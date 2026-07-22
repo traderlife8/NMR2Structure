@@ -32,6 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .io_bruker import read_bruker_folder
+from .log_setup import setup_logging as _setup_logging
 
 
 def validate_bruker_with_nmrpy(folder: str, prefix: str) -> Dict:
@@ -211,7 +212,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument('--folder', help='Bruker 化合物目录 (含 21/22/... 子目录)')
     parser.add_argument('--out-prefix', help='输出文件前缀')
     parser.add_argument('--mnova', help='MNova 文件路径 (检查格式)')
+    parser.add_argument('--log-dir', default=None,
+                        help='日志输出目录 (默认 E:\\NMR2Structure\\logs)')
+    parser.add_argument('--no-log', action='store_true',
+                        help='禁用日志记录 (默认每次运行都会把屏幕内容写入日志文件)')
     args = parser.parse_args(argv)
+
+    # 初始化日志 (默认开启, --no-log 可禁用)
+    if not args.no_log:
+        log_file = _setup_logging(log_dir=args.log_dir)
+        print(f'[nmrpy_validate] 日志文件: {log_file}')
 
     if args.folder and args.out_prefix:
         print(f'[nmrpy_validate] 处理 Bruker: {args.folder}', file=sys.stderr)

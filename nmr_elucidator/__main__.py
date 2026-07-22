@@ -28,6 +28,10 @@ from .nmrsim_check import check_candidate_with_nmrsim
 from .report import write_report_html, write_report_json, write_report_markdown
 from .retrieve import ProblemPeaks, retrieve_candidates
 
+# 项目 logger (在需要时调用 setup_logging() 初始化)
+from .log_setup import setup_logging as _setup_logging
+from .log_setup import get_logger as _get_logger
+
 
 def _filter_peaks_by_intensity(shifts, intensities, percentile=0.20):
     """保留强度 ≥ 第 N 百分位的峰 (去噪声).
@@ -116,9 +120,37 @@ def main(argv=None):
     parser.add_argument('--with-real-spectrum', action='store_true',
                         help='读取 pdata/1/1r 真实处理后谱, 绘制真实谱线形图 (叠加 peaklist 峰位), '
                              '产出 *_real_spectrum.png')
+    parser.add_argument('--use-hose', action='store_true',
+                        help='启用 HOSE code 13C 预测验证 (从 nmrshiftdb2 自建查找表)')
+    parser.add_argument('--use-pubchem', action='store_true',
+                        help='启用 PubChem 扩展检索 (按分子式/子结构)')
+    parser.add_argument('--use-fragment-assembly', action='store_true',
+                        help='启用片段组装候选生成 (库外新骨架)')
+    parser.add_argument('--determine', action='store_true',
+                        help='输出结构推断结论 (含置信度分级)')
+    parser.add_argument('--hose-cache', default=None,
+                        help='HOSE 查找表缓存文件路径 (避免每次重建)')
+    parser.add_argument('--hose-max-records', type=int, default=50000,
+                        help='从 SDF 构建 HOSE 查找表的最大记录数 (默认 50000; '
+                             '0=处理全部; 10000~50000 够用, 100000+ 需约 5 分钟)')
+    parser.add_argument('--lucy-ng-db', default=None,
+                        help='lucy-ng 完整 HOSE 数据库路径 (lucy-ng-derep.db); '
+                             '启用后优先用该库查询, 精度更高 (MAE ~3.5 ppm). '
+                             '默认查找 E:\\NMR2Structure\\data\\lucy-ng-derep_db\\lucy-ng-derep.db')
     parser.add_argument('--quiet', action='store_true',
                         help='不打印检索进度')
+    parser.add_argument('--log-dir', default=None,
+                        help='日志输出目录 (默认 E:\\NMR2Structure\\logs); '
+                             '每次运行生成 NMR2Structure_YYYY-MM-DD_HH-MM-SS.log')
+    parser.add_argument('--no-log', action='store_true',
+                        help='禁用日志记录 (默认每次运行都会把屏幕内容写入日志文件)')
     args = parser.parse_args(argv)
+
+    # 初始化日志 (默认开启, --no-log 可禁用)
+    if not args.no_log:
+        log_file = _setup_logging(log_dir=args.log_dir)
+        log = _get_logger('main')
+        log.info(f'日志文件: {log_file}')
 
     folder = os.path.abspath(args.folder)
     sdf_path = os.path.abspath(args.sdf)
@@ -245,6 +277,113 @@ def main(argv=None):
     else:
         print(f"[5/5] 跳过 nmrsim 反向校验", file=sys.stderr)
 
+    # 6. HOSE 13C 预测验证（可选）
+    hose_verifications = []
+    if args.use_hose:
+        print(f"[6] HOSE 13C 预测验证 ...", file=sys.stderr)
+        # 优先使用 lucy-ng 完整数据库 (如 --lucy-ng-db 指定)
+        lucy_provider = None
+        try:
+            from .lucy_ng_hose import get_lucy_ng_provider, verify_candidate_with_lucy_db
+            lucy_provider = get_lucy_ng_provider(args.lucy_ng_db, quiet=args.quiet)
+        except Exception as ex:
+            if not args.quiet:
+                print(f"  [HOSE] lucy-ng 集成跳过: {ex}", file=sys.stderr)
+
+        if lucy_provider is not None:
+            # 用 lucy-ng 数据库预测 (精度高)
+            for e in evidences[:args.top_n]:
+                vs = verify_candidate_with_lucy_db(
+                    lucy_provider, e.smiles, problem.carbon_shifts,
+                    c_tol=args.c_tol + 1.0,
+                )
+                hose_verifications.append(vs)
+                e.notes.extend(vs.notes)
+            print(f"  -> HOSE 验证完成 (lucy-ng 数据库): {len(hose_verifications)} 个候选",
+                  file=sys.stderr)
+        else:
+            # 回退到本地 SDF 自建表
+            try:
+                from .nmr_predict import get_predictor, verify_candidate
+                hose_cache = args.hose_cache or os.path.join(
+                    os.path.dirname(sdf_path), '_hose_lookup_cache.tsv')
+                predictor = get_predictor(
+                    sdf_path=sdf_path,
+                    table_path=hose_cache,
+                    max_records=args.hose_max_records,
+                    quiet=args.quiet,
+                )
+                for e in evidences[:args.top_n]:
+                    vs = verify_candidate(
+                        predictor, e.smiles, problem.carbon_shifts, c_tol=args.c_tol + 1.0,
+                    )
+                    hose_verifications.append(vs)
+                    e.notes.extend(vs.notes)
+                print(f"  -> HOSE 验证完成 (本地 SDF 表): {len(hose_verifications)} 个候选",
+                      file=sys.stderr)
+            except Exception as ex:
+                print(f"WARN: HOSE 预测验证失败: {ex}", file=sys.stderr)
+    else:
+        print(f"[6] 跳过 HOSE 预测验证", file=sys.stderr)
+
+    # 7. PubChem 扩展检索（可选）
+    pubchem_candidates = []
+    if args.use_pubchem:
+        print(f"[7] PubChem 扩展检索 ...", file=sys.stderr)
+        try:
+            from .retrieve_pubchem import retrieve_pubchem_candidates
+            pubchem_candidates = retrieve_pubchem_candidates(
+                formula=constraints.formula,
+                c13_shifts=problem.carbon_shifts,
+                max_results=50,
+                quiet=args.quiet,
+            )
+            print(f"  -> PubChem 候选: {len(pubchem_candidates)} 条", file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: PubChem 检索失败: {ex}", file=sys.stderr)
+    else:
+        print(f"[7] 跳过 PubChem 扩展检索", file=sys.stderr)
+
+    # 8. 片段组装（可选）
+    fragment_candidates = []
+    if args.use_fragment_assembly:
+        print(f"[8] 片段组装候选生成 ...", file=sys.stderr)
+        try:
+            from .fragment_assembler import assemble_candidates, build_constraints
+            frag_constraint = build_constraints(
+                c13_shifts=problem.carbon_shifts,
+                dept_summary=obs_dept_summary,
+                formula=constraints.formula,
+            )
+            fragment_candidates = assemble_candidates(
+                frag_constraint, max_candidates=100, quiet=args.quiet,
+            )
+            print(f"  -> 片段组装候选: {len(fragment_candidates)} 条", file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 片段组装失败: {ex}", file=sys.stderr)
+    else:
+        print(f"[8] 跳过片段组装", file=sys.stderr)
+
+    # 9. 结构推断置信度评估（可选）
+    determination_result = None
+    if args.determine:
+        print(f"[9] 结构推断置信度评估 ...", file=sys.stderr)
+        try:
+            from .determination import assess_determination
+            determination_result = assess_determination(
+                evidences=evidences[:args.top_n],
+                hose_verifications=hose_verifications if hose_verifications else None,
+            )
+            print(f"  -> 结论: {determination_result.conclusion_label} "
+                  f"(置信度={determination_result.confidence:.3f})", file=sys.stderr)
+            if determination_result.top_candidate_smiles:
+                print(f"  -> 推断结构: {determination_result.top_candidate_smiles}",
+                      file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 置信度评估失败: {ex}", file=sys.stderr)
+    else:
+        print(f"[9] 跳过结构推断评估 (使用 --determine 启用)", file=sys.stderr)
+
     # 输出 (out_prefix 已在 main() 开头构造, 路径 = output_root / compound_name / compound_name.*)
     meta = {
         'folder': folder,
@@ -256,11 +395,58 @@ def main(argv=None):
         'h_tol': args.h_tol,
         'top_n': args.top_n,
         'used_nmrsim': bool(args.use_nmrsim),
+        'used_hose': bool(args.use_hose),
+        'used_hose_source': 'lucy-ng-derep.db' if (args.use_hose and args.lucy_ng_db) else 'local-sdf',
+        'used_pubchem': bool(args.use_pubchem),
+        'used_fragment_assembly': bool(args.use_fragment_assembly),
         'dept_counts': dept_counts,
         'observed_carbon_shifts': problem.carbon_shifts,
         'observed_proton_shifts': problem.proton_shifts,
         'obs_dept_summary': obs_dept_summary,
     }
+    # 结构推断结论
+    if determination_result is not None:
+        meta['determination'] = {
+            'conclusion': determination_result.conclusion,
+            'conclusion_label': determination_result.conclusion_label,
+            'confidence': determination_result.confidence,
+            'top_candidate_smiles': determination_result.top_candidate_smiles,
+            'top_candidate_score': determination_result.top_candidate_score,
+            'gap_to_second': determination_result.gap_to_second,
+            'evidence_summary': determination_result.evidence_summary,
+            'recommendations': determination_result.recommendations,
+        }
+    # HOSE 验证详情
+    if hose_verifications:
+        meta['hose_verifications'] = [
+            {
+                'smiles': hv.smiles,
+                'hose_rms': hv.hose_rms,
+                'hose_coverage': hv.hose_coverage,
+                'hose_match_rate': hv.hose_match_rate,
+                'verification_score': hv.verification_score,
+                'notes': hv.notes,
+            }
+            for hv in hose_verifications
+        ]
+    # PubChem 拓展候选
+    if pubchem_candidates:
+        meta['pubchem_candidates'] = [
+            {
+                'cid': pc.cid,
+                'smiles': pc.smiles,
+                'iupac_name': pc.iupac_name,
+                'molecular_formula': pc.molecular_formula,
+                'molecular_weight': pc.molecular_weight,
+            }
+            for pc in pubchem_candidates[:20]  # 限制存储
+        ]
+    # 片段组装候选
+    if fragment_candidates:
+        meta['fragment_candidates'] = [
+            {'smiles': fc.smiles, 'source': fc.source, 'notes': fc.notes}
+            for fc in fragment_candidates[:20]
+        ]
     write_report_json(out_prefix + '.json', evidences, meta)
     write_report_markdown(out_prefix + '.md', evidences, meta, top_n=args.top_n)
     # HTML 报告（人类阅读, 含流程/结果/结构图/未匹配峰/DEPT 推断）

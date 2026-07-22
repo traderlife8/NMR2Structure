@@ -20,6 +20,8 @@ import os
 import sys
 from typing import Optional
 
+from .log_setup import setup_logging as _setup_logging
+
 
 def stage1(folder: str, prefix: str) -> dict:
     """把 Bruker 转成 NMR2Struct 期望的 hnmr/cnmr .txt."""
@@ -70,7 +72,16 @@ def main() -> int:
     ap.add_argument('--h5', default=None, help='阶段 3 单独用: h5 文件路径')
     ap.add_argument('--num-pred', type=int, default=15, help='候选 SMILES 数量 (默认 15, 调试设 3-5)')
     ap.add_argument('--ckpt', default=None, help='自定义权重路径, 默认 multitask_checkpoint.pt')
+    ap.add_argument('--log-dir', default=None,
+                    help='日志输出目录 (默认 E:\\NMR2Structure\\logs)')
+    ap.add_argument('--no-log', action='store_true',
+                    help='禁用日志记录 (默认每次运行都会把屏幕内容写入日志文件)')
     args = ap.parse_args()
+
+    # 初始化日志 (默认开启, --no-log 可禁用)
+    if not args.no_log:
+        log_file = _setup_logging(log_dir=args.log_dir)
+        print(f'[run_bridge] 日志文件: {log_file}')
 
     folder = os.path.abspath(args.folder)
     prefix = os.path.abspath(args.out_prefix)

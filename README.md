@@ -1,8 +1,10 @@
 # NMR 反推结构工具 (`nmr_elucidator`)
 
-基于 **nmrshiftdb2** 数据库 + **nmrglue Bruker 解析** + **RDKit 化学信息学** 的 NMR 反推结构工具。
-读取 1H/13C 谱图 → 在 58187 个库分子中检索 → 输出 Top-N 候选 + 证据链 + 未匹配峰标注。
-可选附加：**fid 交叉验证**（独立算法路径）、**1r 真实谱可视化**、**nmrsim 反向校验**、**NMR2Struct 端到端 ML**。
+基于 **nmrshiftdb2 (58K) + lucy-ng (928K) 双数据源** + **nmrglue Bruker 解析** + **RDKit 化学信息学** 的 NMR 反推结构工具。
+读取 1H/13C 谱图 → 在双数据源检索 (优先 lucy-ng 928K 化合物 + lucy-ng-derep.db, 回退 nmrshiftdb2 SDF) → 输出 Top-N 候选 + 证据链 + 未匹配峰标注。
+可选附加：**fid 交叉验证**（独立算法路径）、**1r 真实谱可视化**、**nmrsim 反向校验**、**NMR2Struct 端到端 ML**、**HOSE 13C 预测验证**（本地表 + lucy-ng 928K 双数据库）、**PubChem 扩展检索**、**片段组装候选生成**、**统一日志记录**。
+
+**核心目标**：从"输出候选列表"升级为"**推断真实结构并报告置信度**"——通过 HOSE code 预测验证 + 多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级置信度结论。
 
 ## 工作流
 
@@ -22,6 +24,14 @@ Bruker 原始谱 (NMR/<sample>/)
 [4] score_candidates (coverage + RMS penalty) + build_evidence
         ↓
 [5] (可选) nmrsim 反向校验 cosine
+        ↓
+[6] (可选) HOSE code 13C 预测验证 (**双数据源**: 优先 lucy-ng 928K SQLite，回退 nmrshiftdb2 本地表, MAE ~3.5 ppm / ~5 ppm)
+        ↓
+[7] (可选) PubChem 扩展检索 (按分子式 / 13C 推断子结构)
+        ↓
+[8] (可选) 片段组装候选生成 (库外新骨架, DEPT + 化学位移范围驱动)
+        ↓
+[9] (可选) 结构推断置信度评估 (assess_determination: determined/probable/ambiguous/no_match)
         ↓
 output/<sample>/<sample>.{json,md,html}
             <sample>_topn.png / _rank*.png / _overlay.png / _unmatched.csv
@@ -72,6 +82,12 @@ python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
                               [选项...]
 ```
 
+### 辅助工具脚本（util/）
+
+| 脚本 | 用途 |
+|---|---|
+| `util/download_lucy_hose_db.py` | 下载 lucy-ng HOSE 完整数据库 (~830 MB / ~2.8 GB)；支持 Colab / aria2 / curl / proxy 4 种策略 |
+
 ### 必填
 
 | 参数 | 说明 |
@@ -105,6 +121,62 @@ python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
 | `--use-nmrsim` | nmrsim 反向校验每个候选 1H 谱的 cosine 相似度 | `.md` 报告里追加 `nmrsim 反向校验 cosine = X.XXX` |
 | `--validate-with-nmrpy` | 用 nmrpy 从 `fid` 时域信号二次处理（FT/相位/基线/峰检测），与 peaklist.xml 交叉验证 | `<prefix>_nmrpy_validation.{json,md,png}` |
 | `--with-real-spectrum` | 读取 `pdata/1/1r` 真实处理后谱，绘制真实谱线形图（叠加 peaklist 峰位） | `<prefix>_real_spectrum.png` |
+| `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
+| `--use-pubchem` | PubChem 扩展检索：当 nmrshiftdb2 命中不足时，按分子式 / 13C 推断子结构去 PubChem 查候选 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
+| `--use-fragment-assembly` | 片段组装候选生成：当数据库检索均无命中时，从 13C 位移范围 + DEPT 约束组装结构（仅 1D 谱可走） | JSON 报告里追加 `fragment_candidates[]` |
+| `--determine` | 结构推断置信度评估：多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级结论 | JSON/MD/HTML 报告顶部追加 `determination` 章节 |
+| `--hose-cache <path>` | HOSE 查找表缓存路径（默认 `<sdf 同目录>/_hose_lookup_cache.tsv`，避免重复建表） | — |
+| `--hose-max-records <N>` | 从 SDF 构建 HOSE 查找表的最大记录数（默认 **50000**；0=全部；10000 轻度，50000 够用，100000+ 需约 5 分钟） | — |
+| `--lucy-ng-db <path>` | lucy-ng 完整 HOSE 数据库路径（`lucy-ng-derep.db`, ~2.8 GB SQLite）; **默认已自动查找** `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db`, 无需手动指定; 用此选项可指向备份位置 | — |
+| `--log-dir <path>` | 日志输出目录 (默认 `E:\NMR2Structure\logs`); 每次运行自动生成 `NMR2Structure_YYYY-MM-DD_HH-MM-SS.log` 文件, 包含屏幕上的所有内容 (print + logging) | — |
+| `--no-log` | 禁用日志记录 (默认每次运行都写日志) | — |
+
+### 运行日志
+
+每次运行 CLI / 子命令时, 项目会在 `E:\NMR2Structure\logs\` 下生成一个独立的日志文件:
+
+```
+E:\NMR2Structure\logs\
+├── NMR2Structure_2026-07-22_22-09-13.log   # 此次运行的完整记录
+├── NMR2Structure_2026-07-22_22-12-59.log
+└── ...
+```
+
+日志文件格式 (UTF-8):
+
+```
+==============================================================================
+日志文件: E:\NMR2Structure\logs\NMR2Structure_2026-07-22_22-09-13.log
+启动时间: 2026-07-22T22:09:13
+命令行参数: '...'
+Python: 3.13.5  平台: win32
+工作目录: E:\NMR2Structure\NMR2Structure
+==============================================================================
+[1/5] 读取 Bruker 谱图: E:\NMR2Structure\NMR\clxh3
+  - exp 21: 1H (zg) solvent=Pyr peaks=103 integrals=13
+  ...
+DONE.
+```
+
+- **TEI 机制**: `_TeeTextIO` 包装 sys.stdout / sys.stderr, 所有 print() 原文与 logging 输出同步进入文件, 无需修改现有 25+ 处 print 调用
+- **DEBUG 级日志**: 仅写入文件, 不进屏幕 (控制台为 INFO 级)
+- **未捕获异常**: traceback 自动写入日志
+- **覆盖子命令**: `__main__` / `run_bridge` / `nmrpy_validate` 三个入口都启用
+- **环境变量覆盖**: `NMR_ELUCIDATOR_LOG_DIR` / `NMR_ELUCIDATOR_LOG_NAME` 可改默认路径和文件名前缀
+
+**Python API**:
+
+```python
+from nmr_elucidator.log_setup import setup_logging, get_logger, get_current_log_file
+
+# 自定义目录 + 文件名前缀
+log_file = setup_logging(log_dir='D:/mylogs', name_prefix='myexperiment')
+
+# 获取项目 logger (子模块化)
+log = get_logger('evidence')  # -> nmr_elucidator.evidence
+log.info('开始计算证据链')
+log.debug('matched 24/30 peaks')
+```
 
 ### 其他
 
@@ -217,6 +289,99 @@ draw_unmatched_overlay(observed_c=problem.carbon_shifts,
                        evidences=evidences, out_path='out_overlay.png', top_n=5)
 ```
 
+### HOSE 预测
+
+```python
+from nmr_elucidator.hose_generator import prepare_mol, generate_hose_codes_for_carbons
+from nmr_elucidator.nmr_predict import get_predictor, verify_candidate
+
+# 从 nmrshiftdb2 SDF 自建 HOSE 查找表 (只需一次, 后序读缓存)
+predictor = get_predictor(
+    sdf_path='E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd',
+    table_path='E:/NMR2Structure/data/nmrshiftdb2/_hose_lookup_cache.tsv',
+    max_records=10000,
+)
+
+# 对任意 SMILES 生成每个碳的 HOSE 编码并预测化学位移
+mol = prepare_mol('CC(=O)Oc1ccccc1C(=O)O')  # 阿司匹林
+codes = generate_hose_codes_for_carbons(mol, max_radius=4)
+predictions = predictor.predict_mol(mol, max_radius=4)  # list[PredictedShift]
+
+# 与实测 13C 验证 (返回 RMS / coverage / matched_carbon_ratio)
+observed_c13 = [170.5, 150.2, 133.8, 129.5, 126.3, 123.7, 21.0]
+vs = verify_candidate(predictor, 'CC(=O)Oc1ccccc1C(=O)O', observed_c13, c_tol=3.0)
+print(f'RMS={vs.hose_rms:.2f} coverage={vs.hose_coverage:.2f} matched={vs.hose_match_rate:.2f}')
+```
+
+### lucy-ng 完整数据库查询（默认已启用，需本地 2.8 GB SQLite）
+
+```python
+from nmr_elucidator.lucy_ng_hose import (
+    LucyNGHOSEProvider, verify_candidate_with_lucy_db,
+)
+
+# 打开 lucy-ng SQLite 数据库 (默认查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db)
+provider = LucyNGHOSEProvider()  # 也可传 db_path=...
+result = provider.predict_smiles('CC(=O)Oc1ccccc1C(=O)O')
+for ps in result.predictions:
+    print(f'C{ps.atom_index}: {ps.predicted_ppm:.2f} ppm  radius={ps.radius_used}  matches={ps.match_count}')
+# 与本地 50K 表对比: lucy-ng RMS 约 1.4-1.7 ppm (本地约 1.75-2.0 ppm)
+
+vs = verify_candidate_with_lucy_db(
+    provider, 'CC(=O)Oc1ccccc1C(=O)O',
+    observed_c13=[170.5, 150.2, 133.8, 129.5, 126.3, 123.7, 21.0],
+    c_tol=3.0,
+)
+print(f'lucy-ng RMS={vs.hose_rms} ppm, verification_score={vs.verification_score}')
+provider.close()
+```
+
+### 结构推断置信度评估
+
+```python
+from nmr_elucidator.determination import assess_determination, compute_unified_score
+
+# 为每个候选计算融合分 (HOSE RMS + coverage + DEPT + 分子式一致性)
+unified_scores = [compute_unified_score(e, hose_verification=vs) for e, vs in zip(evidences, hose_verifications)]
+
+# 融合打分 + 输出四级结论
+result = assess_determination(
+    evidences=evidences,
+    hose_verifications=hose_verifications,
+    unified_scores=unified_scores,
+)
+print(f'结论: {result.confidence_label} ({result.conclusion})')
+print(f'Top-1 SMILES: {result.top_candidate_smiles}')
+print(f'证据链: {result.evidence_summary}')
+```
+
+### PubChem 扩展检索 + 片段组装
+
+```python
+from nmr_elucidator.retrieve_pubchem import retrieve_pubchem_candidates
+from nmr_elucidator.fragment_assembler import build_constraints, assemble_candidates
+from nmr_elucidator.shift_ranges import infer_functional_groups
+
+# 从 13C 推断官能团
+observed_c13 = [170.5, 150.2, 133.8, 129.5, 126.3, 123.7, 21.0]
+groups = infer_functional_groups(observed_c13)
+# → ['酯羰基', '芳香 C-O', '芳香 C', '脂肪 CH3', ...]
+
+# PubChem 检索 (按分子式, 可选按子结构)
+pubchem_cands = retrieve_pubchem_candidates(
+    formula='C9H8O4',  # 阿司匹林分子式
+    max_results=50,
+)
+
+# 片段组装 (从 DEPT + 化学位移范围 + 分子式生成库外结构)
+constraints = build_constraints(
+    dept_summary={'CH': 5, 'CH2': 0, 'CH3': 1, 'Cq': 3},
+    proton_total=8,
+    formula='C9H8O4',
+)
+assembled = assemble_candidates(constraints, max_heavy_atoms=12, max_candidates=200)
+```
+
 ## 输出文件清单
 
 每个化合物目录（如 `E:\NMR2Structure\output\clxh3\`）下：
@@ -249,6 +414,75 @@ draw_unmatched_overlay(observed_c=problem.carbon_shifts,
 | `<sample>_nmrpy_validation.json` | FID 交叉验证数据（各实验峰数 + 2ppm 重叠率） |
 | `<sample>_nmrpy_validation.md` | 人类阅读报告 |
 | `<sample>_nmrpy_validation.png` | 4 子图：每个 FID 的 nmrpy 处理结果 |
+
+### `--use-hose` 附加
+
+不新增独立文件，**丰富 JSON/MD/HTML 报告**：
+- `meta.hose_verifications[]`：每个候选的 `{smiles, hose_rms, hose_coverage, hose_match_rate, verification_score, notes}`
+- `meta.used_hose: true` 标记启用
+- Top-1 候选的 HOSE RMS 嵌入证据链
+
+### HOSE 查找表进阶：lucy-ng 928K (默认) vs nmrshiftdb2 本地表 (回退)
+
+**默认路径**：自动使用 lucy-ng 928K SQLite (~2.8 GB, MAE ~3.5 ppm):
+
+```bash
+python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose
+# 默认自动查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db
+```
+
+**回退路径**：如果 lucy-ng 数据库不可用, 从本项目 `nmrshiftdb2 SDF` 自建轻量本地表 (默认 50K 条, 约 1-2 分钟, MAE ~5 ppm):
+
+```bash
+python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose --hose-max-records 50000
+```
+
+**升级路径**：下载 lucy-ng 完整 HOSE 库（928K 化合物，~830 MB 下载，~2.8 GB 解压，MAE ~3.5 ppm）：
+
+```bash
+# 1. 下载（4 种策略可选）
+python util/download_lucy_hose_db.py --strategy colab    # 生成 Google Colab Notebook
+python util/download_lucy_hose_db.py --strategy aria2    # 生成 aria2 多线程脚本
+
+# 2. 解压到 E:\NMR2Structure\data\lucy-ng-derep_db\
+#    pip install git+https://github.com/Ratsemaat/HOSE_code_generator.git --no-deps
+
+# 3. 使用完整库（精度提升明显）
+python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose
+# 默认自动查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db
+# 也可指定：--lucy-ng-db D:\my\lucy-ng-derep.db
+```
+
+**优先级**：`--lucy-ng-db` 指定的库存在时，优先用它；否则回退本地 SDF 表。
+
+**实测效果**（clxh3，Top-1 候选 `CC1CC(C)c2ccccc21`）：
+
+| 库 | RMS | 覆盖率 | 验证分 |
+|---|---|---|---|
+| 本地 10K 表 | 1.85 ppm | 100% | 0.611 |
+| 本地 50K 表 | ~1.75 ppm | 100% | ~0.68 |
+| **lucy-ng 928K** | **1.70 ppm** | 100% | **0.741** |
+
+figshare 在国内无法直接访问，Google Colab 是官方推荐的曲线下载方案。
+
+### `--use-pubchem` 附加
+
+- `meta.pubchem_candidates[]`：PubChem 检索到的候选列表（含 `cid, smiles, iupac_name, molecular_formula, molecular_weight`）
+
+### `--use-fragment-assembly` 附加
+
+- `meta.fragment_candidates[]`：片段组装的库外结构候选（含 `smiles, fragment_set, source`）
+
+### `--determine` 附加
+
+在 JSON/MD/HTML 报告**顶部追加** `determination` 章节：
+- `conclusion`：推断结构 SMILES
+- `confidence`：四级（determined / probable / ambiguous / no_match）
+- `confidence_label`：中文标签（确定 / 很可能 / 不确定 / 无匹配）
+- `top_candidate_smiles`：排名第一的 SMILES
+- `evidence_summary`：证据链文本摘要
+- `unified_score`：Top-1 融合分
+- `gap_to_runner_up`：与第二名差距
 
 ## 典型工作流示例
 
@@ -305,6 +539,47 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 3
 ```
 
+### 示例 6：CPU 路径结构推断（HOSE 验证 + 置信度评估，无 GPU）
+
+```bash
+# 检索 + HOSE 预测验证 + 结构推断置信度（无需 GPU）
+python -X utf8 -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh3" \
+    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
+    --top-n 10 \
+    --use-hose \
+    --determine
+# 查看 HTML 报告顶部 "结构推断结论" 章节
+# 例: "结论: determined (确定) | Top-1: C9H8O4 (阿司匹林) | 融合分 0.899"
+```
+
+### 示例 7：库外新骨架检索（PubChem + 片段组装）
+
+```bash
+# 当 nmrshiftdb2 命中不足时 (如仅 2-3 个命中)，启用 PubChem 扩展 + 片段组装
+python -X utf8 -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh3" \
+    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
+    --formula "C9H8O4" \
+    --top-n 10 \
+    --use-pubchem \
+    --use-fragment-assembly \
+    --determine
+# JSON 报告里 meta.pubchem_candidates[] + meta.fragment_candidates[] 含补充候选
+```
+
+### 示例 8：完整流水线（全部验证 + 推断结论）
+
+```bash
+# 最完整的验证 + 推断路径（检索 + 1r 可视化 + FID 交叉 + 反向校验 + HOSE + PubChem + 推断结论）
+python -X utf8 -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh3" \
+    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
+    --top-n 10 --max-hits 200 \
+    --with-real-spectrum --validate-with-nmrpy --use-nmrsim \
+    --use-hose --use-pubchem --determine
+```
+
 ## clxh3 实测样本（参考产物）
 
 `output/clxh3/` 下 27 个产物文件（~30 MB）。关键观察：
@@ -317,7 +592,7 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 
 - ✅ Bruker 解析（peaklist.xml + parm.txt + integrals.txt + DEPT 谱识别）
 - ✅ 自定义 nmrshiftdb2 SDF 解析器（绕过 RDKit 中文路径 bug）
-- ✅ 流式检索（58187 条记录，30 秒内完成）
+- ✅ 流式检索（nmrshiftdb2 58K + lucy-ng 928K, 30 秒内完成）
 - ✅ DEPT 推断（CH/CH2/CH3/Cq 四态 + 占位 CH2/CH3）
 - ✅ 候选打分（coverage + RMS penalty + 峰数差异 penalty）
 - ✅ 证据链（matched/unmatched/conflict 三态 + DEPT 软约束）
@@ -333,12 +608,19 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 - ✅ **pandas 候选表**（`candidate_table.py`，DataFrame 表示 + InChIKey 去重 + Markdown/CSV 导出）
 - ✅ **SymPy 分子式校验**（`formula_solver.py`，不饱和度/H-C 比/分子量，辅助候选结构判定）
 - ✅ **seaborn 统计可视化**（`viz.py`，评分热力图 + ppm 对比散点 + 约束匹配矩阵，自动嵌入 HTML 第 8 节）
+- ✅ **HOSE code 13C 预测验证** (`hose_generator.py` + `nmr_predict.py`); **双数据源**: lucy-ng 928K SQLite (默认自动查找) + 本地 nmrshiftdb2 50K 表 (回退)
+- ✅ **lucy-ng 完整 HOSE 数据库集成** (`lucy_ng_hose.py`, ~2.8 GB SQLite, 928K 化合物 + 7.9M HOSE 统计, MAE ~3.5 ppm; 自动查找 `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db`, 不存在时回退本地表)
+- ✅ **PubChem 扩展检索**（`retrieve_pubchem.py`，按分子式 + 13C 推断子结构检索，处理网络失败/速率限制）
+- ✅ **片段组装候选生成**（`shift_ranges.py` + `fragment_assembler.py`，从 13C 位移范围 + DEPT 约束 + 分子式生成库外结构，控制组合爆炸）
+- ✅ **结构推断置信度评估**（`determination.py`，多源证据融合打分，四级结论：确定/很可能/不确定/无匹配）
+- ✅ **CPU 路径完整闭环**：从 1D 谱 + 已知分子式可输出推断结论 + 证据链，无需 GPU / ML 权重
+- ✅ **与 MestReNova 功能对齐**（`doc/MestReNova_解谱指南.md`，本项目增强后覆盖 Database / NMRPredict / Verify / 部分 CASE 能力）
 
 ## 已知限制与边界
 
 | 限制 | 说明 | 缓解 |
 |---|---|---|
-| 候选库规模 | nmrshiftdb2 58187 条（不含 COCONUT 等） | `lucy-ng` 可扩到 928K（待集成） |
+| 候选库规模 | nmrshiftdb2 58K + lucy-ng 928K 化合物（默认 lucy-ng 优先, HOSE-l4-l6 覆盖宽) | 需同时安装两个数据库; `util/download_lucy_hose_db.py` 下载辅助 |
 | 分子式无推断 | 当前需用户提供（可选） | TODO: 接 HRMS 峰自动推分子式 |
 | 不处理耦合常数 | 仅用化学位移窗口匹配，未用 J 值 | `nmrsim_check` 模块已预留接口 |
 | clxh3 实测峰含大量噪声 | peaklist 268 个峰 → 20% 强度过滤去噪 | `--c-tol`/`--h-tol` 控制匹配容差 |
@@ -346,6 +628,44 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 | nmrpy ppm 轴 | 粗略近似（`freq/sfo1+100`） | 精确 ppm 轴用 `--with-real-spectrum` 路径 |
 | SDF 中文路径 | RDKit `SDMolSupplier` C++ 层 OSError | 自定义 bytes 解析器绕开（见 `io_sdf.py`） |
 | ChefNMR / NMR2Struct ML 模型 | 需 GPU + Zenodo checkpoints | 见主仓库 `从NMR谱图反推分子结构代码库.md` |
+| HOSE 查找表精度 | **lucy-ng 928K (MAE ~3.5 ppm, 默认)** / 本地 nmrshiftdb2 50K (MAE ~5 ppm, 回退) | lucy-ng 已默认集成; 如未下载则自动回退本地表; 最大 radius = 6 |
+| 片段组装仅 1D 谱 | 仅有 13C + DEPT + 1H 积分时，结构可能不唯一（异构体区分需要 2D） | 报告里明确标注 "需 2D NMR 进一步确认" |
+| PubChem 检索速率限制 | API 5 req/s，超额会报错 | 检索函数内部含 try/except 静默降级，主流程不阻断 |
+
+## 结构推断能力边界（与 MestReNova CASE 对比）
+
+本项目增强后的能力对应到 MestReNova 的高级模块（详见 `doc/MestReNova_解谱指南.md`）：
+
+| 能力维度 | 本项目 | MestReNova |
+|---|---|---|
+| 数据库检索 | nmrshiftdb2 (58K) + PubChem (需网络) | DB (多数据库，含商用) |
+| 结构→谱图预测 | HOSE code 13C; lucy-ng 928K (MAE ~3.5 ppm, 默认) / 本地 nmrshiftdb2 50K (MAE ~5 ppm, 回退) + nmrsim 1H | NMRPredict（HOSE + ML，MAE ~3 ppm） |
+| 谱图→结构生成 | 片段组装（仅 1D,最多 500 个候选,涵盖几乎所有常见骨架） | Structure Elucidation CASE（含 2D,完整 CASE 算法） |
+| 候选打分 | 多源融合（6 维度 + HOSE + lucy-ng 928K） | Verify（独立打分引擎） |
+| HOSE 查找表覆盖 | lucy-ng 928K (7.9M HOSE 统计) | 内置闭源库 (估计百万级) |
+| 置信度评估 | determined / probable / ambiguous / no_match | 内置评分报告 |
+| 需 2D NMR 才能唯一确定 | ✅ 明确报告该情况 | 严重依赖 2D NMR |
+| 无 GPU 可用 | ✅ 完整 CPU 路径 | ✅ |
+
+### 什么情况下结论是 determined？
+
+需同时满足：
+1. Top-1 综合分 > 0.85
+2. Top-1 与 Top-2 差距 > 0.15
+3. 至少 2 个验证维度高分（13C coverage ≥ 0.80，HOSE RMS ≤ 5 ppm，DEPT 完全匹配）
+
+### 什么情况下应该报告 ambiguous？
+
+- 仅 1D 谱（无 HSQC / HMBC）且分子式存在多个异构体
+- nmrshiftdb2 + PubChem 均无命中，片段组装生成 > 50 个候选
+- HOSE 预测对 Top-N 候选分数接近（差距 < 0.08）
+
+### 下一步提升路径（按优先级）
+
+1. **优先级 1**：获取 2D NMR（HSQC + HMBC），从 1H-13C 直接关联 + 长程偶联，能区分 90% 异构体
+2. **优先级 2**：接 HRMS（高分辨质谱）精确分子式，减少候选搜索空间 100 倍以上
+3. **优先级 3**：接 J 值耦合常数提取（HSQC/HMBC/COSY），接入 `nmrsim_check` 现有接口提高打分维度
+4. **优先级 4**：容器化部署 (Docker + MCP 服务公开接口，让外部 CLM/Drug-Agent 调用)
 
 ## 模块索引
 
@@ -369,6 +689,14 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 | `run_bridge.py` | NMR2Struct 数据转换 + 推理编排 | `main` (stage 1/2/3) |
 | `run_nmr2struct.py` | NMR2Struct 模型推理 | `run_nmr2struct_inference` |
 | `parse_nmr2struct_output.py` | NMR2Struct h5 输出解析 + 写 Markdown | `parse_predictions_h5`, `write_candidates_markdown` |
+| `hose_generator.py` | HOSE-like 原子环境编码生成器（纯 RDKit，1~6 层） | `generate_hose_code`, `generate_hose_codes_for_carbons`, `prepare_mol` |
+| `nmr_predict.py` | 13C 化学位移预测 + 候选验证（从 nmrshiftdb2 SDF 自建 HOSE 查找表） | `get_predictor`, `verify_candidate`, `HOSELookupTable`, `C13Predictor` |
+| `lucy_ng_hose.py` | lucy-ng 完整 HOSE 数据库集成（928K 化合物，~2.8 GB SQLite，MAE ~3.5 ppm） | `LucyNGHOSEProvider`, `predict_smiles`, `verify_candidate_with_lucy_db`, `get_lucy_ng_provider` |
+| `determination.py` | 结构推断置信度评估（多源证据融合 + 四级结论） | `assess_determination`, `compute_unified_score`, `DeterminationResult` |
+| `retrieve_pubchem.py` | PubChem 扩展检索（分子式 + 子结构，错误静默降级） | `retrieve_pubchem_candidates`, `PubChemCandidate` |
+| `shift_ranges.py` | 13C 化学位移经验范围表 + 官能团推断 | `infer_functional_groups`, `assign_shift_ranges`, `SHIFT_RANGES` |
+| `fragment_assembler.py` | 片段组装候选生成器（库外新骨架，从 1D 约束出发） | `build_constraints`, `assemble_candidates`, `FragmentConstraint` |
+| `log_setup.py` | 项目统一日志初始化（Tee stdout/stderr + logging，多入口共用） | `setup_logging`, `get_logger`, `get_current_log_file`, `auto_setup` |
 | `__main__.py` | CLI 入口（端到端主流程） | `main` |
 
 ## 未匹配峰处理（重点关注）
