@@ -1,6 +1,6 @@
-#!/usr/bin/env pwsh
+#!/bin/sh
 # ============================================================
-# post-commit hook - commit 后自动 push 到 origin
+# post-commit hook (bash) - commit 后自动 push 到 origin
 # ============================================================
 # 安装方法：
 #   git config core.hooksPath .githooks
@@ -8,64 +8,59 @@
 # 设计要点：
 #   - 没有 origin remote → 静默跳过
 #   - push 失败 → 打印警告但不返回非零（不污染 commit 状态）
-#   - push 成功 → 简短提示
-#   - 检测 fast-forward / non-fast-forward，分别提示
+#   - 检测 fast-forward / non-fast-forward / 网络 / 认证失败，分别提示
 # ============================================================
 
-$ErrorActionPreference = "Continue"
-
 # 切到 git 仓库根目录
-$RepoRoot = git rev-parse --show-toplevel 2>$null
-if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$repo_root" ]; then
     exit 0
-}
-Set-Location -LiteralPath $RepoRoot
+fi
+cd "$repo_root" || exit 0
 
 # 检查 origin 是否存在
-$remoteUrl = git remote get-url origin 2>$null
-if ([string]::IsNullOrWhiteSpace($remoteUrl)) {
+remote_url=$(git remote get-url origin 2>/dev/null)
+if [ -z "$remote_url" ]; then
     exit 0
-}
+fi
 
-# 检测当前分支
-$branch = git rev-parse --abbrev-ref HEAD 2>$null
-if ([string]::IsNullOrWhiteSpace($branch) -or $branch -eq "HEAD") {
+# 当前分支
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     exit 0
-}
+fi
 
 # 检测本地是否有未推送的 commit
-$unpushed = git log "@{u}..$branch" --oneline 2>$null
-if ([string]::IsNullOrWhiteSpace($unpushed)) {
+unpushed=$(git log "@{u}..$branch" --oneline 2>/dev/null)
+if [ -z "$unpushed" ]; then
     # 没有未推送的 commit（例如 amend 后未产生新 commit）
     exit 0
-}
+fi
 
-$count = ($unpushed | Measure-Object -Line).Lines
-Write-Host "[post-commit] pushing $count new commit(s) to origin/$branch ..." -ForegroundColor Cyan
+count=$(printf "%s\n" "$unpushed" | wc -l | tr -d ' ')
+echo "[post-commit] pushing $count new commit(s) to origin/$branch ..."
 
-# 执行 push
-$output = git push origin $branch 2>&1
-$exitCode = $LASTEXITCODE
+# 执行 push，捕获输出和退出码
+push_output=$(git push origin "$branch" 2>&1)
+push_exit=$?
 
-if ($exitCode -eq 0) {
-    Write-Host "[post-commit] pushed OK." -ForegroundColor Green
-} else {
-    # 区分失败原因
-    $joined = ($output | Out-String)
-    if ($joined -match "non-fast-forward|rejected|fetch first") {
-        Write-Host "[post-commit] push REJECTED (remote has new commits)." -ForegroundColor Yellow
-        Write-Host "             run: git pull --rebase, then re-run git_sync.ps1 or push manually." -ForegroundColor Yellow
-    } elseif ($joined -match "Could not resolve|Connection|timeout|unreachable") {
-        Write-Host "[post-commit] push failed: network unreachable." -ForegroundColor Yellow
-        Write-Host "             commit is kept locally; push later when network is back." -ForegroundColor Yellow
-    } elseif ($joined -match "Authentication|denied|403|401") {
-        Write-Host "[post-commit] push failed: authentication error." -ForegroundColor Yellow
-        Write-Host "             check token / credentials." -ForegroundColor Yellow
-    } else {
-        Write-Host "[post-commit] push failed (exit=$exitCode):" -ForegroundColor Yellow
-        Write-Host $joined -ForegroundColor Yellow
-    }
-    # 关键：失败时 exit 0，不污染 commit 状态
-}
+if [ $push_exit -eq 0 ]; then
+    echo "[post-commit] pushed OK."
+else
+    if echo "$push_output" | grep -qE "non-fast-forward|rejected|fetch first"; then
+        echo "[post-commit] push REJECTED (remote has new commits)." >&2
+        echo "             run: git pull --rebase, then push again." >&2
+    elif echo "$push_output" | grep -qE "Could not resolve|Connection|timeout|unreachable"; then
+        echo "[post-commit] push failed: network unreachable." >&2
+        echo "             commit kept locally; push later when network is back." >&2
+    elif echo "$push_output" | grep -qE "Authentication|denied|403|401"; then
+        echo "[post-commit] push failed: authentication error." >&2
+        echo "             check token / credentials." >&2
+    else
+        echo "[post-commit] push failed (exit=$push_exit):" >&2
+        echo "$push_output" >&2
+    fi
+    # 失败时 exit 0，不污染 commit 状态
+fi
 
 exit 0
