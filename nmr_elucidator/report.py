@@ -23,6 +23,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from .evidence import CandidateEvidence, DeptEvidence, HCountEvidence
+from .candidate_table import (
+    dedupe_by_inchikey,
+    evidences_to_dataframe,
+    to_csv as candidates_to_csv,
+    to_markdown as candidates_to_markdown,
+)
+
+# seaborn 可视化 (可选). 未装时函数返回 None, 报告自动跳过.
+try:
+    from .viz import (
+        plot_candidate_score_heatmap,
+        plot_constraint_match_matrix,
+        plot_ppm_comparison_scatter,
+    )
+    _HAS_SEABORN = True
+except ImportError:
+    _HAS_SEABORN = False
 
 
 def write_report_json(path: str, evidences: List[CandidateEvidence], meta: Dict) -> None:
@@ -175,6 +192,23 @@ def write_report_markdown(path: str, evidences: List[CandidateEvidence], meta: D
             for n in e.notes:
                 lines.append(f'- {n}')
             lines.append('')
+
+    # pandas 候选表 (按 InChIKey 去重, 便于化学家筛选/排序; tabulate 未装时静默退回手写表)
+    if evidences[:top_n]:
+        try:
+            df = evidences_to_dataframe(evidences[:top_n])
+            df = dedupe_by_inchikey(df, keep='first')
+            if not df.empty:
+                lines.append('## pandas 候选表 (按 InChIKey 去重)')
+                lines.append('')
+                md_table = candidates_to_markdown(df, columns=[
+                    'rank', 'score', 'formula', 'inchikey', 'solvent_lib',
+                    'heavy_atoms', 'c_match', 'h_match', 'dept_full',
+                    'h_count', 'conflicts'])
+                lines.append(md_table)
+                lines.append('')
+        except Exception:
+            pass  # pandas/tabulate 未装或出锺, 现有手工表已够用
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
@@ -352,6 +386,20 @@ def write_report_html(
         b = _img_to_base64(rp)
         if b:
             rank_pngs[e.rank] = b
+
+    # seaborn 可视化 (可选, 未装时三项均为 None)
+    heatmap_png = os.path.join(out_dir, f'{base}_heatmap.png')
+    scatter_png = os.path.join(out_dir, f'{base}_scatter.png')
+    matrix_png = os.path.join(out_dir, f'{base}_matrix.png')
+    rendered_heatmap = plot_candidate_score_heatmap(evidences, heatmap_png, top_n) if _HAS_SEABORN else None
+    rendered_scatter = plot_ppm_comparison_scatter(
+        meta.get('observed_carbon_shifts', []),
+        meta.get('observed_proton_shifts', []),
+        evidences, scatter_png, top_n) if _HAS_SEABORN else None
+    rendered_matrix = plot_constraint_match_matrix(evidences, matrix_png, top_n) if _HAS_SEABORN else None
+    heatmap_b64 = _img_to_base64(rendered_heatmap) if rendered_heatmap else None
+    scatter_b64 = _img_to_base64(rendered_scatter) if rendered_scatter else None
+    matrix_b64 = _img_to_base64(rendered_matrix) if rendered_matrix else None
 
     # 未匹配峰汇总
     all_unmatched_c = sorted({round(s, 2) for e in evidences[:top_n] for s in e.unmatched_carbon_shifts})
@@ -576,6 +624,21 @@ def write_report_html(
         parts.append(f'<h4>未匹配 1H 峰 (ppm): {", ".join(f"{s:.2f}" for s in all_unmatched_h)}</h4>')
     else:
         parts.append('<h4>未匹配 1H 峰: 无 (top-N 候选已覆盖所有实测 1H 峰)</h4>')
+
+    # 8. seaborn 可视化 (候选评分热力图 / ppm 对比散点 / 约束矩阵)
+    parts.append('<h2>8. 📊 候选评估可视化 (seaborn)</h2>')
+    if not any((heatmap_b64, scatter_b64, matrix_b64)):
+        parts.append('<div class="alert alert-info">seaborn 未装或数据不足, 跳过统计可视化。</div>')
+    else:
+        if heatmap_b64:
+            parts.append(f'<h3>候选评分热力图</h3>')
+            parts.append(f'<img class="mol-img" src="{heatmap_b64}" alt="评分热力图">')
+        if scatter_b64:
+            parts.append(f'<h3>实测 vs 候选 ppm 对比散点图</h3>')
+            parts.append(f'<img class="mol-img" src="{scatter_b64}" alt="ppm 对比">')
+        if matrix_b64:
+            parts.append(f'<h3>约束匹配矩阵</h3>')
+            parts.append(f'<img class="mol-img" src="{matrix_b64}" alt="约束匹配矩阵">')
 
     # overlay 对比图
     if overlay_b64:

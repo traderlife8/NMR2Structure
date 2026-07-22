@@ -281,15 +281,16 @@ def compute_h_count_evidence(
     if expected == 0:
         return None
 
-    # 候选 H 总数
+    # 候选 H 总数与分子式
     if lib_mol is None:
         return None
     from rdkit.Chem import rdMolDescriptors
+    formula_str = ''
     try:
-        formula = rdMolDescriptors.CalcMolFormula(lib_mol)
+        formula_str = rdMolDescriptors.CalcMolFormula(lib_mol)
         # 提取 H 数量
         import re
-        m = re.search(r'H(\d+)', formula)
+        m = re.search(r'H(\d+)', formula_str)
         lib_heavy_h = int(m.group(1)) if m else 0
     except Exception:
         lib_heavy_h = 0
@@ -307,6 +308,28 @@ def compute_h_count_evidence(
         notes.append(f"候选比实测少 {-delta} 个 H (可能丢失部分结构或实测 DEPT 漏检)")
     else:
         notes.append("H 总数完全一致")
+
+    # SymPy 辅助: 候选不饱和度与 H/C 比 (帮助化学家判断结构类型)
+    if formula_str:
+        try:
+            from .formula_solver import (
+                FormulaParseError, formula_dou, formula_hc_ratio, parse_formula,
+            )
+            parsed = parse_formula(formula_str)
+            dou = formula_dou(parsed)
+            hc = formula_hc_ratio(parsed)
+            if dou is not None:
+                notes.append(f"候选不饱和度 DoU = {dou:.2f} (苯环/双键/环数总和)")
+            if hc is not None:
+                notes.append(
+                    f"候选 H/C 比 = {hc:.2f} "
+                    "(饱和烷烃 ~2.2, 烯烃 ~1.5-1.8, 芳烃 ~1.0)"
+                )
+        except FormulaParseError:
+            pass  # RDKit 输出的分子式 SymPy 解析失败 (如含同位素标记), 不阻断主流程
+        except Exception:
+            pass  # 其他 SymPy 异常, 静默跳过, 不影响主打分
+
     return HCountEvidence(
         expected=expected,
         lib_heavy_h=lib_heavy_h,

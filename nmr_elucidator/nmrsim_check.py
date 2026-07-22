@@ -58,15 +58,15 @@ def simulate_peaks_to_spectrum(
 
     multiplets = []
     for p in peaks:
-        # nmrsim Multiplet 接受 J 列表（Hz）
+        # nmrsim Multiplet(v, I, J, w): v=ppm, I=intensity, J=耦合常数列表(Hz)
         # shift 单位 ppm
         if p.j_hz > 0:
             # 用一阶近似：n+1 重峰, intensity 总和 = p.intensity
             mult = int(round(p.intensity))  # 假设整数积分
             j_list = [p.j_hz] * max(1, mult - 1)
-            m = Multiplet(p.shift, j_list, peak_multiplicity=mult)
+            m = Multiplet(p.shift, p.intensity, j_list)
         else:
-            m = Multiplet(p.shift, [], peak_multiplicity=1)
+            m = Multiplet(p.shift, p.intensity, [])
         multiplets.append(m)
     try:
         spec = Spectrum(multiplets)

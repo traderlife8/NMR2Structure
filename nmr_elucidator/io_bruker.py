@@ -438,3 +438,84 @@ def read_bruker_folder(folder: str) -> List[BrukerSpectrum]:
             continue
         out.append(read_bruker_experiment(exp_dir))
     return out
+
+
+# ---- scipy.signal.find_peaks 二次找峰 (可选增强) ----
+
+def enhance_peaks_with_scipy(
+    pdata_dir: str,
+    existing_peaks: List[Peak],
+    tol_ppm: float = 0.1,
+    min_distance_pts: int = 5,
+    prominence: float = 0.05,
+    height_min: float = 0.0,
+) -> List[Peak]:
+    """从 1r 实谱用 scipy.signal.find_peaks 二次找峰, 与 peaklist.xml 合并去重.
+
+    设计目标: peaklist.xml 是 Bruker TopSpin 自动峰检测, 可能漏检弱峰/重叠峰;
+    本函数从 1r 实谱 (连续谱线) 补充, 与现有峰位相差 <tol_ppm 视为同峰, 丢弃.
+
+    依赖 (可选, 未装时静默返回原峰列表):
+      - scipy.signal.find_peaks
+      - nmrglue (io_processed.read_processed_spectrum)
+
+    失败路径 (scipy 未装 / nmrglue 未装 / 1r 缺失) 静默返回原峰列表, 不抛错,
+    保证 read_bruker_experiment 主路径不受影响.
+
+    ponytail: 跳过项 — 升级路径: 若需支持重叠峰分峰, 改用 scipy.signal.peak_widths + 拟合 (curve_fit).
+    """
+    try:
+        from scipy.signal import find_peaks
+    except ImportError:
+        return list(existing_peaks)
+    try:
+        from .io_processed import ProcessedReadError, read_processed_spectrum
+    except ImportError:
+        return list(existing_peaks)
+    try:
+        ps = read_processed_spectrum(pdata_dir, nucleus='?')
+    except ProcessedReadError:
+        return list(existing_peaks)
+    except Exception:
+        return list(existing_peaks)
+    intensity = ps.intensity
+    ppm = ps.ppm
+    if intensity is None or len(intensity) == 0:
+        return list(existing_peaks)
+    peak_max = float(intensity.max())
+    if peak_max <= 0:
+        return list(existing_peaks)
+    norm = intensity / peak_max
+    # 默认参数: 最小峰间隔 + 突出度阈值. 可由调用方覆盖.
+    kwargs: dict = {'distance': max(1, int(min_distance_pts))}
+    if prominence is not None:
+        kwargs['prominence'] = float(prominence)
+    if height_min is not None:
+        kwargs['height'] = float(height_min)
+    try:
+        indices, _ = find_peaks(norm, **kwargs)
+    except Exception:
+        return list(existing_peaks)
+    if len(indices) == 0:
+        return list(existing_peaks)
+    # 去重合并: 与 existing_peaks 比, |ppm delta| < tol_ppm 视为同峰, 丢弃新峰.
+    existing_shifts = [p.shift for p in existing_peaks]
+    merged = list(existing_peaks)
+    for idx in indices:
+        try:
+            idx_i = int(idx)
+        except (TypeError, ValueError):
+            continue
+        if idx_i < 0 or idx_i >= len(ppm):
+            continue
+        s = float(ppm[idx_i])
+        if any(abs(s - es) < tol_ppm for es in existing_shifts):
+            continue  # 与原 peaklist 重复
+        merged.append(Peak(
+            shift=s,
+            intensity=float(norm[idx_i]),
+            sign='unknown',
+        ))
+    # 按化学位移降序 (与原 _parse_peaklist_xml 一致)
+    merged.sort(key=lambda p: p.shift, reverse=True)
+    return merged

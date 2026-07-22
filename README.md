@@ -38,6 +38,7 @@ pip install nmrglue nmrsim -i https://pypi.tuna.tsinghua.edu.cn/simple
 # nmrpy 可选（FID 交叉验证才需要）:
 pip install nmrpy -i https://pypi.tuna.tsinghua.edu.cn/simple
 # 预装依赖: rdkit / pubchempy / numpy / scipy / matplotlib / pandas
+# 以下为该项目增强: sympy (公式校验) / seaborn (统计可视化)
 ```
 
 ## 数据准备
@@ -225,12 +226,15 @@ draw_unmatched_overlay(observed_c=problem.carbon_shifts,
 | 文件 | 说明 |
 |---|---|
 | `<sample>.json` | 完整证据链（matched/unmatched/conflict），程序可读 |
-| `<sample>.md` | Markdown 报告，含未匹配峰专项章节 |
-| `<sample>.html` | HTML 报告（人类阅读，含流程 + 结构图 + DEPT 推断） |
+| `<sample>.md` | Markdown 报告，含未匹配峰专项章节 + pandas 候选表（InChIKey 去重）|
+| `<sample>.html` | HTML 报告（人类阅读，含流程 + 结构图 + DEPT 推断 + seaborn 统计可视化）|
 | `<sample>_topn.png` | Top-N 候选 2D 结构网格图 |
 | `<sample>_rank<N>.png` | 每个候选的单分子图（N=1..top-n） |
 | `<sample>_overlay.png` | 实测谱 vs Top-5 候选预测谱对比（红色=实测，散点=候选） |
 | `<sample>_unmatched.csv` | 未匹配峰汇总（Excel 友好，UTF-8 BOM） |
+| `<sample>_heatmap.png` | 候选评分热力图（seaborn，行=候选，列=维度，归一化 [0, 1]）|
+| `<sample>_scatter.png` | 实测 vs 候选 ppm 散点对比（seaborn，13C + 1H 双子图）|
+| `<sample>_matrix.png` | 约束匹配矩阵（seaborn，6 维度满足度热力图）|
 
 ### `--with-real-spectrum` 附加
 
@@ -324,6 +328,11 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 - ✅ JSON + Markdown + HTML 三种报告
 - ✅ CSV 导出（Excel 兼容）
 - ✅ 1r 真实谱重采样到 ML 网格（ChefNMR/NMR2Struct 共用对接点）
+- ✅ **scipy.cKDTree 化学位移索引**（`match_index.py`，单条候选内部 O(m log m) 加速，失败回退纯 Python 暴力）
+- ✅ **scipy.signal.find_peaks 二次找峰**（`io_bruker.enhance_peaks_with_scipy`，从 1r 实谱补漏 peaklist.xml，依赖未装时静默退化）
+- ✅ **pandas 候选表**（`candidate_table.py`，DataFrame 表示 + InChIKey 去重 + Markdown/CSV 导出）
+- ✅ **SymPy 分子式校验**（`formula_solver.py`，不饱和度/H-C 比/分子量，辅助候选结构判定）
+- ✅ **seaborn 统计可视化**（`viz.py`，评分热力图 + ppm 对比散点 + 约束匹配矩阵，自动嵌入 HTML 第 8 节）
 
 ## 已知限制与边界
 
@@ -342,14 +351,18 @@ python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stag
 
 | 模块 | 职责 | 关键 API |
 |---|---|---|
-| `io_bruker.py` | 读 Bruker 原始谱（peaklist.xml / parm.txt / integrals.txt） | `read_bruker_folder`, `BrukerSpectrum` |
+| `io_bruker.py` | 读 Bruker 原始谱（peaklist.xml / parm.txt / integrals.txt） | `read_bruker_folder`, `BrukerSpectrum`, `enhance_peaks_with_scipy` |
 | `io_processed.py` | 读 Bruker 已处理谱（pdata/1/1r）+ 重采样到 ML 网格 | `read_processed_folder`, `resample_to_grid` |
 | `io_sdf.py` | 自定义 nmrshiftdb2 SDF 解析器 | `stream_nmrshiftdb2_sdf`, `NmrShiftDb2Entry` |
 | `constraints.py` | 硬约束（分子式、溶剂、重原子数） | `Constraints`, `formula_match` |
-| `retrieve.py` | 流式窗口匹配检索（贪心 + DEPT 软约束） | `retrieve_candidates`, `RetrievalHit` |
-| `evidence.py` | 打分 + 证据链生成（matched/unmatched/conflict） | `score_candidates`, `build_evidence` |
-| `report.py` | JSON + Markdown + HTML 报告 | `write_report_json`, `write_report_markdown`, `write_report_html` |
+| `retrieve.py` | 流式窗口匹配检索（贪心 + DEPT 软约束，cKDTree fast path） | `retrieve_candidates`, `RetrievalHit` |
+| `evidence.py` | 打分 + 证据链生成（matched/unmatched/conflict，含 DoU/H-C 校验） | `score_candidates`, `build_evidence` |
+| `report.py` | JSON + Markdown + HTML 报告（含 pandas 候选表 + seaborn 统计图） | `write_report_json`, `write_report_markdown`, `write_report_html` |
 | `drawing.py` | 结构图 + 谱图对比 + 真实谱可视化 | `draw_topn_grid`, `draw_unmatched_overlay`, `draw_real_spectrum_overlay` |
+| `match_index.py` | scipy.cKDTree 化学位移索引（retrieve 内部加速） | `build_shift_index`, `ShiftIndex` |
+| `candidate_table.py` | pandas 候选表 + InChIKey 去重 + Markdown/CSV 导出 | `evidences_to_dataframe`, `dedupe_by_inchikey`, `to_markdown`, `to_csv` |
+| `formula_solver.py` | SymPy 分子式解析 + 元素平衡 + DoU + 分子量 | `parse_formula`, `formula_balance`, `formula_dou`, `formula_molecular_weight`, `validate_formula_match` |
+| `viz.py` | seaborn 候选评分热力图 + ppm 对比散点 + 约束匹配矩阵 | `plot_candidate_score_heatmap`, `plot_ppm_comparison_scatter`, `plot_constraint_match_matrix` |
 | `nmrsim_check.py` | nmrsim 反向校验（cosine 相似度） | `check_candidate_with_nmrsim` |
 | `nmrpy_validate.py` | nmrpy FID 二次处理 + 交叉验证 | `validate_bruker_with_nmrpy` |
 | `bridge_nmr2struct.py` | Bruker → NMR2Struct 输入格式转换 + DEPT 推断 | `convert_bruker_folder_to_nmr2struct` |

@@ -21,6 +21,16 @@ from typing import Iterator, List, Optional
 from .constraints import Constraints, formula_match, solvent_compatible
 from .io_sdf import NmrShiftDb2Entry
 
+# scipy.cKDTree 加速路径 (可选). 模块加载时尝试导入一次, 避免每次 retrieve 都重 import.
+try:
+    from .match_index import build_shift_index
+    _HAS_KDTREE = True
+    _KDTreeImportError: Exception | None = None
+except ImportError as e:  # scipy 未装
+    build_shift_index = None
+    _HAS_KDTREE = False
+    _KDTreeImportError = e
+
 
 # 默认容差（13C 化学位移在 100 MHz 下典型 0.5 ppm, 高场下 1-2 ppm）
 DEFAULT_13C_TOL = 2.0
@@ -89,9 +99,23 @@ def _greedy_match(obs: List[float], lib: List[float], tol: float) -> tuple:
     """贪心匹配: 对每个 obs 峰找最近的 lib 峰, 一对一, 距离 <= tol 才计入.
 
     返回 (matched_count, rms_of_matched_pairs).
+
+    优先用 scipy.spatial.cKDTree (match_index.ShiftIndex) 加速, 失败时回退纯 Python.
+    KDTree 优势在 m>=20 时明显; m<20 时 build 开销可能抵消收益, 但接口统一.
     """
     if not obs or not lib:
         return 0, 0.0
+    if tol < 0:
+        raise ValueError(f'tol 必须非负: {tol}')
+    # fast path: scipy cKDTree
+    if _HAS_KDTREE and build_shift_index is not None:
+        try:
+            idx = build_shift_index(lib)
+            return idx.greedy_match(obs, tol)
+        except Exception as e:  # KDTree 偶发数值异常 (NaN/Inf), 回退
+            import sys
+            print(f'[retrieve] KDTree 路径失败, 回退暴力: {e}', file=sys.stderr)
+    # fallback: 原暴力线性扫描 (与 test_retrieve 一致)
     lib_sorted = sorted(lib)
     matched = 0
     sqsum = 0.0
