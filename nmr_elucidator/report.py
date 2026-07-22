@@ -88,6 +88,28 @@ def write_report_markdown(path: str, evidences: List[CandidateEvidence], meta: D
                 lines.append(f"| {d['ppm']:.3f} | **{d['mult']}** | {sign_icon} |")
             lines.append('')
 
+    # 2D NMR 关联验证
+    if meta.get('used_2d') and meta.get('2d_experiments'):
+        lines.append('## 2D NMR 关联验证')
+        lines.append('')
+        lines.append(f"检测到的 2D 实验: {', '.join(meta['2d_experiments'])}")
+        lines.append('')
+        corr_2d = meta.get('correlation_2d', {})
+        if corr_2d:
+            lines.append('| Rank | SMILES | HSQC | HMBC | COSY | 综合 |')
+            lines.append('|---:|---|---:|---:|---:|---:|')
+            for e in evidences[:top_n]:
+                s2d = corr_2d.get(e.smiles)
+                if s2d:
+                    lines.append(
+                        f"| {e.rank} | `{e.smiles[:30]}` "
+                        f"| {s2d['hsqc_match_rate']:.0%} "
+                        f"| {s2d['hmbc_match_rate']:.0%} "
+                        f"| {s2d['cosy_match_rate']:.0%} "
+                        f"| {s2d['combined_2d_score']:.0%} |"
+                    )
+            lines.append('')
+
     # 未匹配峰
     lines.append('## 重点关注: 未匹配的实测峰 (可能是新结构片段)')
     lines.append('')
@@ -501,12 +523,40 @@ def write_report_html(
                      f'<strong>从 DEPT 推断的 H 总数 (非活泼 H):</strong> {h_expected}'
                      f'<br><small>公式: CH×1 + CH2×2 + CH3×3; Cq 计入 0; CH2/CH3 占位不计入</small></div>')
 
+    # 3.5 2D NMR 关联验证
+    if meta.get('used_2d') and meta.get('2d_experiments'):
+        parts.append('<h2>3.5 2D NMR 关联验证</h2>')
+        parts.append(f'<div class="alert alert-info">检测到的 2D 实验: '
+                     f'<strong>{", ".join(meta["2d_experiments"])}</strong></div>')
+        corr_2d = meta.get('correlation_2d', {})
+        if corr_2d:
+            parts.append('<table>')
+            parts.append('<thead><tr><th>Rank</th><th>SMILES</th>'
+                         '<th>HSQC</th><th>HMBC</th><th>COSY</th><th>综合</th></tr></thead>')
+            parts.append('<tbody>')
+            for e in evidences[:top_n]:
+                s2d = corr_2d.get(e.smiles)
+                if s2d:
+                    parts.append(
+                        f'<tr><td><strong>#{e.rank}</strong></td>'
+                        f'<td><code>{_render_html_escaped(e.smiles[:40])}</code></td>'
+                        f'<td>{s2d["hsqc_match_rate"]:.0%}</td>'
+                        f'<td>{s2d["hmbc_match_rate"]:.0%}</td>'
+                        f'<td>{s2d["cosy_match_rate"]:.0%}</td>'
+                        f'<td><strong>{s2d["combined_2d_score"]:.0%}</strong></td></tr>'
+                    )
+            parts.append('</tbody></table>')
+            parts.append('<div class="alert alert-info" style="margin-top:8px;">'
+                         '<small>HSQC: ¹H-¹³C 直接连接匹配率; '
+                         'HMBC: ¹H-¹³C 远程 (2-3键) 匹配率; '
+                         'COSY: ¹H-¹H 邻接匹配率</small></div>')
+
     # 4. Top-N 结构图
     parts.append('<h2>4. Top-{0} 候选结构</h2>'.format(min(top_n, len(evidences))))
     if topn_b64:
         parts.append(f'<img class="mol-img" src="{topn_b64}" alt="Top-N 候选网格">')
     else:
-        parts.append('<div class="alert">候选网格图未生成 (需要先运行带 --viz 的解谱命令)。</div>')
+        parts.append('<div class="alert">候选网格图未生成 (结构图绘制失败)。</div>')
 
     # 5. 候选详细
     parts.append('<h2>5. 候选详细证据</h2>')

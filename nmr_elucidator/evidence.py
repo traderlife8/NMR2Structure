@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .constraints import formula_match
+from .correlation_2d import Correlation2DScore
 from .io_sdf import NmrShiftDb2Entry
 from .retrieve import RetrievalHit
 
@@ -138,6 +139,8 @@ class CandidateEvidence:
     dept_evidence: List[DeptEvidence] = field(default_factory=list)
     # H 总数一致性
     h_count_evidence: Optional[HCountEvidence] = None
+    # 2D NMR 关联验证分 (HSQC/HMBC/COSY)
+    correlation_2d_score: Optional[Correlation2DScore] = None
     # 冲突: 分子式/溶剂/碳类型不一致等
     conflicts: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)

@@ -65,6 +65,7 @@ def compute_unified_score(
       - HOSE 13C 预测 RMS (来自 hose_verification)
       - DEPT 碳级数一致性 (来自 evidence)
       - 分子式/DoU 一致性 (来自 evidence)
+      - 2D NMR 关联匹配率 (来自 evidence.correlation_2d_score, 可选)
 
     Args:
         evidence: 候选证据链
@@ -74,15 +75,30 @@ def compute_unified_score(
     Returns:
         统一分数 (0-1)
     """
+    # 根据是否有 2D 数据调整权重
+    has_2d = (evidence.correlation_2d_score is not None
+              and evidence.correlation_2d_score.combined_2d_score > 0)
+
     if weights is None:
-        weights = {
-            'c_coverage': 0.20,
-            'h_coverage': 0.15,
-            'hose_rms': 0.30,
-            'dept_match': 0.15,
-            'formula_match': 0.10,
-            'peak_count': 0.10,
-        }
+        if has_2d:
+            weights = {
+                'c_coverage': 0.15,
+                'h_coverage': 0.10,
+                'hose_rms': 0.25,
+                'dept_match': 0.10,
+                'formula_match': 0.10,
+                'peak_count': 0.10,
+                '2d_correlation': 0.20,
+            }
+        else:
+            weights = {
+                'c_coverage': 0.20,
+                'h_coverage': 0.15,
+                'hose_rms': 0.30,
+                'dept_match': 0.15,
+                'formula_match': 0.10,
+                'peak_count': 0.10,
+            }
 
     scores = {}
 
@@ -130,6 +146,12 @@ def compute_unified_score(
         scores['peak_count'] = max(0.0, 1.0 - n_unmatched / n_total_peaks)
     else:
         scores['peak_count'] = 0.5
+
+    # 2D NMR 关联匹配率 (可选)
+    if has_2d:
+        scores['2d_correlation'] = evidence.correlation_2d_score.combined_2d_score
+    else:
+        scores['2d_correlation'] = 0.0
 
     # 加权求和
     total = sum(weights.get(k, 0.0) * v for k, v in scores.items())
@@ -198,19 +220,35 @@ def assess_determination(
     # 置信度分级
     recommendations: List[str] = []
 
+    # 检查 2D 数据支持
+    has_2d_support = (top_ev.correlation_2d_score is not None
+                      and top_ev.correlation_2d_score.combined_2d_score > 0)
+    hsqc_rate = (top_ev.correlation_2d_score.hsqc_match_rate
+                 if top_ev.correlation_2d_score else 0.0)
+
     if top_score >= 0.85 and gap >= 0.15:
         conclusion = CONFIDENCE_DETERMINED
         confidence = min(1.0, top_score)
         recommendations.append('结构已确定, 可直接用于后续研究')
+        if has_2d_support and hsqc_rate >= 0.8:
+            recommendations.append(f'2D NMR 支持: HSQC 匹配率 {hsqc_rate:.0%}')
     elif top_score >= 0.70 and gap >= 0.08:
         conclusion = CONFIDENCE_PROBABLE
         confidence = top_score
-        recommendations.append('结构很可能正确, 建议用 2D NMR (HSQC/HMBC) 进一步确认')
+        if has_2d_support and hsqc_rate >= 0.6:
+            # 2D 数据支持时提升置信度
+            confidence = min(1.0, confidence + 0.05)
+            recommendations.append(f'结构很可能正确, 2D NMR 支持 (HSQC={hsqc_rate:.0%})')
+        else:
+            recommendations.append('结构很可能正确, 建议用 2D NMR (HSQC/HMBC) 进一步确认')
     elif top_score >= 0.50:
         conclusion = CONFIDENCE_AMBIGUOUS
         confidence = top_score * 0.7  # 不确定时降低置信度
-        recommendations.append('多个候选分数接近, 需要 2D NMR 数据区分')
-        recommendations.append(f'建议优先获取 HSQC 和 HMBC 谱图')
+        if has_2d_support:
+            recommendations.append(f'多个候选分数接近, 2D 验证分有限 (HSQC={hsqc_rate:.0%})')
+        else:
+            recommendations.append('多个候选分数接近, 需要 2D NMR 数据区分')
+            recommendations.append(f'建议优先获取 HSQC 和 HMBC 谱图')
         # 列出前 3 候选
         for rank_i, (idx, sc) in enumerate(indexed[:3], 1):
             recommendations.append(f'  候选 {rank_i}: {evidences[idx].smiles} (分={sc:.3f})')

@@ -28,6 +28,16 @@ from .io_bruker import (
     read_bruker_experiment,
     read_bruker_folder,
 )
+from .io_bruker_2d import (
+    Peak2D,
+    Spectrum2D,
+    read_bruker_2d_experiment,
+    read_bruker_2d_folder,
+)
+from .correlation_2d import (
+    Correlation2DScore,
+    score_candidate_2d,
+)
 from .io_sdf import (
     NmrShiftDb2Entry,
     read_nmrshiftdb2_sdf,
@@ -45,9 +55,12 @@ __all__ = [
     "BrukerSpectrum",
     "CandidateEvidence",
     "Constraints",
+    "Correlation2DScore",
     "NmrShiftDb2Entry",
+    "Peak2D",
     "RetrievalHit",
     "ScoredCandidate",
+    "Spectrum2D",
     "build_evidence",
     "build_inference_config",
     "convert_bruker_folder_to_nmr2struct",
@@ -56,11 +69,14 @@ __all__ = [
     "draw_unmatched_overlay",
     "parse_constraints_from_acqus",
     "parse_predictions_h5",
+    "read_bruker_2d_experiment",
+    "read_bruker_2d_folder",
     "read_bruker_experiment",
     "read_bruker_folder",
     "read_nmrshiftdb2_sdf",
     "retrieve_candidates",
     "run_nmr2struct_inference",
+    "score_candidate_2d",
     "score_candidates",
     "stream_nmrshiftdb2_sdf",
     "write_candidates_markdown",

@@ -2,7 +2,7 @@
 
 基于 **nmrshiftdb2 (58K) + lucy-ng (928K) 双数据源** + **nmrglue Bruker 解析** + **RDKit 化学信息学** 的 NMR 反推结构工具。
 读取 1H/13C 谱图 → 在双数据源检索 (优先 lucy-ng 928K 化合物 + lucy-ng-derep.db, 回退 nmrshiftdb2 SDF) → 输出 Top-N 候选 + 证据链 + 未匹配峰标注。
-可选附加：**fid 交叉验证**（独立算法路径）、**1r 真实谱可视化**、**nmrsim 反向校验**、**NMR2Struct 端到端 ML**、**HOSE 13C 预测验证**（本地表 + lucy-ng 928K 双数据库）、**PubChem 扩展检索**、**片段组装候选生成**、**统一日志记录**。
+可选附加：**fid 交叉验证**（独立算法路径）、**1r 真实谱可视化**、**nmrsim 反向校验**、**NMR2Struct 端到端 ML**、**HOSE 13C 预测验证**（本地表 + lucy-ng 928K 双数据库）、**PubChem 扩展检索**、**片段组装候选生成**、**2D NMR 关联验证 (HSQC/HMBC/COSY)**、**统一日志记录**。
 
 **核心目标**：从"输出候选列表"升级为"**推断真实结构并报告置信度**"——通过 HOSE code 预测验证 + 多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级置信度结论。
 
@@ -24,6 +24,8 @@ Bruker 原始谱 (NMR/<sample>/)
 [4] score_candidates (coverage + RMS penalty) + build_evidence
         ↓
 [5] (可选) nmrsim 反向校验 cosine
+        ↓
+[5.5] (可选) 2D NMR 关联验证 (HSQC/HMBC/COSY, --use-2d 启用)
         ↓
 [6] (可选) HOSE code 13C 预测验证 (**双数据源**: 优先 lucy-ng 928K SQLite，回退 nmrshiftdb2 本地表, MAE ~3.5 ppm / ~5 ppm)
         ↓
@@ -124,6 +126,7 @@ python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
 | `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
 | `--use-pubchem` | PubChem 扩展检索：当 nmrshiftdb2 命中不足时，按分子式 / 13C 推断子结构去 PubChem 查候选 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
 | `--use-fragment-assembly` | 片段组装候选生成：当数据库检索均无命中时，从 13C 位移范围 + DEPT 约束组装结构（仅 1D 谱可走） | JSON 报告里追加 `fragment_candidates[]` |
+| `--use-2d` | 2D NMR 关联验证：自动检测 COSY/HSQC/HMBC/ROESY 实验，提取交叉峰关联，验证候选结构；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `correlation_2d` 章节 |
 | `--determine` | 结构推断置信度评估：多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级结论 | JSON/MD/HTML 报告顶部追加 `determination` 章节 |
 | `--hose-cache <path>` | HOSE 查找表缓存路径（默认 `<sdf 同目录>/_hose_lookup_cache.tsv`，避免重复建表） | — |
 | `--hose-max-records <N>` | 从 SDF 构建 HOSE 查找表的最大记录数（默认 **50000**；0=全部；10000 轻度，50000 够用，100000+ 需约 5 分钟） | — |
@@ -580,6 +583,20 @@ python -X utf8 -m nmr_elucidator \
     --use-hose --use-pubchem --determine
 ```
 
+### 示例 9：2D NMR 关联验证（有 COSY/HSQC/HMBC 数据时）
+
+```bash
+# 启用 2D NMR 关联验证 (自动检测 COSY/HSQC/HMBC/ROESY)
+python -X utf8 -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh100" \
+    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
+    --top-n 10 \
+    --use-2d \
+    --determine
+# 输出报告中包含 HSQC/HMBC/COSY 匹配率
+# 无 2D 数据时 (clxh3) 自动回退到 1D 流程
+```
+
 ## clxh3 实测样本（参考产物）
 
 `output/clxh3/` 下 27 个产物文件（~30 MB）。关键观察：
@@ -613,6 +630,7 @@ python -X utf8 -m nmr_elucidator \
 - ✅ **PubChem 扩展检索**（`retrieve_pubchem.py`，按分子式 + 13C 推断子结构检索，处理网络失败/速率限制）
 - ✅ **片段组装候选生成**（`shift_ranges.py` + `fragment_assembler.py`，从 13C 位移范围 + DEPT 约束 + 分子式生成库外结构，控制组合爆炸）
 - ✅ **结构推断置信度评估**（`determination.py`，多源证据融合打分，四级结论：确定/很可能/不确定/无匹配）
+- ✅ **2D NMR 关联验证**（`io_bruker_2d.py` + `correlation_2d.py`，自动检测 COSY/HSQC/HMBC/ROESY，MAD-SNR 自适应检峰，候选结构 2D 匹配率打分，无 2D 数据时自动回退）
 - ✅ **CPU 路径完整闭环**：从 1D 谱 + 已知分子式可输出推断结论 + 证据链，无需 GPU / ML 权重
 - ✅ **与 MestReNova 功能对齐**（`doc/MestReNova_解谱指南.md`，本项目增强后覆盖 Database / NMRPredict / Verify / 部分 CASE 能力）
 
@@ -693,6 +711,8 @@ python -X utf8 -m nmr_elucidator \
 | `nmr_predict.py` | 13C 化学位移预测 + 候选验证（从 nmrshiftdb2 SDF 自建 HOSE 查找表） | `get_predictor`, `verify_candidate`, `HOSELookupTable`, `C13Predictor` |
 | `lucy_ng_hose.py` | lucy-ng 完整 HOSE 数据库集成（928K 化合物，~2.8 GB SQLite，MAE ~3.5 ppm） | `LucyNGHOSEProvider`, `predict_smiles`, `verify_candidate_with_lucy_db`, `get_lucy_ng_provider` |
 | `determination.py` | 结构推断置信度评估（多源证据融合 + 四级结论） | `assess_determination`, `compute_unified_score`, `DeterminationResult` |
+| `io_bruker_2d.py` | 2D Bruker 谱图读取与峰检测 (COSY/HSQC/HMBC/ROESY) | `read_bruker_2d_folder`, `read_bruker_2d_experiment`, `pick_peaks_2d`, `Spectrum2D`, `Peak2D` |
+| `correlation_2d.py` | 2D NMR 关联提取与候选验证打分 | `score_candidate_2d`, `extract_hsqc_pairs`, `extract_hmbc_pairs`, `extract_cosy_pairs`, `Correlation2DScore` |
 | `retrieve_pubchem.py` | PubChem 扩展检索（分子式 + 子结构，错误静默降级） | `retrieve_pubchem_candidates`, `PubChemCandidate` |
 | `shift_ranges.py` | 13C 化学位移经验范围表 + 官能团推断 | `infer_functional_groups`, `assign_shift_ranges`, `SHIFT_RANGES` |
 | `fragment_assembler.py` | 片段组装候选生成器（库外新骨架，从 1D 约束出发） | `build_constraints`, `assemble_candidates`, `FragmentConstraint` |

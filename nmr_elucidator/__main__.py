@@ -33,6 +33,32 @@ from .log_setup import setup_logging as _setup_logging
 from .log_setup import get_logger as _get_logger
 
 
+def _cleanup_embedded_pngs(out_prefix: str, top_n: int, evidences) -> None:
+    """HTML 已内嵌所有图片为 base64, 删除输出目录中的独立 PNG 文件.
+
+    保留输出目录简洁: 只留 .json / .md / .html / .csv.
+    删除失败时静默跳过 (不影响主流程).
+    """
+    import glob as _glob
+    patterns = [
+        out_prefix + '_topn.png',
+        out_prefix + '_overlay.png',
+        out_prefix + '_real_spectrum.png',
+        out_prefix + '_heatmap.png',
+        out_prefix + '_scatter.png',
+        out_prefix + '_matrix.png',
+        out_prefix + '_overview.png',
+    ]
+    # 单分子图 (含历史残留的 rank PNG)
+    patterns.extend(_glob.glob(out_prefix + '_rank*.png'))
+    for p in patterns:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
 def _filter_peaks_by_intensity(shifts, intensities, percentile=0.20):
     """保留强度 ≥ 第 N 百分位的峰 (去噪声).
 
@@ -126,6 +152,9 @@ def main(argv=None):
                         help='启用 PubChem 扩展检索 (按分子式/子结构)')
     parser.add_argument('--use-fragment-assembly', action='store_true',
                         help='启用片段组装候选生成 (库外新骨架)')
+    parser.add_argument('--use-2d', action='store_true',
+                        help='启用 2D NMR 关联验证 (HSQC/HMBC/COSY); '
+                             '无 2D 数据时自动回退到 1D 流程')
     parser.add_argument('--determine', action='store_true',
                         help='输出结构推断结论 (含置信度分级)')
     parser.add_argument('--hose-cache', default=None,
@@ -177,6 +206,26 @@ def main(argv=None):
         print(f"  - exp {s.exp_no}: {s.nucleus} ({s.pulse_program}) "
               f"solvent={s.solvent or '?'} peaks={len(s.peaks)} integrals={len(s.integrals)}",
               file=sys.stderr)
+
+    # 1.5 检测 2D 实验 (--use-2d 开启)
+    spectra_2d = {}
+    if args.use_2d:
+        print(f"[1.5/5] 检测 2D NMR 实验 ...", file=sys.stderr)
+        try:
+            from .io_bruker_2d import read_bruker_2d_folder
+            spectra_2d = read_bruker_2d_folder(folder, quiet=args.quiet)
+            if spectra_2d:
+                print(f"  -> 检测到 2D 实验: {list(spectra_2d.keys())}", file=sys.stderr)
+                for etype, spec in spectra_2d.items():
+                    print(f"     {etype}: exp={spec.exp_no} peaks={len(spec.peaks)} "
+                          f"({spec.f1_nucleus}-{spec.f2_nucleus})", file=sys.stderr)
+            else:
+                print(f"  -> 未检测到 2D 数据, 回退到 1D 流程", file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 2D 检测失败, 回退到 1D: {ex}", file=sys.stderr)
+            spectra_2d = {}
+    else:
+        print(f"[1.5/5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
 
     # 2. 构造问题
     problem = _build_problem_from_bruker(specs)
@@ -276,6 +325,35 @@ def main(argv=None):
                     break
     else:
         print(f"[5/5] 跳过 nmrsim 反向校验", file=sys.stderr)
+
+    # 5.5 2D NMR 关联验证 (可选, 依赖 --use-2d + 实际 2D 数据)
+    if spectra_2d:
+        print(f"[5.5] 2D NMR 关联验证 (HSQC/HMBC/COSY) ...", file=sys.stderr)
+        try:
+            from .correlation_2d import score_candidate_2d
+            for e in evidences[:args.top_n]:
+                # 找到对应的 entry (从 scored 中匹配 smiles)
+                entry_for_2d = None
+                for s in scored:
+                    if (s.hit.entry.canonical_smiles or s.hit.entry.smiles) == e.smiles:
+                        entry_for_2d = s.hit.entry
+                        break
+                if entry_for_2d is None:
+                    continue
+                score_2d = score_candidate_2d(
+                    entry_for_2d, spectra_2d,
+                    h_tol=args.h_tol, c_tol=args.c_tol,
+                )
+                e.correlation_2d_score = score_2d
+                e.notes.extend(score_2d.notes)
+            print(f"  -> 2D 验证完成: {min(args.top_n, len(evidences))} 个候选", file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 2D 关联验证失败: {ex}", file=sys.stderr)
+    else:
+        if args.use_2d:
+            print(f"[5.5] 跳过 2D 验证 (无 2D 数据)", file=sys.stderr)
+        else:
+            print(f"[5.5] 跳过 2D 验证", file=sys.stderr)
 
     # 6. HOSE 13C 预测验证（可选）
     hose_verifications = []
@@ -399,6 +477,8 @@ def main(argv=None):
         'used_hose_source': 'lucy-ng-derep.db' if (args.use_hose and args.lucy_ng_db) else 'local-sdf',
         'used_pubchem': bool(args.use_pubchem),
         'used_fragment_assembly': bool(args.use_fragment_assembly),
+        'used_2d': bool(args.use_2d and spectra_2d),
+        '2d_experiments': list(spectra_2d.keys()) if spectra_2d else [],
         'dept_counts': dept_counts,
         'observed_carbon_shifts': problem.carbon_shifts,
         'observed_proton_shifts': problem.proton_shifts,
@@ -447,18 +527,23 @@ def main(argv=None):
             {'smiles': fc.smiles, 'source': fc.source, 'notes': fc.notes}
             for fc in fragment_candidates[:20]
         ]
-    write_report_json(out_prefix + '.json', evidences, meta)
-    write_report_markdown(out_prefix + '.md', evidences, meta, top_n=args.top_n)
-    # HTML 报告（人类阅读, 含流程/结果/结构图/未匹配峰/DEPT 推断）
-    write_report_html(
-        out_prefix + '.html',
-        evidences=evidences,
-        meta=meta,
-        bridge_info=bridge_info,
-        top_n=args.top_n,
-    )
-
-    # 结构图与未匹配峰汇总
+    # 2D NMR 关联验证分
+    if spectra_2d:
+        meta['correlation_2d'] = {}
+        for e in evidences[:args.top_n]:
+            if e.correlation_2d_score is not None:
+                s2d = e.correlation_2d_score
+                meta['correlation_2d'][e.smiles] = {
+                    'hsqc_match_rate': s2d.hsqc_match_rate,
+                    'hmbc_match_rate': s2d.hmbc_match_rate,
+                    'cosy_match_rate': s2d.cosy_match_rate,
+                    'combined_2d_score': s2d.combined_2d_score,
+                    'n_hsqc_obs': s2d.n_hsqc_obs,
+                    'n_hmbc_obs': s2d.n_hmbc_obs,
+                    'n_cosy_obs': s2d.n_cosy_obs,
+                    'notes': s2d.notes,
+                }
+    # 结构图生成 (在 HTML 报告之前, 以便 HTML 内嵌 base64 图片)
     print(f"[viz] 生成 Top-N 结构图...", file=sys.stderr)
     try:
         draw_topn_grid(evidences, out_prefix + '_topn.png', top_n=args.top_n)
@@ -485,6 +570,39 @@ def main(argv=None):
         )
     except Exception as e:
         print(f"WARN: 对比图生成失败: {e}", file=sys.stderr)
+
+    # 真实谱线形图 (来自 pdata/1/1r; --with-real-spectrum 开启)
+    # 价值: peaklist.xml 是竹签, 1r 是完整线形. 叠加展示真实谱 + 峰检测落点是否吻合.
+    if args.with_real_spectrum:
+        print(f"[real] 读取 pdata/1/1r 真实谱并绘图...", file=sys.stderr)
+        try:
+            specs_proc = read_processed_folder(folder, specs=specs)
+            if specs_proc:
+                observed_by_exp = {int(s.exp_no): [p.shift for p in s.peaks]
+                                   for s in specs if str(s.exp_no).isdigit()}
+                draw_real_spectrum_overlay(specs_proc, observed_by_exp,
+                                           out_prefix + '_real_spectrum.png')
+                print(f"  -> 真实谱图已生成 ({len(specs_proc)} 个实验)", file=sys.stderr)
+            else:
+                print(f"  WARN: 未读到任何 1r 真实谱 (检查 pdata/1/1r 是否存在)", file=sys.stderr)
+        except ProcessedReadError as e:
+            print(f"WARN: 真实谱读取失败 (stage={e.stage}): {e}", file=sys.stderr)
+
+    # 报告输出 (JSON/Markdown/HTML)
+    write_report_json(out_prefix + '.json', evidences, meta)
+    write_report_markdown(out_prefix + '.md', evidences, meta, top_n=args.top_n)
+    # HTML 报告（人类阅读, 含流程/结果/结构图/未匹配峰/DEPT 推断, 图片 base64 内嵌）
+    write_report_html(
+        out_prefix + '.html',
+        evidences=evidences,
+        meta=meta,
+        bridge_info=bridge_info,
+        top_n=args.top_n,
+    )
+
+    # HTML 已内嵌所有图片, 删除独立 PNG 文件 (保持输出目录简洁)
+    _cleanup_embedded_pngs(out_prefix, args.top_n, evidences)
+
     # 未匹配峰汇总 CSV
     try:
         write_unmatched_summary_csv(
@@ -492,27 +610,6 @@ def main(argv=None):
         )
     except Exception as e:
         print(f"WARN: 未匹配峰 CSV 失败: {e}", file=sys.stderr)
-
-    # 真实谱线形图 (来自 pdata/1/1r; --with-real-spectrum 开启)
-    # 价值: peaklist.xml 是竹签, 1r 是完整线形. 叠加展示真实谱 + 峰检测落点是否吻合.
-    real_spectrum_png = None
-    if args.with_real_spectrum:
-        print(f"[real] 读取 pdata/1/1r 真实谱并绘图...", file=sys.stderr)
-        try:
-            specs_proc = read_processed_folder(folder, specs=specs)
-            if specs_proc:
-                # io_bruker 的 exp_no 是 str, 统一转 int 匹配 io_processed 的数字 exp 键
-                observed_by_exp = {int(s.exp_no): [p.shift for p in s.peaks]
-                                   for s in specs if str(s.exp_no).isdigit()}
-                real_spectrum_png = out_prefix + '_real_spectrum.png'
-                draw_real_spectrum_overlay(specs_proc, observed_by_exp, real_spectrum_png)
-                print(f"  -> {real_spectrum_png} ({len(specs_proc)} 个实验)", file=sys.stderr)
-            else:
-                real_spectrum_png = None
-                print(f"  WARN: 未读到任何 1r 真实谱 (检查 pdata/1/1r 是否存在)", file=sys.stderr)
-        except ProcessedReadError as e:
-            real_spectrum_png = None
-            print(f"WARN: 真实谱读取失败 (stage={e.stage}): {e}", file=sys.stderr)
 
     # nmrpy fid 时域二次处理 + 交叉验证 (--validate-with-nmrpy 开启)
     # 价值: 从 fid 第一性原理重出谱, 独立验证 peaklist.xml 的峰是否可复现.
@@ -532,13 +629,8 @@ def main(argv=None):
     print(f"\nDONE. Top-{args.top_n} 已写入:", file=sys.stderr)
     print(f"  {out_prefix}.json  (机器读取)", file=sys.stderr)
     print(f"  {out_prefix}.md    (Markdown 备查)", file=sys.stderr)
-    print(f"  {out_prefix}.html  (人类阅读报告, 含流程+结构图)", file=sys.stderr)
-    print(f"  {out_prefix}_topn.png (候选网格)", file=sys.stderr)
-    print(f"  {out_prefix}_rank*.png (单分子)", file=sys.stderr)
-    print(f"  {out_prefix}_overlay.png (实测 vs 候选对比)", file=sys.stderr)
+    print(f"  {out_prefix}.html  (人类阅读报告, 含全部图片 base64 内嵌)", file=sys.stderr)
     print(f"  {out_prefix}_unmatched.csv (未匹配峰汇总)", file=sys.stderr)
-    if real_spectrum_png:
-        print(f"  {real_spectrum_png} (1r 真实谱线形)", file=sys.stderr)
     if nmrpy_ok:
         print(f"  {out_prefix}_nmrpy_validation.{{json,md,png}} (nmrpy fid 交叉验证)", file=sys.stderr)
     return 0
