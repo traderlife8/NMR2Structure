@@ -58,3 +58,4 @@ credentials.json
 
 # 自动提交 watcher 运行时状态
 .auto_commit.pid
+*.ps1
