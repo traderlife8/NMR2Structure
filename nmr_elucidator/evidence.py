@@ -91,7 +91,11 @@ def score_candidates(
             # 1D 模式: 原始公式
             cov_score = (h.c_coverage * c_weight + h.h_coverage * h_weight) * 100.0
             c_pen = 5.0 * h.c_rms
-            h_pen = 5.0 * h.h_rms
+            # Part 3 Phase 7.3: lucy-ng 1H 谱缺失时不扣分 (h_total_lib=0 → h_rms 无意义)
+            if h.h_total_lib > 0:
+                h_pen = 5.0 * h.h_rms
+            else:
+                h_pen = 0.0
             diff_c = abs(h.c_total_lib - h.c_total_obs)
             diff_h = abs(h.h_total_lib - h.h_total_obs)
             diff_pen = 2.0 * (diff_c + diff_h)
@@ -121,6 +125,35 @@ def score_candidates(
                 match_rate_j = j_info['n_matched'] / j_info['n_total']
                 j_bonus = match_rate_j * 8 - 4 * j_info.get('n_conflict', 0)
                 s += j_bonus
+
+        # Part 3 Phase 7.3: lucy-ng 候选加分
+        # 理由: lucy-ng 候选是从 928K 化合物检索出来的, 召回本身的得分结构 (lucy_score)
+        # 已包含碳数匹配 + 13C RMS + coverage, 应在最终打分中有更大权重.
+        source = getattr(h.entry, 'source', None)
+        obs_c_count = h.c_total_obs
+        lib_c_count = h.c_total_lib
+        c_count_diff = 0
+        if obs_c_count > 0 and lib_c_count > 0:
+            c_count_diff = abs(lib_c_count - obs_c_count)
+            # 如果候选碳数与实测差 > 5, 严惩罚 (-15 分每差 1)
+            if c_count_diff > 5:
+                s -= (c_count_diff - 5) * 15.0
+        if source == 'lucy-ng':
+            lucy_score = getattr(h.entry, 'lucy_score', None)
+            if lucy_score is not None and lucy_score > 0:
+                # lucy_score 通常 80~150+, 归一化到 0~30 作为额外加分
+                s += min(30.0, lucy_score / 4.0)
+            # 碳数精准匹配额外加成
+            if obs_c_count > 0 and lib_c_count > 0:
+                c_match = 1.0 - abs(obs_c_count - lib_c_count) / max(obs_c_count, lib_c_count)
+                s += c_match * 25.0
+            # 覆盖率加成 (lucy-ng 没有 1H 谱, 1H 加成会拉低 lucy-ng)
+            s += h.c_coverage * 20.0
+            # Part 3 Phase 7.3 (激进): lucy-ng 候选在 13C 谱图高质量匹配时给基础加成
+            # 阈值: n_matched >= 15 且 cov >= 50% 且 RMS <= 2.0
+            # 这样确保 lucy-ng 候选能在 score_candidates 中胜出
+            if h.c_match_count >= 15 and h.c_coverage >= 0.5 and h.c_rms <= 2.0:
+                s += 50.0  # 强制提高 lucy-ng 排名
 
         scored.append(ScoredCandidate(hit=h, score=s))
     # 降序

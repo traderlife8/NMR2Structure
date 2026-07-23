@@ -103,7 +103,7 @@ def _write_cnmr_txt(out_path: str, cnmr_peaks: List[float]) -> int:
 
 
 # 容忍窗口: 主谱峰位置 vs DEPT 峰位置最大允许差 (ppm)
-DEPT_TOL_PPM = 0.3
+DEPT_TOL_PPM = 5.0  # Part 3: 放宽到 5.0 ppm (clxh100 实测 DEPT vs 主谱偏差可达 ±4.5 ppm)
 
 
 def _match_to_main(main_shifts: List[float], aux_shifts: List[float], tol: float = DEPT_TOL_PPM) -> set:
@@ -158,7 +158,7 @@ def assign_carbon_multiplicity(
 
     main_sorted = sorted(main_shifts, reverse=True)
     if dept90_tol is None:
-        dept90_tol = min(tol, 0.10)
+        dept90_tol = min(tol, 0.50)  # Part 3: 放宽到 0.5 ppm (不同实验间 ppm 校准差异)
 
     # 准备各 DEPT 在主谱中的命中索引
     idx90_in_main: dict[int, None] = {}
@@ -277,15 +277,15 @@ def convert_bruker_folder_to_nmr2struct(
     n_h = _write_hnmr_txt(hnmr_out, h_shifts, h_integrals)
     n_c = _write_cnmr_txt(cnmr_out, c_shifts)
 
-    # DEPT 推断 (可选)
+    # DEPT 推断 (可选) - 使用全部 13C 峰 (不过滤), 避免丢失弱峰
     dept_summary: list[dict] = []
-    if use_dept and c_spec and c_shifts:
+    if use_dept and c_spec and c_peaks_raw:
         d90_shifts = [p.shift for p in d90_spec.peaks] if d90_spec else None
         d135_shifts = [p.shift for p in d135_spec.peaks] if d135_spec else None
         # 直接从 d135 peaklist 读 sign (intensity > 0 -> positive, < 0 -> negative)
         d135_signs = [p.sign for p in d135_spec.peaks] if d135_spec else None
         c_with_mult = assign_carbon_multiplicity(
-            c_shifts, d90_shifts, d135_shifts, d135_signs,
+            c_peaks_raw, d90_shifts, d135_shifts, d135_signs,
         )
         for item in c_with_mult:
             dept_summary.append({

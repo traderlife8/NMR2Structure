@@ -130,7 +130,7 @@ def extract_cosy_pairs(
     COSY 的 F1=1H, F2=1H. 去除对角线峰 (|F1-F2| < diagonal_tol).
     去重复: (a,b) 和 (b,a) 只保留一个 (a < b).
     """
-    if spectrum.experiment_type != 'COSY':
+    if spectrum.experiment_type not in ('COSY', 'ROESY', 'NOESY', 'TOCSY'):
         return []
     pairs: Set[Tuple[float, float]] = set()
     # 按 SNR 过滤

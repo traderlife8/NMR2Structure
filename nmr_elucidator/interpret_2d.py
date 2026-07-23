@@ -158,13 +158,22 @@ def _step1_hsqc_to_ch_pairs(
     solvent: str = '',
     h_tol: float = 0.3,
     c_tol: float = 2.5,
-    min_snr: float = 20.0,
+    min_snr: float = 8.0,
+    carbon_shifts_1d: Optional[List[float]] = None,
+    proton_shifts_1d: Optional[List[float]] = None,
+    c_1d_tol: float = 2.0,
+    h_1d_tol: float = 0.15,
 ) -> List[CHPair]:
     """从 HSQC 谱提取 C-H 直接连接对, 结合 DEPT 和 1H 积分确定碳级数.
 
     HSQC F1=13C, F2=1H. 每个交叉峰 = 一个直接 C-H 连接.
     碳级数来源优先级: DEPT 推断 > 1H 积分推断 > 化学位移经验 > 'unknown'.
     若提供 multiplets (1H 多重峰分析结果), 会按 h_ppm 匹配将 J 耦合填入 CHPair.
+
+    Part 3 Phase 1: 1D 峰表双向约束过滤.
+    - 若提供 carbon_shifts_1d: HSQC F1 必须在某个 1D 13C 峰 ±c_1d_tol 内
+    - 若提供 proton_shifts_1d: HSQC F2 必须在某个 1D 1H 峰 ±h_1d_tol 内
+    - 去重: 同一 (dC, dH) 对只保留最强峰
 
     Part 2.B: 若提供 solvent, HSQC 中位于溶剂残余 (h, c) 位置的交叉峰会被标记
     为 is_solvent_residual, 仍在列表中返回 (供人工复核), 但不阻塞下游处理.
@@ -173,15 +182,156 @@ def _step1_hsqc_to_ch_pairs(
         proton_integrals: [(center_ppm, integral_value), ...] 1H 积分数据
         multiplets: [Multiplet, ...] 1H 多重峰分析结果 (J 耦合)
         solvent: 溶剂名 (e.g. 'CDCl3', 'DMSO-D6') 用于标记溶剂残余峰
+        carbon_shifts_1d: 1D 13C 观测位移列表 (用于约束 HSQC F1)
+        proton_shifts_1d: 1D 1H 观测位移列表 (用于约束 HSQC F2)
+        c_1d_tol: 13C 约束容差 (ppm)
+        h_1d_tol: 1H 约束容差 (ppm)
     """
     from .correlation_2d import extract_hsqc_pairs
 
     if 'HSQC' not in spectra_2d:
         return []
 
-    hsqc_pairs_raw = extract_hsqc_pairs(spectra_2d['HSQC'], min_snr=min_snr)
+    hsqc_spectrum = spectra_2d['HSQC']
+
+    # Part 3 Phase 1: 1D 引导的 HSQC 提取
+    # 策略: 对每个 1D 13C 峰, 在 HSQC 的 F1 切片中找最强 1H 信号
+    # 这比纯峰检测更可靠, 因为我们知道确切的 F1 位置
+    hsqc_pairs_raw = []
+    if carbon_shifts_1d and hsqc_spectrum.data is not None:
+        import numpy as _np
+        data = hsqc_spectrum.data
+        f1_scale = hsqc_spectrum.f1_ppm_scale  # 13C ppm 轴
+        f2_scale = hsqc_spectrum.f2_ppm_scale  # 1H ppm 轴
+
+        # 计算噪声水平 (MAD-based)
+        med = float(_np.median(data))
+        mad = float(_np.median(_np.abs(data - med)))
+        sigma = 1.4826 * mad if mad > 0 else 1.0
+        # 1D 引导提取用较低阈值 (3*sigma)
+        guided_threshold = 3.0 * sigma
+
+        # 构建 DEPT 季碳集合 (用于跳过已知季碳)
+        _cq_set = set()
+        for d in dept_summary:
+            if d.get('mult') == 'Cq':
+                _cq_set.add(round(d.get('ppm', 0), 1))
+
+        # Part 3: 溶剂 13C 峰过滤 (排除已知溶剂残余峰)
+        # 注意: 仅当 1H 和 13C 同时匹配溶剂时才过滤, 避免误删真实峰
+        from .solvent_filter import is_solvent_peak as _is_sol_c
+        _solvent_str = solvent or hsqc_spectrum.solvent or ''
+        _all_solvents = ['CDCl3', 'DMSO-D6', 'CD3OD', 'PYR', 'Acetone-D6', 'C6D6', 'CD2Cl2']
+
+        def _is_solvent_hsqc_pair(h_ppm: float, c_ppm: float) -> bool:
+            """判断 (dH, dC) 对是否为溶剂残余 HSQC 交叉峰.
+            仅当 1H 和 13C 同时匹配同一溶剂时才视为溶剂峰.
+            """
+            for s in _all_solvents:
+                if (_is_sol_c(h_ppm, '1H', s, 0.1)
+                        and _is_sol_c(c_ppm, '13C', s, 1.5)):
+                    return True
+            if _solvent_str:
+                if (_is_sol_c(h_ppm, '1H', _solvent_str, 0.1)
+                        and _is_sol_c(c_ppm, '13C', _solvent_str, 1.5)):
+                    return True
+            return False
+
+        for c_ppm_target in carbon_shifts_1d:
+            # Part 3 Phase 2: 跳过 DEPT 确认为季碳的 13C 峰
+            if round(c_ppm_target, 1) in _cq_set:
+                continue
+            # 找 F1 轴上最接近 c_ppm_target 的索引
+            f1_idx = int(_np.argmin(_np.abs(f1_scale - c_ppm_target)))
+            # 检查实际 dC 偏差 (若偏差 > c_1d_tol, 跳过)
+            actual_c = float(f1_scale[f1_idx])
+            if abs(actual_c - c_ppm_target) > c_1d_tol:
+                continue
+
+            # 提取 F1 切片 (±2 点平均以提高 SNR)
+            n_f1 = len(f1_scale)
+            lo = max(0, f1_idx - 2)
+            hi = min(n_f1, f1_idx + 3)
+            trace = data[lo:hi, :].mean(axis=0)  # 沿 F1 平均
+
+            # 在 trace 中找最强峰 (排除负峰)
+            max_idx = int(_np.argmax(trace))
+            max_val = float(trace[max_idx])
+            if max_val < guided_threshold:
+                continue  # 该 13C 无 HSQC 交叉峰 (季碳)
+
+            h_ppm = float(f2_scale[max_idx])
+
+            # 1H 约束: 若提供 proton_shifts_1d, 检查是否有匹配的 1H 峰
+            if proton_shifts_1d:
+                h_match = any(abs(h_ppm - h1d) <= h_1d_tol
+                              for h1d in proton_shifts_1d)
+                if not h_match:
+                    # 尝试在 trace 中找次强峰 (可能有匹配的)
+                    # 将最强峰位置置零, 再找
+                    trace_copy = trace.copy()
+                    # 排除最强峰附近 ±5 点
+                    exc_lo = max(0, max_idx - 5)
+                    exc_hi = min(len(trace_copy), max_idx + 6)
+                    trace_copy[exc_lo:exc_hi] = 0
+                    max_idx2 = int(_np.argmax(trace_copy))
+                    max_val2 = float(trace_copy[max_idx2])
+                    if max_val2 >= guided_threshold:
+                        h_ppm2 = float(f2_scale[max_idx2])
+                        h_match2 = any(abs(h_ppm2 - h1d) <= h_1d_tol
+                                       for h1d in proton_shifts_1d)
+                        if h_match2:
+                            h_ppm = h_ppm2
+                            max_val = max_val2
+                        else:
+                            continue
+                    else:
+                        continue
+
+            # 溶剂过滤 (1H + 13C 双重匹配)
+            if _is_solvent_hsqc_pair(h_ppm, actual_c):
+                continue
+
+            hsqc_pairs_raw.append((h_ppm, actual_c))
+
+        # 补充: 也加入传统峰检测的结果 (SNR >= 20 的强峰)
+        strong_pairs = extract_hsqc_pairs(hsqc_spectrum, min_snr=20.0)
+        for h, c in strong_pairs:
+            # 检查是否已有近似对 (避免重复)
+            already = any(abs(h - eh) < 0.05 and abs(c - ec) < 1.0
+                          for eh, ec in hsqc_pairs_raw)
+            if not already:
+                # 1D 约束检查
+                if carbon_shifts_1d:
+                    if not any(abs(c - c1d) <= c_1d_tol for c1d in carbon_shifts_1d):
+                        continue
+                if proton_shifts_1d:
+                    if not any(abs(h - h1d) <= h_1d_tol for h1d in proton_shifts_1d):
+                        continue
+                # 溶剂过滤 (1H + 13C 双重匹配)
+                if _is_solvent_hsqc_pair(h, c):
+                    continue
+                # 季碳过滤
+                if round(c, 1) in _cq_set:
+                    continue
+                hsqc_pairs_raw.append((h, c))
+    else:
+        # 无 1D 数据时回退到传统峰检测
+        hsqc_pairs_raw = extract_hsqc_pairs(hsqc_spectrum, min_snr=min_snr)
+
     if not hsqc_pairs_raw:
         return []
+
+    # Part 3 Phase 1: 去重 - 同一 (dC±1.0, dH±0.05) 只保留最强峰
+    # 按 (rounded_c, rounded_h) 分组, 取第一个
+    seen: set = set()
+    deduped = []
+    for h_ppm, c_ppm in hsqc_pairs_raw:
+        key = (round(c_ppm), round(h_ppm * 20) / 20)  # ~1ppm C, ~0.05ppm H
+        if key not in seen:
+            seen.add(key)
+            deduped.append((h_ppm, c_ppm))
+    hsqc_pairs_raw = deduped
 
     # 构建 DEPT 查找: 13C_ppm -> multiplicity
     dept_by_c: Dict[float, str] = {}
@@ -253,12 +403,19 @@ def _step1_hsqc_to_ch_pairs(
                 mult = dept_m
                 break
 
+        # Part 3 Phase 2: 逻辑修正 - 有 HSQC 交叉峰的碳不可能是季碳
+        # DEPT 推断为 Cq 但实际有 HSQC 峰 → 说明 DEPT 推断有误, 覆盖为 CH
+        if mult == 'Cq':
+            mult = 'CH'  # 最低限度: 有 H  attached
+
         # 查找 1H 积分
         h_integral = _find_integral(h_ppm)
 
         # 如果 DEPT 未确定, 用积分推断
-        if mult == 'unknown' and h_integral is not None:
-            mult = _integral_to_mult(h_integral)
+        if mult in ('unknown', 'CH') and h_integral is not None:
+            int_mult = _integral_to_mult(h_integral)
+            if int_mult != 'unknown':
+                mult = int_mult
 
         # 查找该 H 的 J 耦合 (按 h_ppm 匹配 multiplet)
         j_vals = _find_j_couplings(round(h_ppm, 3))
@@ -1161,7 +1318,8 @@ def interpret_2d_sequential(
 
     # 步骤 1: HSQC → C-H 对 (结合 DEPT + 1H 积分推断碳级数, 填充 J 耦合)
     ch_pairs = _step1_hsqc_to_ch_pairs(
-        spectra_2d, dept_summary, proton_integrals, multiplets, solvent=solvent)
+        spectra_2d, dept_summary, proton_integrals, multiplets, solvent=solvent,
+        carbon_shifts_1d=carbon_shifts_1d, proton_shifts_1d=proton_shifts_1d)
     result.ch_pairs = ch_pairs
 
     # 步骤 1b: 重叠峰分解 (对标 5.9 流程: ¹³C 切片 + 分峰检测)

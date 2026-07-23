@@ -29,7 +29,9 @@ Bruker 原始谱 (NMR/<sample>/)
         ↓
 [6] (可选) HOSE code 13C 预测验证 (**双数据源**: 优先 lucy-ng 928K SQLite，回退 nmrshiftdb2 本地表, MAE ~3.5 ppm / ~5 ppm)
         ↓
-[7] (可选) PubChem 扩展检索 (按分子式 / 13C 推断子结构)
+[3c] (自动) 本地库无命中时, 自动扩大到 PubChem 联网检索
+        ↓
+[7] (可选) PubChem 强制检索 (--use-pubchem, 即使本地有命中也检索)
         ↓
 [8] (可选) 片段组装候选生成 (库外新骨架, DEPT + 化学位移范围驱动)
         ↓
@@ -52,13 +54,30 @@ output/<sample>/<sample>.{json,md,html}  (HTML 内嵌所有图片 base64)
 
 ## 安装
 
-```bash
-pip install nmrglue nmrsim -i https://pypi.tuna.tsinghua.edu.cn/simple
-# nmrpy 可选（FID 交叉验证才需要）:
-pip install nmrpy -i https://pypi.tuna.tsinghua.edu.cn/simple
-# 预装依赖: rdkit / pubchempy / numpy / scipy / matplotlib / pandas
-# 以下为该项目增强: sympy (公式校验) / seaborn (统计可视化)
+**一键安装** (推荐):
+
+```powershell
+# 在项目根目录执行, 自动安装所有依赖
+powershell -ExecutionPolicy Bypass -File E:\NMR2Structure\util\install_deps.ps1
 ```
+
+**手动安装**:
+
+```bash
+# 核心依赖
+pip install nmrglue nmrsim rdkit pubchempy numpy scipy matplotlib pandas openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 项目增强
+pip install sympy seaborn -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 可选 (FID 交叉验证)
+pip install nmrpy -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 可选 (lucy-ng HOSE 集成)
+pip install git+https://github.com/Ratsemaat/HOSE_code_generator.git --no-deps
+```
+
+依赖分层:
+- **必需**: rdkit / pubchempy / numpy / scipy / matplotlib / pandas / nmrglue / openpyxl
+- **增强**: sympy (公式校验) / seaborn (统计可视化) / nmrsim (反向校验)
+- **可选**: nmrpy (FID 交叉验证) / HOSE_code_generator (lucy-ng 集成)
 
 ## 数据准备
 
@@ -75,27 +94,60 @@ pip install nmrpy -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 ```bash
 cd E:/NMR2Structure/NMR2Structure
-python -X utf8 -m nmr_elucidator \
-    --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
-    --top-n 10
+# 默认模式 (derive + 2D): 从谱图直接推导归属表, 无需数据库
+python -m nmr_elucidator --folder "E:/NMR2Structure/NMR/clxh100"
+
+# 候选检索模式: 禁用 derive, 走数据库检索+打分
+python -m nmr_elucidator --folder "E:/NMR2Structure/NMR/clxh3" --no-derive
 ```
 
+程序内部已配置 UTF-8 编码, 无需 `python -X utf8`。
 输出落到 `E:\NMR2Structure\output\clxh3\`（默认输出根目录 + 从 folder 路径末段推断化合物名）。
 化合物名显式指定用 `--compound-name my_compound`，输出根目录改 `--output-root D:/my_output`。
 
 ## 主流程 CLI
 
 ```
-python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
-                              [选项...]
+python -m nmr_elucidator --folder <原始数据/<sample>> [选项...]
 ```
+
+默认行为:
+- `--derive` 开启: 从谱图直接推导归属表 (HSQC/COSY/HMBC/ROESY), 完成后自动串联候选检索
+- `--use-2d` 开启: 自动检测 2D 数据, 无则回退 1D
+- `--formula` 不传: 适用于未知化合物
+- `--db` 默认: NMR2Structure 外层平级 `data/` 目录 (自动发现 nmrshiftdb2 + lucy-ng)
+- UTF-8 编码: 程序内部配置, 无需 `-X utf8`
+
+关闭默认: `--no-derive` (跳过归属表推导) / `--no-2d` (强制 1D)
+
+检索级联: nmrshiftdb2 SDF → lucy-ng 928K → PubChem 1亿+ (本地无命中时自动联网, `--no-pubchem` 禁用)
 
 ### 辅助工具脚本（util/）
 
 | 脚本 | 用途 |
 |---|---|
+| `util/install_deps.ps1` | 一键安装所有项目依赖 (PowerShell) |
 | `util/download_lucy_hose_db.py` | 下载 lucy-ng HOSE 完整数据库 (~830 MB / ~2.8 GB)；支持 Colab / aria2 / curl / proxy 4 种策略 |
+
+### 测试
+
+无 pytest; `tests/run_all.py` 串行 `import` 各 `test_*.py`.
+
+```powershell
+cd E:\NMR2Structure\NMR2Structure
+python tests\run_all.py                # 全部
+python tests\test_bridge_dept.py       # 单文件 (有 __main__ 块)
+python tests\test_io_processed.py
+python tests\test_new_features.py
+```
+
+`test_io_bruker.py` / `test_io_sdf.py` / `test_retrieve.py` / `test_score.py` 只有函数定义 (无 `__main__`), 仅通过 `run_all` 触发.
+
+### 清理
+
+```powershell
+Get-ChildItem -Path . -Recurse -Filter __pycache__ | Remove-Item -Recurse -Force
+```
 
 ## 解谱工作流对标
 
@@ -178,7 +230,19 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 | 参数 | 说明 |
 |---|---|
 | `--folder` | Bruker 化合物根目录（含数字子目录 21/22/...，每个下有 `pdata/1/peaklist.xml`）|
-| `--sdf` | nmrshiftdb2 SDF 文件路径 |
+
+### 数据库
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--db` | `E:\NMR2Structure\data` | 数据库路径: 传入总目录自动发现所有数据库, 或传入单个文件路径 |
+| `--lucy-ng-db` | 自动发现 | lucy-ng 数据库路径覆盖 (优先于 --db 自动发现) |
+
+`--db` 支持两种模式:
+- **目录**: 自动扫描 `nmrshiftdb2/nmrshiftdb2withsignals.sd` + `lucy-ng-derep_db/lucy-ng-derep.db`
+- **文件**: 按扩展名判断 (.sd → nmrshiftdb2, .db → lucy-ng)
+
+检索级联: nmrshiftdb2 SDF → lucy-ng 928K → PubChem 1亿+ (本地无命中时自动联网)
 
 ### 检索控制
 
@@ -206,16 +270,19 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 | `--use-nmrsim` | nmrsim 反向校验每个候选 1H 谱的 cosine 相似度 | `.md` 报告里追加 `nmrsim 反向校验 cosine = X.XXX` |
 | `--validate-with-nmrpy` | 用 nmrpy 从 `fid` 时域信号二次处理（FT/相位/基线/峰检测），与 peaklist.xml 交叉验证 | `<prefix>_nmrpy_validation.{json,md,png}` |
 | `--with-real-spectrum` | 读取 `pdata/1/1r` 真实处理后谱，绘制真实谱线形图（叠加 peaklist 峰位） | 图片 base64 内嵌到 HTML 报告 |
-| `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
-| `--use-pubchem` | PubChem 扩展检索：当 nmrshiftdb2 命中不足时，按分子式 / 13C 推断子结构去 PubChem 查候选 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
+| `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `data/lucy-ng-derep_db/lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
+| `--use-pubchem` | PubChem **强制**扩展检索：即使本地库有命中也联网检索 PubChem (1亿+ 化合物)。默认行为: 本地库无命中时自动触发, 无需此参数 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
+| `--no-pubchem` | 禁用 PubChem 检索 (即使本地库无命中也不联网) | — |
 | `--use-fragment-assembly` | 片段组装候选生成：当数据库检索均无命中时，从 13C 位移范围 + DEPT 约束组装结构（仅 1D 谱可走） | JSON 报告里追加 `fragment_candidates[]` |
-| `--use-2d` | 2D NMR 关联验证：自动检测 COSY/HSQC/HMBC/ROESY 实验；按化学家工作流顺序解读（HSQC → COSY → HMBC → 季碳）；含重叠峰分解（5.9 节流程：1H积分≥4 的 C-H 对自动 13C 切片 + scipy.find_peaks 检峰 + 分解 H 个数）；Top-1 生成完整 NMR 归属表（论文 Table 1 格式）；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `interpretation_2d` + `full_assignment` 章节；中间结果独立 CSV 落盘 |
+| `--use-2d` | 2D NMR 关联验证（**默认开启**, `--no-2d` 关闭）：自动检测 COSY/HSQC/HMBC/ROESY 实验；按化学家工作流顺序解读（HSQC → COSY → HMBC → 季碳）；含重叠峰分解；Top-1 生成完整 NMR 归属表；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `interpretation_2d` + `full_assignment` 章节；中间结果独立 CSV 落盘 |
 | `--determine` | 结构推断置信度评估：多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级结论 | JSON/MD/HTML 报告顶部追加 `determination` 章节 |
 | `--hose-cache <path>` | HOSE 查找表缓存路径（默认 `<sdf 同目录>/_hose_lookup_cache.tsv`，避免重复建表） | — |
 | `--hose-max-records <N>` | 从 SDF 构建 HOSE 查找表的最大记录数（默认 **50000**；0=全部；10000 轻度，50000 够用，100000+ 需约 5 分钟） | — |
-| `--lucy-ng-db <path>` | lucy-ng 完整 HOSE 数据库路径（`lucy-ng-derep.db`, ~2.8 GB SQLite）; **默认已自动查找** `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db`, 无需手动指定; 用此选项可指向备份位置 | — |
+| `--lucy-ng-db <path>` | lucy-ng 完整 HOSE 数据库路径（`lucy-ng-derep.db`, ~2.8 GB SQLite）; **默认已自动查找** `data/lucy-ng-derep_db/lucy-ng-derep.db`, 无需手动指定; 用此选项可指向备份位置 | — |
 | `--log-dir <path>` | 日志输出目录 (默认 `E:\NMR2Structure\logs`); 每次运行自动生成 `NMR2Structure_YYYY-MM-DD_HH-MM-SS.log` 文件, 包含屏幕上的所有内容 (print + logging) | — |
 | `--no-log` | 禁用日志记录 (默认每次运行都写日志) | — |
+| `--no-derive` | 禁用 derive 模式, 走候选检索+打分流程 (默认 derive 开启) | — |
+| `--no-2d` | 禁用 2D NMR 检测, 强制使用 1D 流程 (默认 2D 开启) | — |
 
 ### 运行日志
 
@@ -277,7 +344,7 @@ log.debug('matched 24/30 peaks')
 ### `nmrpy_validate` — FID 二次处理 + 交叉验证
 
 ```bash
-python -X utf8 -m nmr_elucidator.nmrpy_validate \
+python -m nmr_elucidator.nmrpy_validate \
     --folder "E:/NMR2Structure/NMR/clxh3" \
     --out-prefix "E:/NMR2Structure/output/clxh3/nmrpy_check"
 ```
@@ -290,17 +357,17 @@ python -X utf8 -m nmr_elucidator.nmrpy_validate \
 
 ```bash
 # stage 1: 数据转换 (无需 torch)
-python -X utf8 -m nmr_elucidator.run_bridge \
+python -m nmr_elucidator.run_bridge \
     --folder "E:/NMR2Structure/NMR/clxh3" \
     --out-prefix "E:/NMR2Structure/output/clxh3/nmr2struct" --stage 1
 
 # stage 2: NMR2Struct 推理 (需 torch + 已下载权重)
-python -X utf8 -m nmr_elucidator.run_bridge \
+python -m nmr_elucidator.run_bridge \
     --folder "E:/NMR2Structure/NMR/clxh3" \
     --out-prefix "E:/NMR2Structure/output/clxh3/nmr2struct" --stage 2
 
 # stage 3: h5 -> Markdown (无需 torch)
-python -X utf8 -m nmr_elucidator.run_bridge \
+python -m nmr_elucidator.run_bridge \
     --folder "E:/NMR2Structure/NMR/clxh3" \
     --out-prefix "E:/NMR2Structure/output/clxh3/nmr2struct" --stage 3
 ```
@@ -406,7 +473,7 @@ from nmr_elucidator.lucy_ng_hose import (
     LucyNGHOSEProvider, verify_candidate_with_lucy_db,
 )
 
-# 打开 lucy-ng SQLite 数据库 (默认查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db)
+# 打开 lucy-ng SQLite 数据库 (默认查找 data/lucy-ng-derep_db/lucy-ng-derep.db)
 provider = LucyNGHOSEProvider()  # 也可传 db_path=...
 result = provider.predict_smiles('CC(=O)Oc1ccccc1C(=O)O')
 for ps in result.predictions:
@@ -533,14 +600,14 @@ assembled = assemble_candidates(constraints, max_heavy_atoms=12, max_candidates=
 **默认路径**：自动使用 lucy-ng 928K SQLite (~2.8 GB, MAE ~3.5 ppm):
 
 ```bash
-python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose
-# 默认自动查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db
+python -m nmr_elucidator --folder ... --use-hose
+# 默认自动查找 data/lucy-ng-derep_db/lucy-ng-derep.db
 ```
 
 **回退路径**：如果 lucy-ng 数据库不可用, 从本项目 `nmrshiftdb2 SDF` 自建轻量本地表 (默认 50K 条, 约 1-2 分钟, MAE ~5 ppm):
 
 ```bash
-python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose --hose-max-records 50000
+python -m nmr_elucidator --folder ... --use-hose --hose-max-records 50000
 ```
 
 **升级路径**：下载 lucy-ng 完整 HOSE 库（928K 化合物，~830 MB 下载，~2.8 GB 解压，MAE ~3.5 ppm）：
@@ -554,8 +621,8 @@ python util/download_lucy_hose_db.py --strategy aria2    # 生成 aria2 多线�
 #    pip install git+https://github.com/Ratsemaat/HOSE_code_generator.git --no-deps
 
 # 3. 使用完整库（精度提升明显）
-python -X utf8 -m nmr_elucidator --folder ... --sdf ... --use-hose
-# 默认自动查找 E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db
+python -m nmr_elucidator --folder ... --use-hose
+# 默认自动查找 data/lucy-ng-derep_db/lucy-ng-derep.db
 # 也可指定：--lucy-ng-db D:\my\lucy-ng-derep.db
 ```
 
@@ -625,27 +692,24 @@ figshare 在国内无法直接访问，Google Colab 是官方推荐的曲线下�
 ### 示例 1：基础检索（最少命令）
 
 ```bash
-python -X utf8 -m nmr_elucidator \
-    --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd"
-# 默认 top-n=10, c-tol=2.0, h-tol=0.3
+python -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh3"
+# 默认 top-n=10, c-tol=2.0, h-tol=0.3; 数据库从 --db 默认目录自动发现
 ```
 
 ### 示例 2：分子式硬约束 + 1H 谱可视化
 
 ```bash
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --formula "C8H8O2" --top-n 5 --with-real-spectrum
 ```
 
 ### 示例 3：完整流水线（检索 + 1r 可视化 + FID 交叉验证 + 反向校验）
 
 ```bash
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --top-n 10 --max-hits 200 \
     --with-real-spectrum --validate-with-nmrpy --use-nmrsim
 ```
@@ -653,9 +717,8 @@ python -X utf8 -m nmr_elucidator \
 ### 示例 4：快速验证（小样本 + 跳过校验）
 
 ```bash
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --max-hits 30 --top-n 5 --quiet
 # 仅 30 秒内可跑完
 ```
@@ -664,24 +727,22 @@ python -X utf8 -m nmr_elucidator \
 
 ```bash
 # 步骤 1: 检索 + 未匹配峰标注
-python -X utf8 -m nmr_elucidator \
-    --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd"
+python -m nmr_elucidator \
+    --folder "E:/NMR2Structure/NMR/clxh3"
 # 看 output/clxh3/clxh3_unmatched.csv
 
 # 步骤 2: NMR2Struct 端到端反推（需 GPU + 已下载权重）
-python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 1
-python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 2
-python -X utf8 -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 3
+python -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 1
+python -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 2
+python -m nmr_elucidator.run_bridge --folder ... --out-prefix ... --stage 3
 ```
 
 ### 示例 6：CPU 路径结构推断（HOSE 验证 + 置信度评估，无 GPU）
 
 ```bash
 # 检索 + HOSE 预测验证 + 结构推断置信度（无需 GPU）
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --top-n 10 \
     --use-hose \
     --determine
@@ -693,9 +754,8 @@ python -X utf8 -m nmr_elucidator \
 
 ```bash
 # 当 nmrshiftdb2 命中不足时 (如仅 2-3 个命中)，启用 PubChem 扩展 + 片段组装
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --formula "C9H8O4" \
     --top-n 10 \
     --use-pubchem \
@@ -708,9 +768,8 @@ python -X utf8 -m nmr_elucidator \
 
 ```bash
 # 最完整的验证 + 推断路径（检索 + 1r 可视化 + FID 交叉 + 反向校验 + HOSE + PubChem + 推断结论）
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh3" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --top-n 10 --max-hits 200 \
     --with-real-spectrum --validate-with-nmrpy --use-nmrsim \
     --use-hose --use-pubchem --determine
@@ -720,11 +779,9 @@ python -X utf8 -m nmr_elucidator \
 
 ```bash
 # 启用 2D NMR 关联验证 (自动检测 COSY/HSQC/HMBC/ROESY)
-python -X utf8 -m nmr_elucidator \
+python -m nmr_elucidator \
     --folder "E:/NMR2Structure/NMR/clxh100" \
-    --sdf "E:/NMR2Structure/data/nmrshiftdb2/nmrshiftdb2withsignals.sd" \
     --top-n 10 \
-    --use-2d \
     --determine
 # 输出报告中包含 HSQC/HMBC/COSY 匹配率
 # 无 2D 数据时 (clxh3) 自动回退到 1D 流程

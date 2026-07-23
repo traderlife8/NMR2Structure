@@ -1,17 +1,33 @@
 """CLI 入口: 端到端运行 NMR 反推结构.
 
 用法:
-    python -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF path>
-                             [--formula <分子式>] [--top-n 10]
-                             [--output-prefix <prefix>]
+    python -m nmr_elucidator --folder <原始数据/<sample>>
+                             [--sdf <SDF path>] [--formula <分子式>]
+                             [--top-n 10] [--no-derive] [--no-2d]
+
+默认行为:
+    - 启用 --derive (从谱图直接推导归属表) 和 --use-2d (自动检测 2D 数据)
+    - 不强制 --formula (适用于未知化合物)
+    - 不强制 --sdf (derive 模式无需数据库; 候选检索时提供)
+    - 程序内部强制 UTF-8 编码, 无需 python -X utf8
 """
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import sys
 from pathlib import Path
+
+# 程序内部强制 UTF-8 编码 (替代 python -X utf8 命令行标志)
+# Windows 默认编码为 GBK/cp936, 不配置则中文输出可能乱码
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except (AttributeError, OSError):
+        pass  # 非标准 stream (如 IDE 重定向) 时静默跳过
 
 from .constraints import Constraints
 from .bridge_nmr2struct import convert_bruker_folder_to_nmr2struct
@@ -29,9 +45,72 @@ from .nmrsim_check import check_candidate_with_nmrsim
 from .report import write_report_html, write_report_json, write_report_markdown
 from .retrieve import ProblemPeaks, retrieve_candidates
 
+# 默认数据库目录: NMR2Structure 包外层平级的 data 文件夹
+# 即 <project_root>/data (与 NMR2Structure/ 同级)
+_DEFAULT_DB_DIR = str(Path(__file__).resolve().parent.parent.parent / 'data')
+
 # 项目 logger (在需要时调用 setup_logging() 初始化)
 from .log_setup import setup_logging as _setup_logging
 from .log_setup import get_logger as _get_logger
+
+
+def _discover_databases(db_path: str) -> dict:
+    """从 --db 参数自动发现可用数据库.
+
+    支持两种模式:
+      - 目录: 自动扫描 nmrshiftdb2/*.sd 和 lucy-ng-derep_db/*.db
+      - 文件: 按扩展名判断类型 (.sd/.sdf → nmrshiftdb2, .db → lucy-ng)
+
+    Returns:
+        {'sdf': str|None, 'lucy_ng': str|None}
+    """
+    result = {'sdf': None, 'lucy_ng': None}
+    db_path = os.path.abspath(db_path)
+
+    if os.path.isdir(db_path):
+        # 目录模式: 自动扫描已知数据库布局
+        # 1. nmrshiftdb2 SDF
+        sdf_candidates = [
+            os.path.join(db_path, 'nmrshiftdb2', 'nmrshiftdb2withsignals.sd'),
+        ]
+        # 也扫描根目录下的 .sd 文件
+        try:
+            for f in os.listdir(db_path):
+                if f.endswith(('.sd', '.sdf')):
+                    sdf_candidates.append(os.path.join(db_path, f))
+        except OSError:
+            pass
+        for p in sdf_candidates:
+            if os.path.isfile(p):
+                result['sdf'] = p
+                break
+        # 2. lucy-ng SQLite
+        lucy_candidates = [
+            os.path.join(db_path, 'lucy-ng-derep_db', 'lucy-ng-derep.db'),
+            os.path.join(db_path, 'lucy-ng-derep.db'),
+        ]
+        try:
+            for f in os.listdir(db_path):
+                if f.endswith('.db'):
+                    lucy_candidates.append(os.path.join(db_path, f))
+        except OSError:
+            pass
+        for p in lucy_candidates:
+            if os.path.isfile(p):
+                result['lucy_ng'] = p
+                break
+    elif os.path.isfile(db_path):
+        # 文件模式: 按扩展名判断类型
+        ext = os.path.splitext(db_path)[1].lower()
+        if ext in ('.sd', '.sdf'):
+            result['sdf'] = db_path
+        elif ext == '.db':
+            result['lucy_ng'] = db_path
+        else:
+            # 未知扩展名: 尝试当 SDF
+            result['sdf'] = db_path
+
+    return result
 
 
 def _cleanup_embedded_pngs(out_prefix: str, top_n: int, evidences) -> None:
@@ -61,17 +140,22 @@ def _cleanup_embedded_pngs(out_prefix: str, top_n: int, evidences) -> None:
 
 
 def _filter_peaks_by_intensity(shifts, intensities, percentile=0.20):
-    """保留强度 ≥ 第 N 百分位的峰 (去噪声).
+    """保留强度 ≥ 第 (1-percentile) 百分位的峰 (去最弱噪声).
 
     shifts 和 intensities 等长. 如果峰数 ≤ 5 则不过滤.
+
+    语义修正 (Part 3.A): 原实现取前 percentile 比例的强峰, 把 41 峰 13C 砍到 8 峰,
+    丢失 sp3 区弱峰. 现在按 docstring 描述"去底部 percentile 比例的弱峰":
+      percentile=0.20 → 去掉最弱的 20% (从排序数组尾部取 cut 处的强度作阈值).
     """
     if not shifts or not intensities or len(shifts) <= 5:
         return list(shifts)
-    paired = sorted(zip(intensities, shifts), reverse=True)
+    paired = sorted(zip(intensities, shifts), reverse=True)  # 强→弱
     n = len(paired)
     cut = max(1, int(n * percentile))
-    thresh = paired[cut - 1][0]
-    return sorted(p for i, p in paired if i >= thresh)
+    # 取第 cut 个最弱峰的强度作为阈值 (>= 该阈值即保留)
+    thresh = paired[-cut][0]
+    return sorted(s for i, s in paired if i >= thresh)
 
 
 def _build_problem_from_bruker(specs, keep_solvent: bool = False) -> ProblemPeaks:
@@ -96,9 +180,14 @@ def _build_problem_from_bruker(specs, keep_solvent: bool = False) -> ProblemPeak
             center = (region.low + region.high) / 2.0
             h_integrals.append((center, region.value))
 
-    # 强度过滤: 用 20% percentile 阈值去掉噪声峰 (保留真实信号)
-    c_shifts = _filter_peaks_by_intensity(c_shifts, [p.intensity for p in c_spec.peaks]) if c_spec else []
-    h_shifts = _filter_peaks_by_intensity(h_shifts, [p.intensity for p in h_spec.peaks]) if h_spec else []
+    # 强度过滤: 13C 仅去最弱 10% (Bruker peaklist 已筛选); 1H 去最弱 65% (含 t1 噪声/旋转边峰)
+    # Part 3.A: 修复 percentile 语义后, 采用绝对按比例过滤, 不再一刀切.
+    c_shifts = _filter_peaks_by_intensity(
+        c_shifts, [p.intensity for p in c_spec.peaks], percentile=0.10,
+    ) if c_spec else []
+    h_shifts = _filter_peaks_by_intensity(
+        h_shifts, [p.intensity for p in h_spec.peaks], percentile=0.65,
+    ) if h_spec else []
 
     solvent = None
     for s in specs:
@@ -143,10 +232,13 @@ def main(argv=None):
     )
     parser.add_argument('--folder', required=True,
                         help='原始数据样本目录, e.g. NMR/clxh3')
-    parser.add_argument('--sdf', required=True,
-                        help='nmrshiftdb2 SDF 文件路径')
+    parser.add_argument('--db', default=_DEFAULT_DB_DIR,
+                        help='数据库路径: 可传入总目录 (自动发现 nmrshiftdb2 + lucy-ng), '
+                             '或单个数据库文件路径 (.sd/.db). '
+                             '默认: NMR2Structure 外层平级 data/ 目录')
     parser.add_argument('--formula', default=None,
-                        help='可选：硬约束分子式, e.g. C8H8O2')
+                        help='可选：硬约束分子式, e.g. C8H8O2. '
+                             '默认不传 (适用于未知化合物推导)')
     parser.add_argument('--top-n', type=int, default=10,
                         help='输出 Top-N 候选')
     parser.add_argument('--max-hits', type=int, default=None,
@@ -170,13 +262,23 @@ def main(argv=None):
                              '产出 *_real_spectrum.png')
     parser.add_argument('--use-hose', action='store_true',
                         help='启用 HOSE code 13C 预测验证 (从 nmrshiftdb2 自建查找表)')
-    parser.add_argument('--use-pubchem', action='store_true',
-                        help='启用 PubChem 扩展检索 (按分子式/子结构)')
+    parser.add_argument('--use-pubchem', action='store_true', default=None,
+                        help='强制启用 PubChem 扩展检索 (即使本地库有命中也检索). '
+                             '默认: 本地库无命中时自动触发')
+    parser.add_argument('--no-pubchem', action='store_true',
+                        help='禁用 PubChem 扩展检索 (即使本地库无命中也不联网)')
     parser.add_argument('--use-fragment-assembly', action='store_true',
                         help='启用片段组装候选生成 (库外新骨架)')
-    parser.add_argument('--use-2d', action='store_true',
+    parser.add_argument('--use-2d', action='store_true', default=True,
                         help='启用 2D NMR 关联验证 (HSQC/HMBC/COSY); '
-                             '无 2D 数据时自动回退到 1D 流程')
+                             '无 2D 数据时自动回退到 1D 流程 (默认开启)')
+    parser.add_argument('--no-2d', action='store_true', default=False,
+                        help='禁用 2D NMR 检测, 强制使用 1D 流程')
+    parser.add_argument('--derive', action='store_true', default=True,
+                        help='从谱图数据直接推导归属表 '
+                             '(不依赖候选检索/打分, 仅用 HSQC/COSY/HMBC/ROESY; 默认开启)')
+    parser.add_argument('--no-derive', action='store_true', default=False,
+                        help='禁用 derive 模式, 走候选检索+打分流程')
     parser.add_argument('--determine', action='store_true',
                         help='输出结构推断结论 (含置信度分级)')
     parser.add_argument('--hose-cache', default=None,
@@ -185,9 +287,24 @@ def main(argv=None):
                         help='从 SDF 构建 HOSE 查找表的最大记录数 (默认 50000; '
                              '0=处理全部; 10000~50000 够用, 100000+ 需约 5 分钟)')
     parser.add_argument('--lucy-ng-db', default=None,
-                        help='lucy-ng 完整 HOSE 数据库路径 (lucy-ng-derep.db); '
-                             '启用后优先用该库查询, 精度更高 (MAE ~3.5 ppm). '
-                             '默认查找 E:\\NMR2Structure\\data\\lucy-ng-derep_db\\lucy-ng-derep.db')
+                        help='lucy-ng 数据库路径覆盖 (优先于 --db 自动发现). '
+                             '默认从 --db 目录自动查找 lucy-ng-derep.db')
+    # lucy-ng 检索参数 (当发现 lucy-ng 数据库时自动启用)
+    parser.add_argument('--lucy-ng-carbon-tol', type=int, default=2,
+                        help='lucy-ng 检索时碳数容差 (±, 默认 2)')
+    parser.add_argument('--lucy-ng-min-matches', type=int, default=10,
+                        help='lucy-ng 检索最少 13C 匹配数 (默认 10)')
+    parser.add_argument('--lucy-ng-max-results', type=int, default=500,
+                        help='lucy-ng 检索最大返回数 (默认 500)')
+    # Part 3 Phase 9: 化学家元信息接口
+    parser.add_argument('--hresims', default='',
+                        help='HRESIMS 数据, 例: "[M+Na]+ 647.3407". 会写入 Excel 顶部元信息行.')
+    parser.add_argument('--optical-rotation', default='',
+                        help='比旋光度 [α], 例: "(calcd. for C33H52O11Na+, 647.3402)".')
+    parser.add_argument('--ir', default='',
+                        help='IR/DBE 数据, 例: "DBE=8".')
+    parser.add_argument('--compound-class', default='',
+                        help='化合物分类提示, 例: "diterpenoid glucoside". 仅作为额外 meta 字段输出.')
     parser.add_argument('--quiet', action='store_true',
                         help='不打印检索进度')
     parser.add_argument('--log-dir', default=None,
@@ -201,6 +318,12 @@ def main(argv=None):
                              '/ DMSO 2.50 等溶剂信号会被剔除, 避免污染检索)')
     args = parser.parse_args(argv)
 
+    # 处理 --no-2d / --no-derive 互斥开关
+    if args.no_2d:
+        args.use_2d = False
+    if args.no_derive:
+        args.derive = False
+
     # 初始化日志 (默认开启, --no-log 可禁用)
     if not args.no_log:
         log_file = _setup_logging(log_dir=args.log_dir)
@@ -208,13 +331,21 @@ def main(argv=None):
         log.info(f'日志文件: {log_file}')
 
     folder = os.path.abspath(args.folder)
-    sdf_path = os.path.abspath(args.sdf)
     if not os.path.isdir(folder):
         print(f"ERROR: 原始数据目录不存在: {folder}", file=sys.stderr)
         return 2
-    if not os.path.isfile(sdf_path):
-        print(f"ERROR: SDF 文件不存在: {sdf_path}", file=sys.stderr)
-        return 2
+
+    # 数据库自动发现 (--db 支持目录或单文件)
+    dbs = _discover_databases(args.db)
+    # --lucy-ng-db 显式指定时覆盖自动发现
+    if args.lucy_ng_db:
+        dbs['lucy_ng'] = os.path.abspath(args.lucy_ng_db)
+    sdf_path = dbs['sdf']
+    lucy_ng_path = dbs['lucy_ng']
+    if not args.quiet:
+        print(f"[数据库] 发现: SDF={os.path.basename(sdf_path) if sdf_path else '无'}, "
+              f"lucy-ng={os.path.basename(lucy_ng_path) if lucy_ng_path else '无'}",
+              file=sys.stderr)
 
     # 推断化合物名 (优先 --compound-name, 否则取 folder 路径最后一段)
     compound_name = args.compound_name or os.path.basename(folder.rstrip(r'\/'))
@@ -335,26 +466,91 @@ def main(argv=None):
             print(f"WARN: 2D 解读失败, 回退 1D 检索: {ex}", file=sys.stderr)
             interpretation_2d = None
 
-    # 3. 检索
+    # Part 3: --derive 模式 - 从谱图数据直接推导归属表 (不依赖候选检索/打分)
+    if args.derive:
+        if interpretation_2d is None or not interpretation_2d.ch_pairs:
+            # 无 2D 数据时自动降级: 提示用户, 回退到候选检索流程
+            print(f"WARN: derive 模式需要 2D 数据 (HSQC), 未检测到. "
+                  f"自动回退到候选检索流程.", file=sys.stderr)
+            args.derive = False  # 降级
+
+    if args.derive:
+        from .assembly import assemble_assignment_table, write_assignment_csv, write_assignment_xlsx
+        from .correlation_2d import extract_cosy_pairs, extract_hmbc_pairs
+        print(f"[Derive] 从谱图数据直接推导归属表 ...", file=sys.stderr)
+
+        # 提取 COSY/HMBC/ROESY 交叉峰
+        cosy_pairs = []
+        hmbc_pairs = []
+        roesy_pairs = []
+        if spectra_2d:
+            if 'COSY' in spectra_2d:
+                cosy_pairs = extract_cosy_pairs(spectra_2d['COSY'], min_snr=10.0)
+            if 'HMBC' in spectra_2d:
+                hmbc_result = extract_hmbc_pairs(
+                    spectra_2d['HMBC'], min_snr=10.0,
+                    hsqc_pairs=[(p.h_ppm, p.c_ppm) for p in interpretation_2d.ch_pairs])
+                hmbc_pairs = hmbc_result[0] if isinstance(hmbc_result, tuple) else hmbc_result
+            if 'ROESY' in spectra_2d:
+                roesy_pairs = extract_cosy_pairs(spectra_2d['ROESY'], min_snr=10.0)
+            elif 'NOESY' in spectra_2d:
+                roesy_pairs = extract_cosy_pairs(spectra_2d['NOESY'], min_snr=10.0)
+
+        print(f"  COSY: {len(cosy_pairs)} 对, HMBC: {len(hmbc_pairs)} 对, "
+              f"ROESY: {len(roesy_pairs)} 对", file=sys.stderr)
+
+        # 组装归属表
+        derive_rows = assemble_assignment_table(
+            ch_pairs=interpretation_2d.ch_pairs,
+            carbon_shifts_1d=problem.carbon_shifts,
+            proton_shifts_1d=problem.proton_shifts,
+            cosy_pairs=cosy_pairs,
+            hmbc_pairs=hmbc_pairs,
+            roesy_pairs=roesy_pairs,
+        )
+        print(f"  归属表: {len(derive_rows)} 行", file=sys.stderr)
+
+        # 输出
+        derive_dir = os.path.join(output_dir, 'derive_归属表')
+        os.makedirs(derive_dir, exist_ok=True)
+        csv_path = os.path.join(derive_dir, 'assignment_table.csv')
+        xlsx_path = os.path.join(derive_dir, 'assignment_table.xlsx')
+        write_assignment_csv(derive_rows, csv_path)
+        meta_lines = []
+        if args.formula:
+            meta_lines.append(('Formula', args.formula))
+        if problem.solvent:
+            meta_lines.append(('Solvent', problem.solvent))
+        write_assignment_xlsx(derive_rows, xlsx_path, meta_lines=meta_lines or None)
+        print(f"  输出: {csv_path}", file=sys.stderr)
+        print(f"  输出: {xlsx_path}", file=sys.stderr)
+
+        # 统计
+        n_cosy = sum(1 for r in derive_rows if r.cosy_partners)
+        n_hmbc = sum(1 for r in derive_rows if r.hmbc_targets)
+        n_roesy = sum(1 for r in derive_rows if r.roesy_contacts)
+        n_cq = sum(1 for r in derive_rows if r.is_quaternary)
+        print(f"  统计: 季碳={n_cq}, COSY非空={n_cosy}, "
+              f"HMBC非空={n_hmbc}, ROESY非空={n_roesy}", file=sys.stderr)
+        print(f"[Derive] 归属表推导完成.", file=sys.stderr)
+
+    # 3. 候选检索 (derive 完成后自动串联; 无数据库时跳过)
+    if not sdf_path and not lucy_ng_path:
+        print(f"[3] 跳过候选检索 (未发现数据库). "
+              f"提示: 用 --db 指定数据库目录", file=sys.stderr)
+        # 无数据库时直接结束 (derive 已产出归属表)
+        if args.derive:
+            print(f"DONE. 归属表已输出 (无候选检索).", file=sys.stderr)
+            return 0
+        return 4
     use_hsqc_mode = hsqc_pairs_for_retrieve is not None
     mode_str = 'HSQC 配对匹配' if use_hsqc_mode else '1D 位移匹配'
-    print(f"[3] 检索候选 ({mode_str}, SDF={os.path.basename(sdf_path)})", file=sys.stderr)
-    progress_every = 0 if args.quiet else 5000
-    hits = list(retrieve_candidates(
-        sdf_path=sdf_path,
-        problem=problem,
-        constraints=constraints,
-        c_tol=args.c_tol,
-        h_tol=args.h_tol,
-        max_hits=args.max_hits,
-        progress_every=progress_every,
-        obs_dept_summary=obs_dept_summary,
-        hsqc_pairs=hsqc_pairs_for_retrieve,
-    ))
-    # HSQC 配对检索无结果时自动回退到 1D 检索
-    if not hits and use_hsqc_mode:
-        print(f"  -> HSQC 配对检索 0 命中, 回退到 1D 位移匹配 ...", file=sys.stderr)
-        use_hsqc_mode = False
+    hits = []
+
+    # 3a. nmrshiftdb2 SDF 检索 (优先)
+    if sdf_path and os.path.isfile(sdf_path):
+        print(f"[3a] nmrshiftdb2 检索 ({mode_str}, {os.path.basename(sdf_path)})", file=sys.stderr)
+        progress_every = 0 if args.quiet else 5000
         hits = list(retrieve_candidates(
             sdf_path=sdf_path,
             problem=problem,
@@ -364,9 +560,186 @@ def main(argv=None):
             max_hits=args.max_hits,
             progress_every=progress_every,
             obs_dept_summary=obs_dept_summary,
-            hsqc_pairs=None,
+            hsqc_pairs=hsqc_pairs_for_retrieve,
         ))
-    print(f"  -> 命中 {len(hits)} 条", file=sys.stderr)
+        # HSQC 配对检索无结果时自动回退到 1D 检索
+        if not hits and use_hsqc_mode:
+            print(f"  -> HSQC 配对检索 0 命中, 回退到 1D 位移匹配 ...", file=sys.stderr)
+            use_hsqc_mode = False
+            hits = list(retrieve_candidates(
+                sdf_path=sdf_path,
+                problem=problem,
+                constraints=constraints,
+                c_tol=args.c_tol,
+                h_tol=args.h_tol,
+                max_hits=args.max_hits,
+                progress_every=progress_every,
+                obs_dept_summary=obs_dept_summary,
+                hsqc_pairs=None,
+            ))
+        print(f"  -> nmrshiftdb2 命中 {len(hits)} 条", file=sys.stderr)
+    else:
+        print(f"[3a] 跳过 nmrshiftdb2 (未找到 SDF 文件)", file=sys.stderr)
+
+    # 3b. lucy-ng 检索 (自动启用: 当发现 lucy-ng 数据库时)
+    lucy_ng_hits: List = []
+    if lucy_ng_path and os.path.isfile(lucy_ng_path):
+        print(f"[3b] lucy-ng 数据库检索 ({os.path.basename(lucy_ng_path)}) ...", file=sys.stderr)
+        try:
+            from .retrieve_lucy_ng import get_lucy_ng_retriever, LucyNGRetriever
+            # Part 3 Phase 7.3 (修复): 实测 13C 峰数 ≠ 候选碳数 (重叠峰会让数字偏多)
+            # 用更宽松的碳数估计: 取 min(实测 13C 峰数, lucy_ng_carbon_tol 范围)
+            # 如果有 formula 约束则不需要碳数过滤
+            if args.formula:
+                # 精确分子式约束时, 不限碳数
+                est_carbon_count = None
+                est_carbon_tol = 0
+            else:
+                est_carbon_count = len(problem.carbon_shifts)
+                est_carbon_tol = max(args.lucy_ng_carbon_tol, 5)  # 至少 ±5 (覆盖重叠峰)
+            retriever = get_lucy_ng_retriever(lucy_ng_path, quiet=args.quiet)
+            if retriever is not None:
+                lucy_ng_hits = retriever.retrieve_by_carbon_count(
+                    observed_c13=problem.carbon_shifts,
+                    observed_h1=problem.proton_shifts,
+                    carbon_count=est_carbon_count,
+                    carbon_tol=est_carbon_tol,
+                    formula=args.formula,
+                    c_tol=args.c_tol,
+                    h_tol=args.h_tol,
+                    min_c_matches=args.lucy_ng_min_matches,
+                    max_results=args.lucy_ng_max_results,
+                    progress_every=0 if args.quiet else 2000,
+                    quiet=args.quiet,
+                )
+                # 转成与 retrieve_candidates 兼容的格式 (用 dict 模拟 hit.entry)
+                from .retrieve import RetrievalHit
+                for lh in lucy_ng_hits:
+                    mock_entry = type('Entry', (), {})()
+                    mock_entry.canonical_smiles = lh.canonical_smiles or lh.smiles
+                    mock_entry.smiles = lh.smiles
+                    mock_entry.inchi = lh.inchi
+                    mock_entry.inchi_key = lh.inchikey
+                    mock_entry.inchikey = lh.inchikey  # evidence.py 也可能用
+                    mock_entry.mol_block = ''
+                    mock_entry.spectrum_13c = []
+                    mock_entry.spectrum_1h = []
+                    mock_entry.formula = lh.formula
+                    mock_entry.heavy_atoms = lh.carbon_count + sum(
+                        1 for s in lh.formula if s.isalpha() and s.upper() not in ('C', 'H')
+                    )
+                    mock_entry.rec_id = None
+                    mock_entry.shiftdb2_id = None
+                    mock_entry.source = 'lucy-ng'
+                    mock_entry.solvent = None
+                    mock_entry.extra_tags = {'source': 'lucy-ng', 'lucy_ng_id': str(lh.compound_id)}
+                    # 填充 lib_13c/lib_1h 让 evidence.py 能调用
+                    from .io_sdf import SpectrumSignal
+                    mock_entry.spectrum_13c = [
+                        SpectrumSignal(shift=s, atom_index=i, multiplicity='?')
+                        for i, s in enumerate(lh.lib_13c_shifts)
+                    ]
+                    # lucy-ng 没有 1H, 留空
+                    mock_entry.spectrum_1h = []
+                    # 提供 mol() 方法 (用 SMILES 解析)
+                    from rdkit import Chem
+                    def _make_mol(entry_self):
+                        try:
+                            return Chem.MolFromSmiles(entry_self.smiles)
+                        except Exception:
+                            return None
+                    mock_entry.mol = lambda e=mock_entry: _make_mol(e)
+                    mock_hit = RetrievalHit(
+                        entry=mock_entry,
+                        c_match_count=lh.c_match_count,
+                        c_total_obs=lh.c_total_obs,
+                        c_total_lib=lh.c_total_lib,
+                        c_coverage=lh.c_coverage,
+                        c_rms=lh.c_rms,
+                        h_match_count=lh.h_match_count,
+                        h_total_obs=lh.h_total_obs,
+                        h_total_lib=lh.h_total_lib,
+                        h_coverage=lh.h_coverage,
+                        h_rms=lh.h_rms,
+                        formula_ok=True,
+                        solvent_ok=True,
+                        heavy_atoms=mock_entry.heavy_atoms,
+                    )
+                    # 在 evidence 阶段需额外信息, 加在 mock_entry 上
+                    mock_entry.lucy_score = lh.score
+                    mock_entry.lucy_compound_id = lh.compound_id
+                    mock_entry.lucy_lib_13c = lh.lib_13c_shifts
+                    hits.append(mock_hit)
+                print(f"  -> lucy-ng 命中 {len(lucy_ng_hits)} 条 (总计 {len(hits)} 条)",
+                      file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: lucy-ng 检索失败: {ex}", file=sys.stderr)
+
+    if not hits:
+        # 本地库无命中 → 自动扩大到 PubChem (需联网)
+        _pubchem_auto = (not args.no_pubchem)
+        if _pubchem_auto:
+            print(f"[3c] 本地库无命中, 自动扩大到 PubChem 检索 (联网) ...", file=sys.stderr)
+            try:
+                from .retrieve_pubchem import retrieve_pubchem_candidates
+                pubchem_results = retrieve_pubchem_candidates(
+                    formula=constraints.formula,
+                    c13_shifts=problem.carbon_shifts,
+                    max_results=50,
+                    quiet=args.quiet,
+                )
+                if pubchem_results:
+                    print(f"  -> PubChem 候选: {len(pubchem_results)} 条", file=sys.stderr)
+                    # 将 PubChem 候选转为 RetrievalHit 兼容格式
+                    from .retrieve import RetrievalHit
+                    from .io_sdf import SpectrumSignal
+                    for pc in pubchem_results:
+                        mock_entry = type('Entry', (), {})()
+                        mock_entry.canonical_smiles = pc.smiles
+                        mock_entry.smiles = pc.smiles
+                        mock_entry.inchi = None
+                        mock_entry.inchi_key = None
+                        mock_entry.inchikey = None
+                        mock_entry.mol_block = ''
+                        mock_entry.spectrum_13c = []
+                        mock_entry.spectrum_1h = []
+                        mock_entry.formula = pc.molecular_formula
+                        mock_entry.heavy_atoms = pc.heavy_atom_count
+                        mock_entry.rec_id = None
+                        mock_entry.shiftdb2_id = None
+                        mock_entry.source = 'pubchem'
+                        mock_entry.solvent = None
+                        mock_entry.extra_tags = {'source': 'pubchem', 'pubchem_cid': str(pc.cid)}
+                        mock_entry.pubchem_cid = pc.cid
+                        mock_entry.iupac_name = pc.iupac_name
+                        from rdkit import Chem as _Chem
+                        def _make_mol_pc(entry_self):
+                            try:
+                                return _Chem.MolFromSmiles(entry_self.smiles)
+                            except Exception:
+                                return None
+                        mock_entry.mol = lambda e=mock_entry: _make_mol_pc(e)
+                        mock_hit = RetrievalHit(
+                            entry=mock_entry,
+                            c_match_count=0,
+                            c_total_obs=len(problem.carbon_shifts),
+                            c_total_lib=0,
+                            c_coverage=0.0,
+                            c_rms=99.0,
+                            h_match_count=0,
+                            h_total_obs=len(problem.proton_shifts),
+                            h_total_lib=0,
+                            h_coverage=0.0,
+                            h_rms=99.0,
+                            formula_ok=True,
+                            solvent_ok=True,
+                            heavy_atoms=pc.heavy_atom_count,
+                        )
+                        hits.append(mock_hit)
+                else:
+                    print(f"  -> PubChem 也无候选", file=sys.stderr)
+            except Exception as ex:
+                print(f"WARN: PubChem 检索失败 (网络异常?): {ex}", file=sys.stderr)
 
     if not hits:
         print("WARN: 未找到任何候选。可放宽容差或移除分子式约束后重试。", file=sys.stderr)
@@ -455,7 +828,7 @@ def main(argv=None):
         lucy_provider = None
         try:
             from .lucy_ng_hose import get_lucy_ng_provider, verify_candidate_with_lucy_db
-            lucy_provider = get_lucy_ng_provider(args.lucy_ng_db, quiet=args.quiet)
+            lucy_provider = get_lucy_ng_provider(lucy_ng_path, quiet=args.quiet)
         except Exception as ex:
             if not args.quiet:
                 print(f"  [HOSE] lucy-ng 集成跳过: {ex}", file=sys.stderr)
@@ -496,10 +869,11 @@ def main(argv=None):
     else:
         print(f"[6] 跳过 HOSE 预测验证", file=sys.stderr)
 
-    # 7. PubChem 扩展检索（可选）
+    # 7. PubChem 强制扩展检索 (--use-pubchem 显式传入时, 即使本地库有命中也检索)
+    # 注: 本地库无命中时的自动触发已在 step 3c 处理
     pubchem_candidates = []
     if args.use_pubchem:
-        print(f"[7] PubChem 扩展检索 ...", file=sys.stderr)
+        print(f"[7] PubChem 强制扩展检索 (--use-pubchem) ...", file=sys.stderr)
         try:
             from .retrieve_pubchem import retrieve_pubchem_candidates
             pubchem_candidates = retrieve_pubchem_candidates(
@@ -512,7 +886,7 @@ def main(argv=None):
         except Exception as ex:
             print(f"WARN: PubChem 检索失败: {ex}", file=sys.stderr)
     else:
-        print(f"[7] 跳过 PubChem 扩展检索", file=sys.stderr)
+        print(f"[7] 跳过 PubChem 强制检索 (本地库已有命中或 --no-pubchem)", file=sys.stderr)
 
     # 8. 片段组装（可选）
     fragment_candidates = []
@@ -631,6 +1005,82 @@ def main(argv=None):
             print(f"  -> Top-N 无对应库条目, 跳过归属表", file=sys.stderr)
         if full_assignments_topn and not args.quiet:
             print(f"  -> 归属表目录: {assignment_dir}", file=sys.stderr)
+
+    # 9.7 化学家 Excel 风格归属表 (Part 3 Phase 2-6: 按 H 排列 + 立体氢拆分 + HMBC/COSY/ROESY 回填 + 多重性 + xlsx)
+    # 与 9.5 (按 C 排列) 并行, 输出互补.
+    assignment_v2_topn: List[dict] = []
+    if scored:
+        from .assignment_table_v2 import (
+            build_assignment_table_v2,
+            write_assignment_table_v2_csv,
+        )
+        from .excel_export import write_assignment_table_v2_xlsx
+        print(f"[9.7] 为 Top-N 生成化学家 Excel 风格归属表 (按 H 排列) ...", file=sys.stderr)
+        v2_dir = os.path.join(output_dir, '化学家归属表_v2')
+        os.makedirs(v2_dir, exist_ok=True)
+        multiplets_list = []
+        if interpretation_2d is not None:
+            multiplets_list = getattr(interpretation_2d, 'multiplet_analyses', []) or []
+        for ev in evidences[:min(args.top_n, len(evidences))]:
+            entry = None
+            for s in scored:
+                if (s.hit.entry.canonical_smiles or s.hit.entry.smiles) == ev.smiles:
+                    entry = s.hit.entry
+                    break
+            if entry is None:
+                continue
+            try:
+                tbl_v2 = build_assignment_table_v2(
+                    smiles=entry.smiles,
+                    mol_block=entry.mol_block,
+                    observed_c13=problem.carbon_shifts,
+                    observed_h1=problem.proton_shifts,
+                    interpretation_2d=interpretation_2d,
+                    multiplets=multiplets_list,
+                    h_tol=args.h_tol,
+                    c_tol=args.c_tol,
+                )
+                # Part 3 Phase 9.1: 注入化学家元信息
+                tbl_v2.hresims = args.hresims
+                tbl_v2.alpha = args.optical_rotation
+                tbl_v2.ir = args.ir
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} v2 归属表生成失败: {ex}", file=sys.stderr)
+                continue
+            safe = re.sub(r'[^A-Za-z0-9_.-]', '_', ev.smiles)[:50] or f'top{ev.rank}'
+            csv_path = os.path.join(v2_dir, f'rank{ev.rank}_{safe}_v2.csv')
+            xlsx_path = os.path.join(v2_dir, f'rank{ev.rank}_{safe}_v2.xlsx')
+            try:
+                if os.path.exists(csv_path):
+                    try:
+                        os.remove(csv_path)
+                    except OSError:
+                        pass
+                write_assignment_table_v2_csv(
+                    tbl_v2, csv_path, rank=ev.rank,
+                    score=getattr(ev, 'unified_score', None),
+                    extra_meta={'Solvent': problem.solvent or '',
+                                'Field_MHz': f'{problem.field_mhz:.2f}' if problem.field_mhz else ''},
+                )
+                write_assignment_table_v2_xlsx(
+                    tbl_v2, xlsx_path, rank=ev.rank,
+                    score=getattr(ev, 'unified_score', None),
+                    extra_meta={'Solvent': problem.solvent or '',
+                                'Field_MHz': f'{problem.field_mhz:.2f}' if problem.field_mhz else ''},
+                )
+                assignment_v2_topn.append({'rank': ev.rank, 'csv': csv_path, 'xlsx': xlsx_path})
+                if ev.rank == 1 and not args.quiet:
+                    print(f"  -> Top-1: {len(tbl_v2.rows)} 行, 未归属 "
+                          f"13C={len(tbl_v2.unassigned_obs_c)} 1H={len(tbl_v2.unassigned_obs_h)}, "
+                          f"置信度 {tbl_v2.confidence:.0%}",
+                          file=sys.stderr)
+                    print(f"     xlsx: {os.path.basename(xlsx_path)}", file=sys.stderr)
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} v2 表写入失败: {ex}", file=sys.stderr)
+        if assignment_v2_topn and not args.quiet:
+            print(f"  -> v2 归属表目录: {v2_dir}", file=sys.stderr)
+    else:
+        print(f"[9.7] 跳过化学家 Excel 风格归属表 (无候选)", file=sys.stderr)
 
     # 9.6 NOE 3D 构象验证 (有 NOESY 数据 + 归属表时)
     noe_verification_results: List[dict] = []
@@ -813,8 +1263,10 @@ def main(argv=None):
         'top_n': args.top_n,
         'used_nmrsim': bool(args.use_nmrsim),
         'used_hose': bool(args.use_hose),
-        'used_hose_source': 'lucy-ng-derep.db' if (args.use_hose and args.lucy_ng_db) else 'local-sdf',
-        'used_pubchem': bool(args.use_pubchem),
+        'used_hose_source': 'lucy-ng-derep.db' if (args.use_hose and lucy_ng_path) else 'local-sdf',
+        'used_pubchem': bool(args.use_pubchem) or any(
+            getattr(h.entry, 'source', None) == 'pubchem' for h in hits
+        ),
         'used_fragment_assembly': bool(args.use_fragment_assembly),
         'used_2d': bool(args.use_2d and spectra_2d),
         '2d_experiments': list(spectra_2d.keys()) if spectra_2d else [],

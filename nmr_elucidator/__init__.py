@@ -50,6 +50,13 @@ from .correlation_2d import (
     verify_candidate_3d_noe,
     write_assignment_table_csv,
 )
+from .assignment_table_v2 import (
+    AssignmentRowV2,
+    AssignmentTableV2,
+    build_assignment_table_v2,
+    write_assignment_table_v2_csv,
+)
+from .excel_export import write_assignment_table_v2_xlsx
 from .solvent_filter import (
     SOLVENT_RESIDUAL_PEAKS_1H,
     SOLVENT_RESIDUAL_PEAKS_13C,
@@ -123,4 +130,9 @@ __all__ = [
     "verify_candidate_3d_j",
     "SOLVENT_RESIDUAL_PEAKS_1H",
     "SOLVENT_RESIDUAL_PEAKS_13C",
+    "AssignmentRowV2",
+    "AssignmentTableV2",
+    "build_assignment_table_v2",
+    "write_assignment_table_v2_csv",
+    "write_assignment_table_v2_xlsx",
 ]  # Part 2.A/2.B/2.C 已实现
