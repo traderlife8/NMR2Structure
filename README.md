@@ -35,9 +35,16 @@ Bruker 原始谱 (NMR/<sample>/)
         ↓
 [9] (可选) 结构推断置信度评估 (assess_determination: determined/probable/ambiguous/no_match)
         ↓
-output/<sample>/<sample>.{json,md,html}
-            <sample>_topn.png / _rank*.png / _overlay.png / _unmatched.csv
-            <sample>_real_spectrum.png        (--with-real-spectrum)
+output/<sample>/<sample>.{json,md,html}  (HTML 内嵌所有图片 base64)
+            <sample>_unmatched.csv
+            step1_hsqc_ch_pairs.csv      (2D 解读中间结果, 化学家复核用)
+            step1_hsqc_ch_pairs/overlap/ (HSQC 重叠峰等高线图, Mnova 风格)
+            step1_hsqc_ch_pairs/normal/  (HSQC 非重叠峰等高线图)
+            step1b_overlap_analysis.csv  (5.9 节重叠峰分解详情)
+            step2_cosy_spin_systems.csv
+            step3_hmbc_connections.csv
+            step4_quaternary_carbons.csv (含 DEPT 证据来源)
+            完整NMR归属表(论文Table1)/   (--use-2d 启用，生成 Top-N 个 CSV, 论文 Table 1 格式)
             <sample>_nmrpy_validation.{json,md,png}  (--validate-with-nmrpy)
 ```
 
@@ -122,11 +129,11 @@ python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
 |---|---|---|
 | `--use-nmrsim` | nmrsim 反向校验每个候选 1H 谱的 cosine 相似度 | `.md` 报告里追加 `nmrsim 反向校验 cosine = X.XXX` |
 | `--validate-with-nmrpy` | 用 nmrpy 从 `fid` 时域信号二次处理（FT/相位/基线/峰检测），与 peaklist.xml 交叉验证 | `<prefix>_nmrpy_validation.{json,md,png}` |
-| `--with-real-spectrum` | 读取 `pdata/1/1r` 真实处理后谱，绘制真实谱线形图（叠加 peaklist 峰位） | `<prefix>_real_spectrum.png` |
+| `--with-real-spectrum` | 读取 `pdata/1/1r` 真实处理后谱，绘制真实谱线形图（叠加 peaklist 峰位） | 图片 base64 内嵌到 HTML 报告 |
 | `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `E:\NMR2Structure\data\lucy-ng-derep_db\lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
 | `--use-pubchem` | PubChem 扩展检索：当 nmrshiftdb2 命中不足时，按分子式 / 13C 推断子结构去 PubChem 查候选 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
 | `--use-fragment-assembly` | 片段组装候选生成：当数据库检索均无命中时，从 13C 位移范围 + DEPT 约束组装结构（仅 1D 谱可走） | JSON 报告里追加 `fragment_candidates[]` |
-| `--use-2d` | 2D NMR 关联验证：自动检测 COSY/HSQC/HMBC/ROESY 实验，提取交叉峰关联，验证候选结构；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `correlation_2d` 章节 |
+| `--use-2d` | 2D NMR 关联验证：自动检测 COSY/HSQC/HMBC/ROESY 实验；按化学家工作流顺序解读（HSQC → COSY → HMBC → 季碳）；含重叠峰分解（5.9 节流程：1H积分≥4 的 C-H 对自动 13C 切片 + scipy.find_peaks 检峰 + 分解 H 个数）；Top-1 生成完整 NMR 归属表（论文 Table 1 格式）；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `interpretation_2d` + `full_assignment` 章节；中间结果独立 CSV 落盘 |
 | `--determine` | 结构推断置信度评估：多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级结论 | JSON/MD/HTML 报告顶部追加 `determination` 章节 |
 | `--hose-cache <path>` | HOSE 查找表缓存路径（默认 `<sdf 同目录>/_hose_lookup_cache.tsv`，避免重复建表） | — |
 | `--hose-max-records <N>` | 从 SDF 构建 HOSE 查找表的最大记录数（默认 **50000**；0=全部；10000 轻度，50000 够用，100000+ 需约 5 分钟） | — |
@@ -395,20 +402,40 @@ assembled = assemble_candidates(constraints, max_heavy_atoms=12, max_candidates=
 |---|---|
 | `<sample>.json` | 完整证据链（matched/unmatched/conflict），程序可读 |
 | `<sample>.md` | Markdown 报告，含未匹配峰专项章节 + pandas 候选表（InChIKey 去重）|
-| `<sample>.html` | HTML 报告（人类阅读，含流程 + 结构图 + DEPT 推断 + seaborn 统计可视化）|
-| `<sample>_topn.png` | Top-N 候选 2D 结构网格图 |
-| `<sample>_rank<N>.png` | 每个候选的单分子图（N=1..top-n） |
-| `<sample>_overlay.png` | 实测谱 vs Top-5 候选预测谱对比（红色=实测，散点=候选） |
+| `<sample>.html` | HTML 报告（人类阅读，含流程 + 结构图 + DEPT 推断 + seaborn 统计可视化，所有图片 base64 内嵌）|
 | `<sample>_unmatched.csv` | 未匹配峰汇总（Excel 友好，UTF-8 BOM） |
-| `<sample>_heatmap.png` | 候选评分热力图（seaborn，行=候选，列=维度，归一化 [0, 1]）|
-| `<sample>_scatter.png` | 实测 vs 候选 ppm 散点对比（seaborn，13C + 1H 双子图）|
-| `<sample>_matrix.png` | 约束匹配矩阵（seaborn，6 维度满足度热力图）|
+
+> 注：所有 PNG 图片（topn / rank / overlay / heatmap / scatter / matrix / overview / real_spectrum）
+> 已 base64 内嵌到 HTML 中，输出目录不再保留独立 PNG 文件。
+
+### 四种输出格式内容对比
+
+| 内容 | JSON | MD | HTML | CSV |
+|---|:---:|:---:|:---:|:---:|
+| 完整 meta（含 observed 原始位移数组） | ✅ | 部分 | 部分（图表展示） | — |
+| **全部**候选数据（不限 top_n） | ✅ | ❌ | ❌ | ❌ |
+| DEPT 推断表（碳类型 + 方向） | ✅ | ✅ | ✅ | — |
+| 2D NMR 关联验证（HSQC/HMBC/COSY） | ✅ | ✅ | ✅ | — |
+| **2D 解读路径索引**（步骤 1/1b/2/3/4 + Top-1 指向各独立文件） | ❌ | ❌ | ✅ | — |
+| **HSQC 等高线图**（Mnova 风格, overlap/normal 分文件夹） | ❌ | ❌ | ❌ (不嵌入) | ✅ (PNG 子目录) |
+| **Top-N 完整 NMR 归属表**（论文 Table 1 格式，HTML 中显示几个 top 就生成几个 CSV） | ❌ | ❌ | ❌ (仅索引目录) | ✅ (专属子目录) |
+| 每候选 13C/1H 逐峰匹配明细 | ✅ | ✅ | ✅ | — |
+| 每候选未匹配峰（逐条） | ✅ | ✅ | ✅ | ✅ |
+| InChIKey 去重候选表（pandas） | ❌ | ✅ | ❌ | — |
+| 结构图 / 谱图可视化 | ❌ | ❌ | ✅（base64 内嵌） | — |
+| seaborn 统计图（热力图/散点/矩阵） | ❌ | ❌ | ✅（base64 内嵌） | — |
+| 未匹配峰汇总（Excel 可筛选排序） | — | — | — | ✅ |
+| 程序可读结构化证据链 | ✅ | ❌ | ❌ | — |
+
+**定位说明**：
+- **JSON** = 程序接口（完整数据，含全部候选 + 原始位移数组，供下游自动化）
+- **MD** = 纯文本备查（含 InChIKey 去重表，适合 diff / 版本管理）
+- **HTML** = 人类阅读（可视化 + 单文件可移植，图片全部内嵌）
+- **CSV** = Excel 工作流（化学家按候选筛选/排序未匹配峰）
 
 ### `--with-real-spectrum` 附加
 
-| 文件 | 说明 |
-|---|---|
-| `<sample>_real_spectrum.png` | 4 子图：每个实验的真实谱曲线（蓝）+ peaklist 峰位（红） |
+不新增独立文件，真实谱图（4 子图：每个实验的真实谱曲线 + peaklist 峰位）已 base64 内嵌到 HTML 报告中。
 
 ### `--validate-with-nmrpy` 附加
 
@@ -486,6 +513,36 @@ figshare 在国内无法直接访问，Google Colab 是官方推荐的曲线下�
 - `evidence_summary`：证据链文本摘要
 - `unified_score`：Top-1 融合分
 - `gap_to_runner_up`：与第二名差距
+
+### `--use-2d` 附加（化学家工作流详解）
+
+启用后，额外产出 **6 个独立中间文件**（化学家人工复核用，UTF-8 CSV/PNG），报告新增内容：
+
+| 文件 | 内容 |
+|---|---|
+| `step1_hsqc_ch_pairs.csv` | HSQC C-H 直接连接对（52 行示例）。列：编号/C_label/H_label/δH/δC/1H积分/H个数/碳级数。 |
+| `step1_hsqc_ch_pairs/overlap/*.png` | 积分 ≥ 4 的 C-H 对 HSQC 等高线图（Mnova 风格：2D等高线+1H投影+13C投影+13C切片检峰），可目视检查重叠峰。 |
+| `step1_hsqc_ch_pairs/normal/*.png` | 非重叠峰等高线图（同上布局）。 |
+| `step1b_overlap_analysis.csv` | 重叠峰分解详情（5.9 节流程）。列：区域序号/δH/总积分/13C切片峰数/13C峰位置/峰强度/分解后H/峰/状态/说明。状态 = `resolved`（完全分解）/ `partial`（部分）/ `unresolvable`（未解）。 |
+| `step2_cosy_spin_systems.csv` | COSY 沿耦合链连接的自旋系统（Union-Find 聚类）。 |
+| `step3_hmbc_connections.csv` | HMBC 远程 H→C 连接（排除 1J，键类型标记 2J/3J）。完整不截断。 |
+| `step4_quaternary_carbons.csv` | 推断的季碳。**推断依据**列标明 `DEPT判定为Cq`（优先级 1）或 `13C有峰但无HSQC对应`（优先级 2）。 |
+
+**HTML 报告 2.5 节**：仅提供一张步骤路径索引表（步骤 1 / 1b / 2 / 3 / 4 + Top-1），
+列出每步的具体文件路径（如 `<code>step1_hsqc_ch_pairs.csv</code>` 与目录
+`<code>step1_hsqc_ch_pairs/overlap/</code>`）。**不嵌入详细表格与 base64 等高线图**，
+详细原始数据在同名独立文件中供化学家单独复核。Top-N 完整归属表
+位于 `<code>完整NMR归属表(论文Table1)/</code>` 子目录，每个 Top 一个 CSV。
+这将 HTML 总大小从 ~8 MB 减到 ~0.8 MB（以 clxh100 为例）。
+
+**关键设计决策**：
+- DEPT 推断优先级 > HSQC 匹配：避免 13C 与 HSQC 微小位移偏差 (< 0.2 ppm) 导致季碳被误判
+- 重叠峰聚类容差 0.3 ppm（与 h_tol 一致）
+- 13C 切片宽度 ±0.15 ppm（约为典型 1H 线宽 3 倍）
+- 13C 峰最小间距 2.0 ppm（避免重复检峰）
+- 分解后 H 个数 = 总积分 / 13C 切片峰数（假设各峰贡献相等）
+
+**JSON/MD 报告新增章节**：
 
 ## 典型工作流示例
 
@@ -599,7 +656,7 @@ python -X utf8 -m nmr_elucidator \
 
 ## clxh3 实测样本（参考产物）
 
-`output/clxh3/` 下 27 个产物文件（~30 MB）。关键观察：
+`output/clxh3/` 下 4 个产物文件（`clxh3.{json,md,html}` + `clxh3_unmatched.csv`）。关键观察：
 
 - **DEPT 推断**：6 CH + 2 CH2 + 1 CH3 + 2 CH2/CH3 + **1 Cq** + 0 ?（详见 `clxh3.html` 报告）
 - **1r 真实谱**：exp 24 (DEPT-135) 的 CH2 负峰在真实谱里清晰可见（向下），peaklist.xml 竹签完全看不出
@@ -712,7 +769,8 @@ python -X utf8 -m nmr_elucidator \
 | `lucy_ng_hose.py` | lucy-ng 完整 HOSE 数据库集成（928K 化合物，~2.8 GB SQLite，MAE ~3.5 ppm） | `LucyNGHOSEProvider`, `predict_smiles`, `verify_candidate_with_lucy_db`, `get_lucy_ng_provider` |
 | `determination.py` | 结构推断置信度评估（多源证据融合 + 四级结论） | `assess_determination`, `compute_unified_score`, `DeterminationResult` |
 | `io_bruker_2d.py` | 2D Bruker 谱图读取与峰检测 (COSY/HSQC/HMBC/ROESY) | `read_bruker_2d_folder`, `read_bruker_2d_experiment`, `pick_peaks_2d`, `Spectrum2D`, `Peak2D` |
-| `correlation_2d.py` | 2D NMR 关联提取与候选验证打分 | `score_candidate_2d`, `extract_hsqc_pairs`, `extract_hmbc_pairs`, `extract_cosy_pairs`, `Correlation2DScore` |
+| `interpret_2d.py` | 2D NMR 逐步解谱引擎 (化学家工作流: HSQC→COSY→HMBC→季碳推断+5.9 节重叠峰分解，每步产出独立 CSV + 等高线图供化学家复核) | `interpret_2d_sequential`, `write_step_files`, `CHPair`, `SpinSystem`, `HMBCConnection`, `OverlapRegion`, `Interpretation2D` |
+| `correlation_2d.py` | 2D NMR 关联提取、候选验证打分、全归属表生成 | `score_candidate_2d`, `build_full_assignment_table`, `extract_hsqc_pairs`, `Correlation2DScore`, `FullAssignmentTable` |
 | `retrieve_pubchem.py` | PubChem 扩展检索（分子式 + 子结构，错误静默降级） | `retrieve_pubchem_candidates`, `PubChemCandidate` |
 | `shift_ranges.py` | 13C 化学位移经验范围表 + 官能团推断 | `infer_functional_groups`, `assign_shift_ranges`, `SHIFT_RANGES` |
 | `fragment_assembler.py` | 片段组装候选生成器（库外新骨架，从 1D 约束出发） | `build_constraints`, `assemble_candidates`, `FragmentConstraint` |
@@ -725,9 +783,8 @@ python -X utf8 -m nmr_elucidator \
 
 报告中的处理：
 1. **JSON 报告**：`CandidateEvidence.unmatched_carbon_shifts` / `unmatched_proton_shifts` 字段
-2. **Markdown 报告**：开篇"重点关注"章节，列出 Top-N 候选都未能解释的实测化学位移
-3. **HTML 报告**：同 Markdown，含交互
+2. **Markdown 报告**：开篇“重点关注”章节，列出 Top-N 候选都未能解释的实测化学位移
+3. **HTML 报告**：同 Markdown，含交互 + overlay 对比图（base64 内嵌）
 4. **CSV 报告**：`<sample>_unmatched.csv` 每行一个候选，列 `rank/smiles/unmatched_*.shifts + note`
-5. **结构图**：`<sample>_overlay.png` 红色竖线标记实测峰，散点显示候选预测峰
 
 后续可对接 ML 模型（chefnmr/NMR2Struct/lucy-ng）输入：`SMILES` + `unmatched_*.shifts`。

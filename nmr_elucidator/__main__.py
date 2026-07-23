@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -209,8 +210,9 @@ def main(argv=None):
 
     # 1.5 检测 2D 实验 (--use-2d 开启)
     spectra_2d = {}
+    interpretation_2d = None
     if args.use_2d:
-        print(f"[1.5/5] 检测 2D NMR 实验 ...", file=sys.stderr)
+        print(f"[1.5] 检测 2D NMR 实验 ...", file=sys.stderr)
         try:
             from .io_bruker_2d import read_bruker_2d_folder
             spectra_2d = read_bruker_2d_folder(folder, quiet=args.quiet)
@@ -225,7 +227,7 @@ def main(argv=None):
             print(f"WARN: 2D 检测失败, 回退到 1D: {ex}", file=sys.stderr)
             spectra_2d = {}
     else:
-        print(f"[1.5/5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
+        print(f"[1.5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
 
     # 2. 构造问题
     problem = _build_problem_from_bruker(specs)
@@ -261,8 +263,40 @@ def main(argv=None):
             except OSError:
                 pass
 
+    # 2.8 2D NMR 逐步解读 (有 2D 数据时, 在检索前完成)
+    hsqc_pairs_for_retrieve = None
+    if spectra_2d:
+        print(f"[2.8] 2D NMR 逐步解读 (化学家工作流) ...", file=sys.stderr)
+        try:
+            from .interpret_2d import interpret_2d_sequential, write_step_files
+            interpretation_2d = interpret_2d_sequential(
+                spectra_2d=spectra_2d,
+                carbon_shifts_1d=problem.carbon_shifts,
+                proton_shifts_1d=problem.proton_shifts,
+                dept_summary=obs_dept_summary,
+                proton_integrals=problem.proton_integrals,
+                quiet=args.quiet,
+            )
+            # 中间结果写入独立 CSV (化学家复核用)
+            step_files = write_step_files(interpretation_2d, output_dir, spectra_2d)
+            if not args.quiet:
+                print(f"  -> 中间结果已写入 {len(step_files)} 个 CSV 文件",
+                      file=sys.stderr)
+            # 提取 HSQC 对用于配对检索
+            if interpretation_2d.ch_pairs:
+                hsqc_pairs_for_retrieve = [
+                    (p.h_ppm, p.c_ppm) for p in interpretation_2d.ch_pairs
+                ]
+                print(f"  -> HSQC 配对检索已启用 ({len(hsqc_pairs_for_retrieve)} 个 C-H 对)",
+                      file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 2D 解读失败, 回退 1D 检索: {ex}", file=sys.stderr)
+            interpretation_2d = None
+
     # 3. 检索
-    print(f"[3/5] 检索候选 (SDF={sdf_path})", file=sys.stderr)
+    use_hsqc_mode = hsqc_pairs_for_retrieve is not None
+    mode_str = 'HSQC 配对匹配' if use_hsqc_mode else '1D 位移匹配'
+    print(f"[3] 检索候选 ({mode_str}, SDF={os.path.basename(sdf_path)})", file=sys.stderr)
     progress_every = 0 if args.quiet else 5000
     hits = list(retrieve_candidates(
         sdf_path=sdf_path,
@@ -273,7 +307,23 @@ def main(argv=None):
         max_hits=args.max_hits,
         progress_every=progress_every,
         obs_dept_summary=obs_dept_summary,
+        hsqc_pairs=hsqc_pairs_for_retrieve,
     ))
+    # HSQC 配对检索无结果时自动回退到 1D 检索
+    if not hits and use_hsqc_mode:
+        print(f"  -> HSQC 配对检索 0 命中, 回退到 1D 位移匹配 ...", file=sys.stderr)
+        use_hsqc_mode = False
+        hits = list(retrieve_candidates(
+            sdf_path=sdf_path,
+            problem=problem,
+            constraints=constraints,
+            c_tol=args.c_tol,
+            h_tol=args.h_tol,
+            max_hits=args.max_hits,
+            progress_every=progress_every,
+            obs_dept_summary=obs_dept_summary,
+            hsqc_pairs=None,
+        ))
     print(f"  -> 命中 {len(hits)} 条", file=sys.stderr)
 
     if not hits:
@@ -296,7 +346,7 @@ def main(argv=None):
 
     # 4. 打分
     print(f"[4/5] 打分 + 证据链 ...", file=sys.stderr)
-    scored = score_candidates(hits)
+    scored = score_candidates(hits, use_2d_scoring=use_hsqc_mode)
     evidences = [build_evidence(
         s,
         observed_c=problem.carbon_shifts,
@@ -462,6 +512,63 @@ def main(argv=None):
     else:
         print(f"[9] 跳过结构推断评估 (使用 --determine 启用)", file=sys.stderr)
 
+    # 9.5 为 Top-N 各生成全归属表 (有 2D 数据时)
+    full_assignment = None
+    full_assignments_topn: List = []  # 存储各 Top-N 候选的归属表 (用于 CSV 输出)
+    if interpretation_2d is not None and scored:
+        from .correlation_2d import (
+            build_full_assignment_table,
+            write_assignment_table_csv,
+        )
+        print(f"[9.5] 为 Top-N 生成完整 NMR 归属表 ...", file=sys.stderr)
+        # 新建 完整NMR归属表(论文Table1) 子目录
+        assignment_dir = os.path.join(output_dir, '完整NMR归属表(论文Table1)')
+        os.makedirs(assignment_dir, exist_ok=True)
+        # 为 evidences 中每个候选查找其 entry 并生成归属表
+        for ev in evidences[:min(args.top_n, len(evidences))]:
+            entry = None
+            for s in scored:
+                if (s.hit.entry.canonical_smiles or s.hit.entry.smiles) == ev.smiles:
+                    entry = s.hit.entry
+                    break
+            if entry is None:
+                continue
+            try:
+                tbl = build_full_assignment_table(
+                    entry, interpretation_2d,
+                    observed_c13=problem.carbon_shifts,
+                    observed_h1=problem.proton_shifts,
+                    h_tol=args.h_tol, c_tol=args.c_tol,
+                )
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} 归属表生成失败: {ex}", file=sys.stderr)
+                continue
+            # 写 CSV (论文 Table 1 格式)
+            safe = re.sub(r'[^A-Za-z0-9_.-]', '_', ev.smiles)[:50] or f'top{ev.rank}'
+            csv_path = os.path.join(
+                assignment_dir, f'rank{ev.rank}_{safe}.csv')
+            try:
+                # 若旧文件存在则先删除 (Windows 防病毒可能锁定, 影响覆写)
+                if os.path.exists(csv_path):
+                    try:
+                        os.remove(csv_path)
+                    except OSError:
+                        pass
+                write_assignment_table_csv(tbl, csv_path, rank=ev.rank,
+                                           score=getattr(ev, 'unified_score', None))
+                full_assignments_topn.append({'rank': ev.rank, 'csv': csv_path})
+                if ev.rank == 1:
+                    full_assignment = tbl  # Top-1 保留原 meta['full_assignment']
+                if not args.quiet:
+                    print(f"  -> Top-{ev.rank}: {len(tbl.rows)} 行 -> "
+                          f"{os.path.basename(csv_path)}", file=sys.stderr)
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} CSV 写入失败: {ex}", file=sys.stderr)
+        if full_assignment is None and not full_assignments_topn:
+            print(f"  -> Top-N 无对应库条目, 跳过归属表", file=sys.stderr)
+        if full_assignments_topn and not args.quiet:
+            print(f"  -> 归属表目录: {assignment_dir}", file=sys.stderr)
+
     # 输出 (out_prefix 已在 main() 开头构造, 路径 = output_root / compound_name / compound_name.*)
     meta = {
         'folder': folder,
@@ -543,6 +650,54 @@ def main(argv=None):
                     'n_cosy_obs': s2d.n_cosy_obs,
                     'notes': s2d.notes,
                 }
+    # 2D 逐步解读中间结果 (化学家可审查)
+    if interpretation_2d is not None:
+        meta['interpretation_2d'] = {
+            'ch_pairs': [
+                {'h_ppm': p.h_ppm, 'c_ppm': p.c_ppm, 'multiplicity': p.multiplicity,
+                 'c_label': p.assigned_c_label, 'h_label': p.assigned_h_label,
+                 'h_integral': p.h_integral,
+                 'n_h': round(p.h_integral) if p.h_integral is not None else None}
+                for p in interpretation_2d.ch_pairs
+            ],
+            'spin_systems': [
+                {'label': ss.label, 'h_ppms': ss.h_ppms,
+                 'cosy_links': ss.cosy_links}
+                for ss in interpretation_2d.spin_systems
+            ],
+            'hmbc_connections': [
+                {'h_ppm': conn.h_ppm, 'c_ppm': conn.c_ppm,
+                 'bond_type': conn.bond_type}
+                for conn in interpretation_2d.hmbc_connections
+            ],
+            'n_cq_inferred': interpretation_2d.n_cq_inferred,
+            'cq_shifts': interpretation_2d.cq_shifts,
+            'cq_evidence': interpretation_2d.cq_evidence,
+            'notes': interpretation_2d.notes,
+            'overlap_regions': [
+                {'h_ppm_center': r.h_ppm_center, 'integral_total': r.integral_total,
+                 'n_peaks_in_13c_slice': r.n_peaks_in_13c_slice,
+                 'c_peaks': r.c_peaks, 'c_peak_intensities': r.c_peak_intensities,
+                 'status': r.status, 'note': r.note}
+                for r in interpretation_2d.overlap_regions
+            ],
+        }
+    # 全归属表 (Top-1)
+    if full_assignment is not None:
+        meta['full_assignment'] = {
+            'structure_smiles': full_assignment.structure_smiles,
+            'confidence': full_assignment.confidence,
+            'rows': [
+                {'atom_label': r.atom_label, 'c_ppm': r.c_ppm,
+                 'multiplicity': r.multiplicity, 'h_ppm': r.h_ppm,
+                 'hsqc_match': r.hsqc_match,
+                 'cosy_partners': r.cosy_partners,
+                 'hmbc_to_c': r.hmbc_to_c}
+                for r in full_assignment.rows
+            ],
+            'unassigned_obs_c': full_assignment.unassigned_obs_c,
+            'unassigned_obs_h': full_assignment.unassigned_obs_h,
+        }
     # 结构图生成 (在 HTML 报告之前, 以便 HTML 内嵌 base64 图片)
     print(f"[viz] 生成 Top-N 结构图...", file=sys.stderr)
     try:

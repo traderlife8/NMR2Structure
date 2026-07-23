@@ -110,6 +110,96 @@ def write_report_markdown(path: str, evidences: List[CandidateEvidence], meta: D
                     )
             lines.append('')
 
+    # 2D NMR 逐步解读过程 (化学家工作流)
+    interp = meta.get('interpretation_2d')
+    if interp:
+        lines.append('## 2D NMR 解谱过程 (化学家工作流)')
+        lines.append('')
+        # HSQC C-H 对
+        ch_pairs = interp.get('ch_pairs', [])
+        if ch_pairs:
+            lines.append(f'### 步骤 1: HSQC C-H 直接连接对 ({len(ch_pairs)} 个)')
+            lines.append('')
+            lines.append('| 编号 | δH (ppm) | δC (ppm) | 碳级数 |')
+            lines.append('|---|---:|---:|---|')
+            for p in ch_pairs:
+                lines.append(f"| {p.get('c_label', '-')} "
+                             f"| {p['h_ppm']:.3f} | {p['c_ppm']:.3f} "
+                             f"| {p.get('multiplicity', '?')} |")
+            lines.append('')
+        # COSY 自旋系统
+        spin_systems = interp.get('spin_systems', [])
+        if spin_systems:
+            lines.append(f'### 步骤 2: COSY 自旋系统 ({len(spin_systems)} 个)')
+            lines.append('')
+            for ss in spin_systems:
+                h_str = ' → '.join(f"{h:.3f}" for h in ss.get('h_ppms', []))
+                lines.append(f"- **{ss.get('label', '?')}**: {h_str}")
+            lines.append('')
+        # HMBC 远程连接
+        hmbc_conns = interp.get('hmbc_connections', [])
+        if hmbc_conns:
+            lines.append(f'### 步骤 3: HMBC 远程连接 ({len(hmbc_conns)} 个)')
+            lines.append('')
+            lines.append('| δH (ppm) | → δC (ppm) | 键类型 |')
+            lines.append('|---:|---:|---|')
+            for conn in hmbc_conns:
+                lines.append(f"| {conn['h_ppm']:.3f} | {conn['c_ppm']:.3f} "
+                             f"| {conn.get('bond_type', '?')} |")
+            lines.append('')
+        # 季碳推断
+        cq_shifts = interp.get('cq_shifts', [])
+        if cq_shifts:
+            lines.append(f'### 步骤 4: 推断季碳 ({len(cq_shifts)} 个)')
+            lines.append('')
+            lines.append('δC: ' + ', '.join(f'{c:.2f}' for c in cq_shifts))
+            lines.append('')
+        # 重叠峰分解 (步骤 1b)
+        overlap_regions = interp.get('overlap_regions', [])
+        if overlap_regions:
+            n_resolved = sum(1 for r in overlap_regions if r.get('status') == 'resolved')
+            lines.append(f'### 步骤 1b: 重叠峰分解 ({len(overlap_regions)} 个区域, '
+                        f'已分解 {n_resolved})')
+            lines.append('')
+            lines.append('| 区域 | δH | 总积分 | ¹³C切片峰数 | ¹³C峰位置 | 分解H/峰 | 状态 |')
+            lines.append('|---|---:|---:|---:|---|---:|---|')
+            for i, r in enumerate(overlap_regions, 1):
+                c_peaks_str = ', '.join(f"{c:.1f}" for c in r.get('c_peaks', []))
+                n_pk = r.get('n_peaks_in_13c_slice', 0)
+                h_per = f"{r['integral_total']/n_pk:.1f}" if n_pk > 0 else '—'
+                status_map = {'resolved': '✔ 已分解', 'partial': '△ 部分',
+                              'unresolvable': '✘ 未解'}
+                st = status_map.get(r.get('status', ''), r.get('status', ''))
+                lines.append(f"| {i} | {r['h_ppm_center']:.3f} "
+                            f"| {r['integral_total']:.1f} | {n_pk} "
+                            f"| {c_peaks_str} | {h_per} | {st} |")
+            lines.append('')
+
+    # 全归属表 (Top-1)
+    fa = meta.get('full_assignment')
+    if fa:
+        lines.append('## Top-1 完整 NMR 归属表')
+        lines.append('')
+        lines.append(f"结构: `{fa.get('structure_smiles', '?')}`  "
+                     f"置信度: {fa.get('confidence', 0):.0%}")
+        lines.append('')
+        lines.append('| 位置 | δC | 级数 | δH | HSQC | COSY | HMBC |')
+        lines.append('|---|---:|---|---:|:-:|---|---|')
+        for r in fa.get('rows', []):
+            hsqc_icon = '✔' if r.get('hsqc_match') else '—'
+            h_str = f"{r['h_ppm']:.3f}" if r.get('h_ppm') is not None else '—'
+            cosy_str = ', '.join(r.get('cosy_partners', [])) or '—'
+            hmbc_str = ', '.join(r.get('hmbc_to_c', [])) or '—'
+            lines.append(f"| {r['atom_label']} | {r['c_ppm']:.2f} "
+                         f"| {r['multiplicity']} | {h_str} | {hsqc_icon} "
+                         f"| {cosy_str} | {hmbc_str} |")
+        lines.append('')
+        unassigned_c = fa.get('unassigned_obs_c', [])
+        unassigned_h = fa.get('unassigned_obs_h', [])
+        if unassigned_c or unassigned_h:
+            lines.append(f"未归属观测峰: 13C={unassigned_c}, 1H={unassigned_h}")
+            lines.append('')
+
     # 未匹配峰
     lines.append('## 重点关注: 未匹配的实测峰 (可能是新结构片段)')
     lines.append('')
@@ -386,6 +476,7 @@ def write_report_html(
     os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
     out_dir = os.path.dirname(os.path.abspath(path))
     base = os.path.splitext(os.path.basename(path))[0]
+    report_basename = base  # 供 2.5 节引用
 
     # 渲染额外的概览图
     overview_path = os.path.join(out_dir, f'{base}_overview.png')
@@ -483,6 +574,105 @@ def write_report_html(
     parts.append('<div class="flow-step">6. Top-N 排序 + 证据链</div>')
     parts.append('</div>')
 
+    # 2.5 2D NMR 解谱详细过程 (化学家工作流)
+    interp = meta.get('interpretation_2d')
+    if interp:
+        parts.append('<h2>2.5  2D NMR 解谱过程 (化学家工作流)</h2>')
+        parts.append('<div class="alert alert-info">按 MestReNova 5.4 节化学家顺序: '
+                     'HSQC → COSY → HMBC → 季碳推断。详细表格与等高线图见各自中间文件 '
+                     '(本节仅给路径, 不嵌入)。</div>')
+
+        # 汇总数据 (后续不再嵌入单独表格/图片)
+        ch_pairs = interp.get('ch_pairs', [])
+        overlap_regions = interp.get('overlap_regions', [])
+        spin_systems = interp.get('spin_systems', [])
+        hmbc_conns = interp.get('hmbc_connections', [])
+        cq_shifts = interp.get('cq_shifts', [])
+
+        n_with_int = sum(1 for p in ch_pairs if p.get('h_integral') is not None)
+        n_overlap = sum(1 for p in ch_pairs
+                        if p.get('h_integral') is not None and p['h_integral'] >= 4.0)
+        if overlap_regions:
+            n_resolved = sum(1 for r in overlap_regions if r.get('status') == 'resolved')
+            n_partial = sum(1 for r in overlap_regions if r.get('status') == 'partial')
+            overlap_summary = (f'{len(overlap_regions)} 区 '
+                               f'(已分解 {n_resolved}, 部分 {n_partial})')
+        else:
+            overlap_summary = '—'
+
+        # 路径索引表
+        parts.append('<table>')
+        parts.append('<thead><tr><th>步骤</th><th>内容</th>'
+                     '<th>产出数</th><th>中间结果文件/目录</th></tr></thead>')
+        parts.append('<tbody>')
+
+        # 步骤 1
+        parts.append('<tr>'
+                     '<td><strong>步骤 1</strong></td>'
+                     '<td>HSQC C-H 直接连接对</td>'
+                     f'<td>{len(ch_pairs)} 个 '
+                     f'(含积分 {n_with_int}, 重叠 {n_overlap})</td>'
+                     '<td>'
+                     '<code>step1_hsqc_ch_pairs.csv</code><br>'
+                     '<code>step1_hsqc_ch_pairs/normal/</code> (非重叠峰等高线)<br>'
+                     '<code>step1_hsqc_ch_pairs/overlap/</code> (重叠峰等高线)'
+                     '</td></tr>')
+
+        # 步骤 1b
+        parts.append('<tr>'
+                     '<td><strong>步骤 1b</strong></td>'
+                     '<td>重叠峰分解 (5.9 节流程)</td>'
+                     f'<td>{overlap_summary}</td>'
+                     '<td>'
+                     '<code>step1b_overlap_analysis.csv</code> '
+                     '(13C 切片检峰详情)<br>'
+                     '<code>step1_hsqc_ch_pairs/overlap/</code> '
+                     '(局部放大含切片)'
+                     '</td></tr>')
+
+        # 步骤 2 / 3 / 4
+        parts.append('<tr>'
+                     '<td><strong>步骤 2</strong></td>'
+                     '<td>COSY 自旋系统</td>'
+                     f'<td>{len(spin_systems)} 个系统</td>'
+                     '<td><code>step2_cosy_spin_systems.csv</code></td></tr>')
+        parts.append('<tr>'
+                     '<td><strong>步骤 3</strong></td>'
+                     '<td>HMBC 远程连接</td>'
+                     f'<td>{len(hmbc_conns)} 个连接</td>'
+                     '<td><code>step3_hmbc_connections.csv</code></td></tr>')
+        parts.append('<tr>'
+                     '<td><strong>步骤 4</strong></td>'
+                     '<td>季碳推断 (含 DEPT 证据)</td>'
+                     f'<td>{len(cq_shifts)} 个</td>'
+                     '<td><code>step4_quaternary_carbons.csv</code></td></tr>')
+
+        # Top-1 完整归属表
+        fa = meta.get('full_assignment')
+        # 统计生成的归属表 CSV (论文 Table 1 格式) 数量
+        assignment_dir = os.path.join(out_dir, '完整NMR归属表(论文Table1)')
+        n_assignment_csv = 0
+        if os.path.isdir(assignment_dir):
+            n_assignment_csv = len([f for f in os.listdir(assignment_dir) if f.endswith('.csv')])
+
+        if fa:
+            fa_info = (f'<code>{_render_html_escaped(fa.get("structure_smiles", "?"))}</code> '
+                       f'置信度 <strong>{fa.get("confidence", 0):.0%}</strong> '
+                       f'({len(fa.get("rows", []))} 行)')
+        else:
+            fa_info = '—'
+        parts.append('<tr>'
+                     '<td><strong>Top-1</strong></td>'
+                     '<td>完整 NMR 归属表 (论文 Table 1)</td>'
+                     f'<td>{fa_info}</td>'
+                     f'<td><code>完整NMR归属表(论文Table1)/</code> '
+                     f'子目录 ({n_assignment_csv} 个 CSV, '
+                     f'每个 Top-1 CSV 含 位置/δC/级数/δH/HSQC/COSY/HMBC 列)</td></tr>')
+
+        parts.append('</tbody></table>')
+        parts.append('<div class="alert alert-info" style="margin-top:6px;">'
+                     '<small>所有中间结果 (CSV/PNG) 与 HTML 报告同级目录;'
+                     ' 化学家可在 Excel 或图片查看器中分别打开复核。</small></div>')
     # 3. DEPT 推断
     parts.append('<h2>3. DEPT 推断 (实测碳类型)</h2>')
     if not obs_dept:

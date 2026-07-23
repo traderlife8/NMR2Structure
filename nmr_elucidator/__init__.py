@@ -35,8 +35,21 @@ from .io_bruker_2d import (
     read_bruker_2d_folder,
 )
 from .correlation_2d import (
+    AssignmentRow,
     Correlation2DScore,
+    FullAssignmentTable,
+    build_full_assignment_table,
     score_candidate_2d,
+    write_assignment_table_csv,
+)
+from .interpret_2d import (
+    CHPair,
+    HMBCConnection,
+    Interpretation2D,
+    OverlapRegion,
+    SpinSystem,
+    interpret_2d_sequential,
+    write_step_files,
 )
 from .io_sdf import (
     NmrShiftDb2Entry,

@@ -81,15 +81,30 @@ def compute_unified_score(
 
     if weights is None:
         if has_2d:
-            weights = {
-                'c_coverage': 0.15,
-                'h_coverage': 0.10,
-                'hose_rms': 0.25,
-                'dept_match': 0.10,
-                'formula_match': 0.10,
-                'peak_count': 0.10,
-                '2d_correlation': 0.20,
-            }
+            # 检查 HSQC/HMBC 匹配率是否足够高
+            s2d = evidence.correlation_2d_score
+            strong_2d = (s2d.hsqc_match_rate > 0.8 and s2d.hmbc_match_rate > 0.6)
+            if strong_2d:
+                # 强 2D 证据: 提升 2D 权重到 0.30
+                weights = {
+                    'c_coverage': 0.10,
+                    'h_coverage': 0.10,
+                    'hose_rms': 0.20,
+                    'dept_match': 0.10,
+                    'formula_match': 0.10,
+                    'peak_count': 0.10,
+                    '2d_correlation': 0.30,
+                }
+            else:
+                weights = {
+                    'c_coverage': 0.15,
+                    'h_coverage': 0.10,
+                    'hose_rms': 0.25,
+                    'dept_match': 0.10,
+                    'formula_match': 0.10,
+                    'peak_count': 0.10,
+                    '2d_correlation': 0.20,
+                }
         else:
             weights = {
                 'c_coverage': 0.20,

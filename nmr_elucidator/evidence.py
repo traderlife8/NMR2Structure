@@ -38,37 +38,62 @@ def score_candidates(
     h_weight: float = 0.4,
     dept_match_bonus: float = 30.0,
     h_count_match_bonus: float = 20.0,
+    use_2d_scoring: bool = False,
 ) -> List[ScoredCandidate]:
     """综合打分.
 
+    无 2D 数据时 (use_2d_scoring=False):
     score = (c_coverage * c_weight + h_coverage * h_weight) * 100
             - 5 * c_rms
             - 5 * h_rms
             - 2 * peak_count_diff
-            + dept_match_bonus  * dept_coverage  (若提供 dept)
-            + h_count_match_bonus * h_count_match_score  (若提供 H 总数)
+            + dept_match_bonus  * dept_coverage
+            + h_count_match_bonus * h_count_match_score
+
+    有 2D 数据时 (use_2d_scoring=True):
+    score = 1D_coverage * 40
+            + hsqc_pair_score * 30
+            - 5 * hsqc_rms
+            + dept_bonus * 5
+            + h_count_bonus * 5
+            - 2 * peak_count_diff
     """
     scored: List[ScoredCandidate] = []
     for h in hits:
-        cov_score = (h.c_coverage * c_weight + h.h_coverage * h_weight) * 100.0
-        c_pen = 5.0 * h.c_rms
-        h_pen = 5.0 * h.h_rms
-        diff_c = abs(h.c_total_lib - h.c_total_obs)
-        diff_h = abs(h.h_total_lib - h.h_total_obs)
-        diff_pen = 2.0 * (diff_c + diff_h)
+        if use_2d_scoring and h.hsqc_total_obs > 0:
+            # 2D 模式: HSQC 配对匹配为核心
+            cov_1d = (h.c_coverage * c_weight + h.h_coverage * h_weight) * 40.0
+            hsqc_score = h.hsqc_coverage * 30.0
+            hsqc_pen = 5.0 * h.hsqc_rms
+            diff_c = abs(h.c_total_lib - h.c_total_obs)
+            diff_h = abs(h.h_total_lib - h.h_total_obs)
+            diff_pen = 2.0 * (diff_c + diff_h)
+            # DEPT + H 总数 (权重降低)
+            dept_bonus = 0.0
+            if h.dept_total > 0:
+                dept_bonus = 5.0 * h.dept_coverage
+            h_count_bonus = 0.0
+            if h.h_count_expected is not None and h.h_count_lib is not None and h.h_count_expected > 0:
+                ratio = min(h.h_count_lib, h.h_count_expected) / max(h.h_count_lib, h.h_count_expected)
+                h_count_bonus = 5.0 * ratio
+            s = cov_1d + hsqc_score - hsqc_pen - diff_pen + dept_bonus + h_count_bonus
+        else:
+            # 1D 模式: 原始公式
+            cov_score = (h.c_coverage * c_weight + h.h_coverage * h_weight) * 100.0
+            c_pen = 5.0 * h.c_rms
+            h_pen = 5.0 * h.h_rms
+            diff_c = abs(h.c_total_lib - h.c_total_obs)
+            diff_h = abs(h.h_total_lib - h.h_total_obs)
+            diff_pen = 2.0 * (diff_c + diff_h)
+            dept_bonus = 0.0
+            if h.dept_total > 0:
+                dept_bonus = dept_match_bonus * h.dept_coverage
+            h_count_bonus = 0.0
+            if h.h_count_expected is not None and h.h_count_lib is not None and h.h_count_expected > 0:
+                ratio = min(h.h_count_lib, h.h_count_expected) / max(h.h_count_lib, h.h_count_expected)
+                h_count_bonus = h_count_match_bonus * ratio
+            s = cov_score - c_pen - h_pen - diff_pen + dept_bonus + h_count_bonus
 
-        # DEPT 匹配 (若有)
-        dept_bonus = 0.0
-        if h.dept_total > 0:
-            dept_bonus = dept_match_bonus * h.dept_coverage
-
-        # H 总数一致性 (若有)
-        h_count_bonus = 0.0
-        if h.h_count_expected is not None and h.h_count_lib is not None and h.h_count_expected > 0:
-            ratio = min(h.h_count_lib, h.h_count_expected) / max(h.h_count_lib, h.h_count_expected)
-            h_count_bonus = h_count_match_bonus * ratio
-
-        s = cov_score - c_pen - h_pen - diff_pen + dept_bonus + h_count_bonus
         scored.append(ScoredCandidate(hit=h, score=s))
     # 降序
     scored.sort(key=lambda x: x.score, reverse=True)

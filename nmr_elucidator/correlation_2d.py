@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import csv
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -444,3 +445,212 @@ def score_candidate_2d(
             f'({result.cosy_match_rate:.0%})')
 
     return result
+
+
+# ---- 全归属表生成 (化学家的最终交付物) ----
+
+@dataclass
+class AssignmentRow:
+    """归属表的一行."""
+
+    atom_label: str       # 'C-1', 'C-2', ...
+    c_ppm: Optional[float] = None
+    multiplicity: str = 'unknown'  # 'CH'/'CH2'/'CH3'/'Cq'
+    h_ppm: Optional[float] = None
+    h_mult: Optional[str] = None  # 's'/'d'/'t'/'q'/'m'
+    hsqc_match: bool = False
+    cosy_partners: List[str] = field(default_factory=list)
+    hmbc_to_c: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FullAssignmentTable:
+    """完整归属表."""
+
+    rows: List[AssignmentRow] = field(default_factory=list)
+    structure_smiles: str = ''
+    confidence: float = 0.0
+    unassigned_obs_c: List[float] = field(default_factory=list)
+    unassigned_obs_h: List[float] = field(default_factory=list)
+
+
+def build_full_assignment_table(
+    entry: NmrShiftDb2Entry,
+    interpretation: 'Interpretation2D',
+    observed_c13: List[float],
+    observed_h1: List[float],
+    h_tol: float = 0.3,
+    c_tol: float = 2.5,
+) -> FullAssignmentTable:
+    """为确定结构生成完整 NMR 归属表.
+
+    对标论文中的 Table 1 格式:
+    | 位置 | δC | 碳级数 | δH | HSQC | COSY | HMBC |
+
+    Args:
+        entry: nmrshiftdb2 候选 (含 per-atom 归属)
+        interpretation: 2D 解谱中间结果
+        observed_c13: 实测 13C 位移
+        observed_h1: 实测 1H 位移
+        h_tol: 1H 容差
+        c_tol: 13C 容差
+    """
+    table = FullAssignmentTable(
+        structure_smiles=entry.canonical_smiles or entry.smiles,
+    )
+
+    # 从 entry 构建原子归属
+    c_map, h_map = _build_atom_shift_maps(entry)
+
+    # 解析分子获取 C-H 键关系
+    try:
+        from rdkit import Chem
+        mol = Chem.MolFromMolBlock(entry.mol_block, sanitize=True, removeHs=False)
+    except Exception:
+        mol = None
+
+    if mol is None:
+        table.unassigned_obs_c = list(observed_c13)
+        table.unassigned_obs_h = list(observed_h1)
+        return table
+
+    # 构建 C-H 键映射: c_idx -> [h_idx, ...]
+    c_to_h: Dict[int, List[int]] = {}
+    for bond in mol.GetBonds():
+        a1, a2 = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        at1, at2 = mol.GetAtomWithIdx(a1), mol.GetAtomWithIdx(a2)
+        if at1.GetSymbol() == 'C' and at2.GetSymbol() == 'H':
+            c_to_h.setdefault(a1, []).append(a2)
+        elif at2.GetSymbol() == 'C' and at1.GetSymbol() == 'H':
+            c_to_h.setdefault(a2, []).append(a1)
+
+    # 确定每个 C 的级数
+    def _get_mult(c_idx: int) -> str:
+        n_h = len(c_to_h.get(c_idx, []))
+        return {0: 'Cq', 1: 'CH', 2: 'CH2', 3: 'CH3'}.get(n_h, 'unknown')
+
+    # 为每个有归属的 C 原子生成一行
+    assigned_c_shifts: Set[float] = set()
+    assigned_h_shifts: Set[float] = set()
+    row_idx = 0
+
+    for c_idx in sorted(c_map.keys(), key=lambda i: c_map[i], reverse=True):
+        c_ppm = c_map[c_idx]
+        mult = _get_mult(c_idx)
+        row_idx += 1
+        label = f'C-{row_idx}'
+
+        # 找对应的 H
+        h_ppm_val: Optional[float] = None
+        h_indices = c_to_h.get(c_idx, [])
+        if h_indices and h_indices[0] in h_map:
+            h_ppm_val = h_map[h_indices[0]]
+
+        # HSQC 匹配: 检查观测 HSQC 中是否有对应
+        hsqc_ok = False
+        for pair in interpretation.ch_pairs:
+            if abs(pair.c_ppm - c_ppm) <= c_tol:
+                if h_ppm_val is not None and abs(pair.h_ppm - h_ppm_val) <= h_tol:
+                    hsqc_ok = True
+                    break
+                elif h_ppm_val is None:
+                    break
+
+        # COSY partners: 找观测 COSY 中与该 H 相关的其他 H
+        cosy_parts: List[str] = []
+        if h_ppm_val is not None:
+            for ss in interpretation.spin_systems:
+                if any(abs(h_ppm_val - sh) <= h_tol for sh in ss.h_ppms):
+                    for other_h in ss.h_ppms:
+                        if abs(other_h - h_ppm_val) > h_tol:
+                            for other_pair in interpretation.ch_pairs:
+                                if abs(other_pair.h_ppm - other_h) <= h_tol:
+                                    cosy_parts.append(
+                                        other_pair.assigned_h_label or f'H({other_h:.2f})')
+                                    break
+                    break
+
+        # HMBC: 找观测 HMBC 中从其他 H 到该 C 的远程连接
+        hmbc_labels: List[str] = []
+        for conn in interpretation.hmbc_connections:
+            if abs(conn.c_ppm - c_ppm) <= c_tol:
+                for pair in interpretation.ch_pairs:
+                    if abs(pair.h_ppm - conn.h_ppm) <= h_tol:
+                        hmbc_labels.append(
+                            pair.assigned_h_label or f'H({conn.h_ppm:.2f})')
+                        break
+
+        row = AssignmentRow(
+            atom_label=label,
+            c_ppm=round(c_ppm, 2),
+            multiplicity=mult,
+            h_ppm=round(h_ppm_val, 3) if h_ppm_val is not None else None,
+            hsqc_match=hsqc_ok,
+            cosy_partners=cosy_parts[:5],
+            hmbc_to_c=hmbc_labels[:5],
+        )
+        table.rows.append(row)
+        assigned_c_shifts.add(round(c_ppm, 1))
+        if h_ppm_val is not None:
+            assigned_h_shifts.add(round(h_ppm_val, 2))
+
+    # 未归属的观测峰
+    table.unassigned_obs_c = [
+        c for c in observed_c13
+        if not any(abs(c - ac) <= c_tol for ac in assigned_c_shifts)
+    ]
+    table.unassigned_obs_h = [
+        h for h in observed_h1
+        if not any(abs(h - ah) <= h_tol for ah in assigned_h_shifts)
+    ]
+
+    # 置信度: 已归属 C 占总观测 C 的比例 (封顶 1.0)
+    if observed_c13:
+        table.confidence = min(1.0, len(assigned_c_shifts) / len(observed_c13))
+
+    return table
+
+
+def write_assignment_table_csv(
+    table: FullAssignmentTable,
+    output_path: str,
+    rank: int = 0,
+    score: Optional[float] = None,
+) -> None:
+    """把 FullAssignmentTable 写成论文 Table 1 格式的 CSV (化学家可直接复核).
+
+    输出列:
+      位置 | δC (ppm) | 碳级数 | δH (ppm) | H多重峰 | HSQC ✓/— | COSY partners | HMBC to C
+
+    文件还包含元信息头注释: Rank / 结构 SMILES / 置信度 / 未归属观测峰.
+    """
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f)
+        # 元信息头
+        w.writerow(['# Rank', rank])
+        if score is not None:
+            w.writerow(['# Score', f'{score:.4f}'])
+        w.writerow(['# Structure SMILES', table.structure_smiles or ''])
+        w.writerow(['# Confidence', f'{table.confidence:.2%}'])
+        if table.unassigned_obs_c:
+            w.writerow(['# Unassigned 13C (ppm)',
+                        '; '.join(f'{c:.3f}' for c in table.unassigned_obs_c)])
+        if table.unassigned_obs_h:
+            w.writerow(['# Unassigned 1H (ppm)',
+                        '; '.join(f'{h:.3f}' for h in table.unassigned_obs_h)])
+        w.writerow([])
+        # 表头
+        w.writerow(['位置', 'δC (ppm)', '碳级数', 'δH (ppm)', 'H多重峰',
+                    'HSQC', 'COSY partners', 'HMBC to C'])
+        # 数据行
+        for r in table.rows:
+            w.writerow([
+                r.atom_label,
+                f'{r.c_ppm:.2f}' if r.c_ppm is not None else '',
+                r.multiplicity,
+                f'{r.h_ppm:.3f}' if r.h_ppm is not None else '',
+                r.h_mult or '',
+                '✓' if r.hsqc_match else '—',
+                '; '.join(r.cosy_partners),
+                '; '.join(r.hmbc_to_c),
+            ])
