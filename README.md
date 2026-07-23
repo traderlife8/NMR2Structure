@@ -97,6 +97,82 @@ python -X utf8 -m nmr_elucidator --folder <原始数据/<sample>> --sdf <SDF>
 |---|---|
 | `util/download_lucy_hose_db.py` | 下载 lucy-ng HOSE 完整数据库 (~830 MB / ~2.8 GB)；支持 Colab / aria2 / curl / proxy 4 种策略 |
 
+## 解谱工作流对标
+
+按 `doc/MestReNova_解谱指南.md` 5.4 节化学家实操 6 步 + 5.1 节拼图策略, 当前程序能力对照:
+
+| 步骤 | 化学家动作 | 程序实现 | 状态 |
+|---|---|---|---|
+| 1.1 | 1H 谱积分 + 标峰 | `io_bruker.py` 读 peaklist.xml + integrals.txt | 已做 |
+| 1.2 | 1H 多重峰分析 (J 耦合) | `io_bruker.parse_multiplets_from_peaklist` (含 `infer_multiplets_from_peaks` 自动反推 fallback) | 已做 |
+| 1.2b | **TopSpin Manual 多重峰精细化分析** | `io_bruker.analyze_multiplet_at_ppm` 对每个 CHPair 单独做局部窗口多重峰拟合 (pattern/J/halfwidth/质量等级) → `step1b_multiplet_analysis.csv` | 已做 |
+| 1.3 | 13C 标峰 + DEPT 推断级数 | `bridge_nmr2struct.assign_carbon_multiplicity` | 已做 |
+| 1.4 | 化学位移经验区段初判 | `shift_ranges` | 已做 |
+| 2.1 | HSQC 建立 (dH, dC) 对 | `interpret_2d._step1_hsqc_to_ch_pairs` | 已做 |
+| 2.2 | HSQC 投影叠加 | 等高线图 1H/13C 双投影 | 已做 |
+| 2.3 | HSQC-DEPT 颜色区分 | 等高线图按 multiplicity 着色 (CH/CH3=红, CH2=蓝) | 已做 |
+| 2.4 | 季碳从 13C 扣除 HSQC 对应 | `_step4_infer_quaternary_carbons` DEPT 优先 | 已做 |
+| 2.5 | 重叠峰 13C 切片分解 | `_step1b_resolve_overlapping` (5.9 节) → `step1b_overlap_regions.csv` (fallback) | 已做 |
+| 2.5b | **精细化 1H 多重峰分析** | `_step1b_multiplet_analysis_for_ch_pairs` 对每个非季碳 C-H 对单独取窗口内 Peak1D, 拟合 pattern/J/半高宽/强度均匀性/质量等级 → `step1b_multiplet_analysis.csv` (主输出) | 已做 |
+| 3.1 | COSY 拼自旋系统 | `_step2_cosy_spin_systems` Union-Find + J 验证 | 已做 |
+| 3.2 | TOCSY 长程自旋系统 | `_step2_tocsy_spin_systems` (h_tol=0.6) | 已做 |
+| 4.1 | HMBC 找 2-3 键外 C | `_step3_hmbc_connections` | 已做 |
+| 4.2 | HMBC 排除 1J 干扰 | c_tol 过滤 | 已做 |
+| 4.3 | HMBC 区分 2J vs 3J | `_annotate_hmbc_bond_type` 自旋系统拓扑 | 已做 |
+| 5.1 | NOESY/ROESY 谱读取 | `io_bruker_2d.detect_2d_experiment_type` | 已做 |
+| 5.2 | NOESY 空间近邻 H-H 提取 | `_step5_extract_noe_contacts` | 已做 |
+| 5.3 | 候选 3D 构象 NOE 验证 | `correlation_2d.verify_candidate_3d_noe` | 已做 |
+| 6.1 | 完整归属表 (论文 Table 1) | `build_full_assignment_table` Top-N CSV | 已做 |
+| 6.2 | 归属完整性自动核对 | `validate_assignment` | 已做 |
+| 6.3 | 候选结构检索 | `retrieve.retrieve_candidates` nmrshiftdb2 | 已做 |
+| 6.4 | 综合打分排序 | `evidence.score_candidates` (含 NOE 加分) | 已做 |
+| 6.5 | 置信度四级评估 | `determination.assess_determination` | 已做 |
+
+### step1b 多重峰数据在后续流程的应用规划
+
+`step1b_multiplet_analysis.csv` 提供每个非季碳 C-H 对的多重峰精细化拟合
+(pattern/J/半高宽/强度均匀性/质量等级), 在项目后续环节具有以下增强潜力:
+
+| 环节 | 当前位置 | step1b 增强方式 | 状态 |
+|---|---|---|---|
+| **HSQC 配对检索** | `__main__.py` 提取 `[(h_ppm, c_ppm), ...]` | 扩展为 `[(h_ppm, c_ppm, multiplicity, j_pattern), ...]`, 候选中对应 H 的 J 模式应匹配实测 | 未做 |
+| **候选打分 (J-RMS 维度)** | `evidence.score_candidates` (13C/1H RMS + DEPT coverage + NOE) | 加 `J_RMS` 维度: 实测 J 与候选结构 RDKit 3D 构象二面角预测的 J 对比 (Karplus 方程) | 未做 |
+| **COSY 交叉峰验证** | `_step2_cosy_spin_systems` 用 `\|J\|>4 Hz` 过滤 | 进一步: 如果实测 H 是 s (无 J) 但 COSY 显示交叉峰, 视为假阳性并降权 | 未做 |
+| **3D 构象 J 验证** | `correlation_2d.verify_candidate_3d_noe` 仅 NOE 距离 | 加 `verify_candidate_3d_j`: ETKDG 嵌入 + MMFF 优化 + 二面角扫描 + Karplus 预测 J, 与实测 J_RMS 比对 | 未做 |
+| **归属置信度** | `determination.assess_determination` (基于 1D/2D 一致性) | 加 J 一致性维度: 实测 pattern (s/d/t/q/m) 应与候选 CH/CH2/CH3 结构相符 | 未做 |
+| **邻位 H 拓扑反推** | `_fill_h_neighbors_from_spin_systems` 仅用 COSY | 用 J 反推: `\|J\|>5 Hz` → 3J 直接邻位, `1-5 Hz` → 邻位或 2J 长程, `<1 Hz` → 4J+ 长程 | 未做 |
+| **化学家人工复核** | 看 step1 CSV 数值 | 重点复核 **Very Poor** 行 (强度剖面严重偏离理论), 这类 C-H 对归属需手动验证 | 已支持 (按 quality_grade 排序) |
+| **Karplus 方程常数表** | 无 | 需维护: ³J(H-C-C-H) Karplus A/B/C 系数 (典型 7.0/-1.0/0.0; 烯烃顺/反 7.0/-1.5/2.0; 芳烃 8.5/-1.0/0.5) | 未做 |
+
+**优先级建议**:
+1. **Karplus 3D J 验证** (优先级高): 与 NOE 3D 验证互补, 二面角 + 距离双维度交叉, 显著提高候选结构可靠性
+2. **HSQC 配对检索加入 J 模式**: 减少误匹配 (CH2 vs CH3 不能仅靠 ppm 区分)
+3. **归属置信度 J 一致性**: 简单加权即可, 让 determination 输出更稳定
+
+**实施示例** (Karplus 3D J 验证):
+
+```python
+def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
+                          field_mhz, num_confs=10):
+    """对候选 SMILES 做 3D 构象采样 + Karplus J 预测 vs 实测.
+
+    Args:
+        candidate_smiles: 候选 SMILES
+        j_observations: [MultipletAnalysis, ...] 实测 J (Hz)
+        h_assignments: {h_ppm: atom_idx} H 归属 (从 build_assignment 推断)
+        field_mhz: 实测频率 (Hz/ppm 转换)
+
+    Returns:
+        J_RMS_Hz, J_match_count, J_conflict_count
+    """
+    mol = Chem.MolFromSmiles(candidate_smiles)
+    mol = Chem.AddHs(mol)
+    cids = AllChem.EmbedMultipleConfs(mol, numConfs=num_confs)
+    AllChem.MMFFOptimizeMoleculeConfs(mol)
+    # 对每个 conf 提取 H-C-C-H 二面角, 用 Karplus 计算 ³J
+    # 取与实测 J_RMS 最小的 conf 为最佳
+```
+
 ### 必填
 
 | 参数 | 说明 |
@@ -520,10 +596,10 @@ figshare 在国内无法直接访问，Google Colab 是官方推荐的曲线下�
 
 | 文件 | 内容 |
 |---|---|
-| `step1_hsqc_ch_pairs.csv` | HSQC C-H 直接连接对（52 行示例）。列：编号/C_label/H_label/δH/δC/1H积分/H个数/碳级数。 |
+| `step1_hsqc_ch_pairs.csv` | HSQC C-H 直接连接对（52 行示例）。列：编号/C_label/H_label/δH/δC/1H积分/H个数/碳级数/J_couplings_Hz/h_neighbors_ppm（精细化 1H 多重峰分析覆盖的 J 与 COSY 反推的邻位 H）。 |
 | `step1_hsqc_ch_pairs/overlap/*.png` | 积分 ≥ 4 的 C-H 对 HSQC 等高线图（Mnova 风格：2D等高线+1H投影+13C投影+13C切片检峰），可目视检查重叠峰。 |
 | `step1_hsqc_ch_pairs/normal/*.png` | 非重叠峰等高线图（同上布局）。 |
-| `step1b_overlap_analysis.csv` | 重叠峰分解详情（5.9 节流程）。列：区域序号/δH/总积分/13C切片峰数/13C峰位置/峰强度/分解后H/峰/状态/说明。状态 = `resolved`（完全分解）/ `partial`（部分）/ `unresolvable`（未解）。 |
+| `step1b_multiplet_analysis.csv` | **精细化 1H 多重峰分析**（主输出，对标 TopSpin Manual Multiple Peak Analysis）。每个非季碳 C-H 对一行：编号/C_label/H_label/δH/δC/碳级数/multiplet_pattern (s/d/t/q/m)/子峰数/J1_Hz/J2_Hz/J3_Hz/多重峰中心_ppm/半高宽_Hz/强度均匀性 (0-1)/质量等级 (Excellent/Good/Poor/Very Poor/N/A)/说明。质量等级基于子峰强度剖面与理论 1:1/1:2:1/1:3:3:1 的吻合度，用于化学家重点复核 "Very Poor" 行。 |
 | `step2_cosy_spin_systems.csv` | COSY 沿耦合链连接的自旋系统（Union-Find 聚类）。 |
 | `step3_hmbc_connections.csv` | HMBC 远程 H→C 连接（排除 1J，键类型标记 2J/3J）。完整不截断。 |
 | `step4_quaternary_carbons.csv` | 推断的季碳。**推断依据**列标明 `DEPT判定为Cq`（优先级 1）或 `13C有峰但无HSQC对应`（优先级 2）。 |

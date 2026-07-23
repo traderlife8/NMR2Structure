@@ -647,6 +647,36 @@ def write_report_html(
                      f'<td>{len(cq_shifts)} 个</td>'
                      '<td><code>step4_quaternary_carbons.csv</code></td></tr>')
 
+        # 步骤 5: NOE 空间近邻 (若有)
+        noe_contacts = interp.get('noe_contacts', [])
+        if noe_contacts:
+            parts.append('<tr>'
+                         '<td><strong>步骤 5</strong></td>'
+                         '<td>NOE 空间近邻 H-H 对</td>'
+                         f'<td>{len(noe_contacts)} 对</td>'
+                         '<td><code>step5_noe_spatial_contacts.csv</code></td></tr>')
+
+        # 步骤 6: NOE 3D 验证 (若有)
+        noe_verif = meta.get('noe_verification', [])
+        if noe_verif:
+            parts.append('<tr>'
+                         '<td><strong>步骤 6</strong></td>'
+                         '<td>NOE 3D 构象验证 (Top-N)</td>'
+                         f'<td>{len(noe_verif)} 个候选</td>'
+                         '<td><code>step6_noe_3d_verification.csv</code></td></tr>')
+
+        # 步骤 7: 归属完整性核对
+        av = interp.get('assignment_validation')
+        if av:
+            av_status = 'OK' if av.get('is_complete') else '有警告'
+            parts.append('<tr>'
+                         '<td><strong>步骤 7</strong></td>'
+                         '<td>归属完整性核对</td>'
+                         f'<td>C: {av.get("assigned_c", 0)}/{av.get("total_observed_c", 0)}; '
+                         f'H: {av.get("assigned_h", 0)}/{av.get("total_observed_h", 0)}; '
+                         f'{av_status}</td>'
+                         '<td><code>step7_assignment_validation.csv</code></td></tr>')
+
         # Top-1 完整归属表
         fa = meta.get('full_assignment')
         # 统计生成的归属表 CSV (论文 Table 1 格式) 数量

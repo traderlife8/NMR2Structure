@@ -269,12 +269,28 @@ def main(argv=None):
         print(f"[2.8] 2D NMR 逐步解读 (化学家工作流) ...", file=sys.stderr)
         try:
             from .interpret_2d import interpret_2d_sequential, write_step_files
+            from .io_bruker import parse_multiplets_from_peaklist
+            # 解析 1H 多重峰 (J 耦合). 优先读取 Multiplet 标签/Peak1D+mult,
+            # 未做手工多重峰分析时 fallback 到 infer_multiplets_from_peaks.
+            multiplets = []
+            h1_peaklist_path = None
+            h1_field_mhz = 0.0
+            for spec in specs:
+                if spec.nucleus == '1H' and spec.peaklist_path:
+                    multiplets = parse_multiplets_from_peaklist(
+                        spec.peaklist_path, field_mhz=spec.field_mhz)
+                    h1_peaklist_path = spec.peaklist_path
+                    h1_field_mhz = spec.field_mhz
+                    break
             interpretation_2d = interpret_2d_sequential(
                 spectra_2d=spectra_2d,
                 carbon_shifts_1d=problem.carbon_shifts,
                 proton_shifts_1d=problem.proton_shifts,
                 dept_summary=obs_dept_summary,
                 proton_integrals=problem.proton_integrals,
+                multiplets=multiplets,
+                h1_peaklist_path=h1_peaklist_path,
+                h1_field_mhz=h1_field_mhz,
                 quiet=args.quiet,
             )
             # 中间结果写入独立 CSV (化学家复核用)
@@ -569,6 +585,72 @@ def main(argv=None):
         if full_assignments_topn and not args.quiet:
             print(f"  -> 归属表目录: {assignment_dir}", file=sys.stderr)
 
+    # 9.6 NOE 3D 构象验证 (有 NOESY 数据 + 归属表时)
+    noe_verification_results: List[dict] = []
+    if (interpretation_2d is not None
+            and interpretation_2d.noe_contacts
+            and full_assignments_topn):
+        from .correlation_2d import verify_candidate_3d_noe
+        print(f"[9.6] NOE 3D 构象验证 ({len(interpretation_2d.noe_contacts)} 个 NOE 对) ...",
+              file=sys.stderr)
+        for ev in evidences[:min(args.top_n, len(evidences))]:
+            # 构建 h_assignments: dH_ppm -> atom_index
+            # 从归属表 rows 提取 (h_ppm, atom_label) 映射到 RDKit mol
+            h_assignments: dict = {}
+            try:
+                from rdkit import Chem
+                mol = Chem.MolFromSmiles(ev.smiles)
+                if mol is None:
+                    continue
+                mol = Chem.AddHs(mol)
+                # 简化映射: 用归属表的 h_ppm 作为 key, 用 H 原子 index 作为 value
+                # 由于归属表可能不完整, 用顺序匹配
+                h_atoms = [a.GetIdx() for a in mol.GetAtoms() if a.GetSymbol() == 'H']
+                # 从归属表提取已归属的 h_ppm
+                for fa_info in full_assignments_topn:
+                    if fa_info.get('rank') == ev.rank:
+                        # 简化: 用观测 proton_shifts 顺序匹配 H 原子
+                        for i, h_ppm in enumerate(problem.proton_shifts):
+                            if i < len(h_atoms):
+                                h_assignments[round(h_ppm, 3)] = h_atoms[i]
+                        break
+            except Exception:
+                pass
+
+            if not h_assignments:
+                continue
+
+            try:
+                noe_result = verify_candidate_3d_noe(
+                    ev.smiles, interpretation_2d.noe_contacts, h_assignments)
+                noe_verification_results.append({
+                    'rank': ev.rank,
+                    'smiles': ev.smiles,
+                    'n_total': noe_result.n_total,
+                    'n_matched': noe_result.n_matched,
+                    'n_conflict': noe_result.n_conflict,
+                    'rms_distance': noe_result.rms_distance,
+                    'status': noe_result.verification_status,
+                })
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} NOE 验证失败: {ex}", file=sys.stderr)
+
+        # 写 step6_noe_3d_verification.csv
+        if noe_verification_results:
+            import csv as csv_mod
+            path6 = os.path.join(output_dir, 'step6_noe_3d_verification.csv')
+            with open(path6, 'w', newline='', encoding='utf-8') as f:
+                w = csv_mod.writer(f)
+                w.writerow(['候选rank', 'SMILES', 'NOE总数', '匹配', '冲突',
+                            'RMS距离_A', '状态'])
+                for r in noe_verification_results:
+                    w.writerow([r['rank'], r['smiles'], r['n_total'],
+                                r['n_matched'], r['n_conflict'],
+                                f"{r['rms_distance']:.3f}", r['status']])
+            if not args.quiet:
+                print(f"  -> NOE 验证: {len(noe_verification_results)} 个候选 -> "
+                      f"step6_noe_3d_verification.csv", file=sys.stderr)
+
     # 输出 (out_prefix 已在 main() 开头构造, 路径 = output_root / compound_name / compound_name.*)
     meta = {
         'folder': folder,
@@ -681,7 +763,30 @@ def main(argv=None):
                  'status': r.status, 'note': r.note}
                 for r in interpretation_2d.overlap_regions
             ],
+            'tocsy_spin_systems': [
+                {'label': ss.label, 'h_ppms': ss.h_ppms}
+                for ss in interpretation_2d.tocsy_spin_systems
+            ],
+            'noe_contacts': [
+                {'h1_ppm': nc.h1_ppm, 'h2_ppm': nc.h2_ppm,
+                 'intensity': nc.intensity, 'confidence': nc.confidence,
+                 'expected_distance': nc.expected_distance}
+                for nc in interpretation_2d.noe_contacts
+            ],
+            'assignment_validation': {
+                'total_observed_c': interpretation_2d.assignment_validation.total_observed_c,
+                'assigned_c': interpretation_2d.assignment_validation.assigned_c,
+                'total_observed_h': interpretation_2d.assignment_validation.total_observed_h,
+                'assigned_h': interpretation_2d.assignment_validation.assigned_h,
+                'unassigned_c': interpretation_2d.assignment_validation.unassigned_c,
+                'unassigned_h': interpretation_2d.assignment_validation.unassigned_h,
+                'warnings': interpretation_2d.assignment_validation.warnings,
+                'is_complete': interpretation_2d.assignment_validation.is_complete,
+            } if interpretation_2d.assignment_validation else None,
         }
+    # NOE 3D 验证结果
+    if noe_verification_results:
+        meta['noe_verification'] = noe_verification_results
     # 全归属表 (Top-1)
     if full_assignment is not None:
         meta['full_assignment'] = {

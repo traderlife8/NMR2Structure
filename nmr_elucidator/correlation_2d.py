@@ -44,6 +44,9 @@ class Correlation2DScore:
     n_hsqc_matched: int = 0
     n_hmbc_matched: int = 0
     n_cosy_matched: int = 0
+    noe_match_rate: Optional[float] = None   # NOE 命中率 (0-1)
+    noe_conflict_count: int = 0              # NOE 冲突数
+    noe_rms_distance: Optional[float] = None # NOE RMS 距离偏差 (A)
     notes: List[str] = field(default_factory=list)
 
 
@@ -654,3 +657,159 @@ def write_assignment_table_csv(
                 '; '.join(r.cosy_partners),
                 '; '.join(r.hmbc_to_c),
             ])
+
+
+# ---- NOE 3D 构象验证 ----
+
+@dataclass
+class NOEVerificationResult:
+    """候选结构 NOE 约束验证结果."""
+
+    n_total: int = 0
+    n_matched: int = 0
+    n_conflict: int = 0
+    rms_distance: float = 0.0
+    conflicts: List[dict] = field(default_factory=list)
+    best_conformer_idx: int = 0
+    verification_status: str = ''  # 'good'/'partial'/'conflict'/'fallback_2d'/'skipped'
+
+
+def verify_candidate_3d_noe(
+    candidate_smiles: str,
+    noe_contacts: List,
+    h_assignments: dict,
+    max_distance: float = 5.0,
+    distance_tolerance: float = 1.0,
+    num_confs: int = 10,
+) -> NOEVerificationResult:
+    """对候选结构用 RDKit 嵌入多构象, 验证 NOE 约束.
+
+    算法:
+    1. RDKit Chem.AddHs -> AllChem.EmbedMultipleConfs(mol, numConfs)
+    2. 对每个构象: MMFFOptimizeMolecule -> 力场优化
+    3. 遍历每个 NOEContact:
+       - 根据 h_assignments 找到两个 H 原子 index
+       - 计算 3D 距离
+       - 与 expected_distance 比较 (容差 +/- distance_tolerance)
+       - 距离 > max_distance -> 标为冲突
+    4. 取 NOE 命中率最高的构象为 best_conformer
+    5. 输出: 命中率, RMS 距离偏差, 冲突列表
+
+    Args:
+        candidate_smiles: 候选结构 SMILES
+        noe_contacts: NOEContact 列表 (从 interpret_2d 提取)
+        h_assignments: {dH_ppm: atom_index} 从归属表构建
+        max_distance: NOE 最大距离阈值 (A)
+        distance_tolerance: 距离容差 (A)
+        num_confs: 嵌入构象数
+
+    Returns:
+        NOEVerificationResult
+    """
+    result = NOEVerificationResult()
+
+    if not noe_contacts or not h_assignments:
+        result.verification_status = 'skipped'
+        return result
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+    except ImportError:
+        result.verification_status = 'skipped'
+        result.conflicts.append({'error': 'RDKit 未安装'})
+        return result
+
+    mol = Chem.MolFromSmiles(candidate_smiles)
+    if mol is None:
+        result.verification_status = 'skipped'
+        return result
+
+    mol = Chem.AddHs(mol)
+
+    # 嵌入多构象
+    try:
+        conf_ids = AllChem.EmbedMultipleConfs(
+            mol, numConfs=num_confs, randomSeed=42,
+            useBasicKnowledge=True, pruneRmsThresh=0.5)
+        if len(conf_ids) == 0:
+            result.verification_status = 'fallback_2d'
+            return result
+    except Exception:
+        result.verification_status = 'fallback_2d'
+        return result
+
+    # 力场优化每个构象
+    for conf_id in conf_ids:
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, confId=int(conf_id))
+        except Exception:
+            pass  # 优化失败不阻断
+
+    # 筛选可验证的 NOE 对 (两个 H 都有归属)
+    verifiable: List[tuple] = []  # (idx1, idx2, expected_dist, contact)
+    for nc in noe_contacts:
+        idx1 = h_assignments.get(round(nc.h1_ppm, 3))
+        idx2 = h_assignments.get(round(nc.h2_ppm, 3))
+        if idx1 is not None and idx2 is not None and idx1 != idx2:
+            verifiable.append((idx1, idx2, nc.expected_distance, nc))
+
+    result.n_total = len(verifiable)
+    if result.n_total == 0:
+        result.verification_status = 'skipped'
+        return result
+
+    # 对每个构象计算 NOE 命中率
+    best_rate = -1.0
+    best_conf_idx = 0
+    best_matched = 0
+    best_conflicts_list: List[dict] = []
+    best_rms = 0.0
+
+    for conf_id in conf_ids:
+        conf = mol.GetConformer(int(conf_id))
+        n_matched = 0
+        n_conflict = 0
+        conflicts_list: List[dict] = []
+        dist_errors: List[float] = []
+
+        for idx1, idx2, exp_dist, nc in verifiable:
+            pos1 = conf.GetAtomPosition(idx1)
+            pos2 = conf.GetAtomPosition(idx2)
+            dist = pos1.Distance(pos2)
+
+            if dist <= max_distance:
+                n_matched += 1
+                dist_errors.append(abs(dist - exp_dist))
+            else:
+                n_conflict += 1
+                conflicts_list.append({
+                    'h1_ppm': nc.h1_ppm,
+                    'h2_ppm': nc.h2_ppm,
+                    'distance': round(dist, 2),
+                    'expected': exp_dist,
+                })
+
+        rate = n_matched / result.n_total if result.n_total > 0 else 0.0
+        if rate > best_rate:
+            best_rate = rate
+            best_conf_idx = int(conf_id)
+            best_matched = n_matched
+            best_conflicts_list = conflicts_list
+            best_rms = (sum(d**2 for d in dist_errors) / len(dist_errors))**0.5 if dist_errors else 0.0
+
+    result.n_matched = best_matched
+    result.n_conflict = result.n_total - best_matched
+    result.rms_distance = round(best_rms, 3)
+    result.conflicts = best_conflicts_list
+    result.best_conformer_idx = best_conf_idx
+
+    # 状态判定
+    if best_rate >= 0.8:
+        result.verification_status = 'good'
+    elif best_rate >= 0.5:
+        result.verification_status = 'partial'
+    else:
+        result.verification_status = 'conflict'
+
+    return result

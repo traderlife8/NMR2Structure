@@ -25,6 +25,10 @@ from .evidence import (
 )
 from .io_bruker import (
     BrukerSpectrum,
+    Multiplet,
+    analyze_multiplet_at_ppm,
+    infer_multiplets_from_peaks,
+    parse_multiplets_from_peaklist,
     read_bruker_experiment,
     read_bruker_folder,
 )
@@ -38,17 +42,23 @@ from .correlation_2d import (
     AssignmentRow,
     Correlation2DScore,
     FullAssignmentTable,
+    NOEVerificationResult,
     build_full_assignment_table,
     score_candidate_2d,
+    verify_candidate_3d_noe,
     write_assignment_table_csv,
 )
 from .interpret_2d import (
+    AssignmentValidation,
     CHPair,
     HMBCConnection,
     Interpretation2D,
+    MultipletAnalysis,
+    NOEContact,
     OverlapRegion,
     SpinSystem,
     interpret_2d_sequential,
+    validate_assignment,
     write_step_files,
 )
 from .io_sdf import (

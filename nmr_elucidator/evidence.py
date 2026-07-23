@@ -39,6 +39,8 @@ def score_candidates(
     dept_match_bonus: float = 30.0,
     h_count_match_bonus: float = 20.0,
     use_2d_scoring: bool = False,
+    use_noe_scoring: bool = False,
+    noe_scores: dict = None,
 ) -> List[ScoredCandidate]:
     """综合打分.
 
@@ -57,6 +59,9 @@ def score_candidates(
             + dept_bonus * 5
             + h_count_bonus * 5
             - 2 * peak_count_diff
+
+    有 NOE 数据时 (use_noe_scoring=True):
+    score += noe_match_rate * 10 - 5 * noe_conflict_count
     """
     scored: List[ScoredCandidate] = []
     for h in hits:
@@ -93,6 +98,15 @@ def score_candidates(
                 ratio = min(h.h_count_lib, h.h_count_expected) / max(h.h_count_lib, h.h_count_expected)
                 h_count_bonus = h_count_match_bonus * ratio
             s = cov_score - c_pen - h_pen - diff_pen + dept_bonus + h_count_bonus
+
+        # NOE 加分 (若有 NOE 验证数据)
+        if use_noe_scoring and noe_scores:
+            smiles = h.entry.canonical_smiles or h.entry.smiles
+            noe_info = noe_scores.get(smiles)
+            if noe_info and noe_info.get('n_total', 0) > 0:
+                match_rate = noe_info['n_matched'] / noe_info['n_total']
+                noe_bonus = match_rate * 10 - 5 * noe_info.get('n_conflict', 0)
+                s += noe_bonus
 
         scored.append(ScoredCandidate(hit=h, score=s))
     # 降序

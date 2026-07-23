@@ -519,3 +519,503 @@ def enhance_peaks_with_scipy(
     # 按化学位移降序 (与原 _parse_peaklist_xml 一致)
     merged.sort(key=lambda p: p.shift, reverse=True)
     return merged
+
+
+# ---- 1H 多重峰分析 (J 耦合) ----
+
+@dataclass
+class Multiplet:
+    """化学家分析后的一个 1H 多重峰.
+
+    来源: Bruker peaklist.xml 中的 <Multiplet> 标签 (TopSpin 手动多重峰分析),
+    或从峰间距估算 J 值.
+    """
+
+    center_ppm: float       # 化学位移中心 (ppm)
+    integral: float = 0.0   # 积分 (H 个数)
+    j_couplings: List[float] = field(default_factory=list)  # J 耦合常数 (Hz)
+    multiplicity: str = ''  # 's'/'d'/'t'/'q'/'m' 等
+    pattern_type: str = ''  # 'singlet'/'doublet'/'triplet'/'quartet'/'multiplet'
+
+
+def parse_multiplets_from_peaklist(
+    peaklist_path: str,
+    field_mhz: float = 0.0,
+) -> List[Multiplet]:
+    """从 Bruker peaklist.xml 解析多重峰信息 (J 耦合).
+
+    Bruker TopSpin 的多重峰分析结果可能以三种形式存储:
+    1. <Multiplet> 标签 (TopSpin 3.x/4.x 手动分析)
+    2. <Peak1D> 带 multiplicity/J 属性 (部分版本)
+    3. (自动推断) 从 <Peak1D> 峰间距反推 J 耦合, 作为 fallback
+
+    若文件中无任何多重峰信息, 静默返回空列表 (不报错, 不阻断主流程).
+
+    Args:
+        peaklist_path: peaklist.xml 文件路径
+        field_mhz: 谱仪 1H 共振频率 (MHz); 仅在策略 1/2 失败后,
+                   用于自动推断 J 耦合. 0 = 未知 (跳过推断)
+
+    Returns:
+        Multiplet 列表 (可能为空)
+    """
+    import re
+
+    if not os.path.isfile(peaklist_path):
+        return []
+
+    try:
+        with open(peaklist_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return []
+
+    multiplets: List[Multiplet] = []
+
+    # 策略 1: 查找 <Multiplet> 标签 (TopSpin 3.x/4.x)
+    # 格式: <Multiplet F1="7.26" F2="7.24" intensity="1.0" J="7.2,7.2" multiplicity="t">
+    mult_pattern = re.compile(
+        r'<Multiplet\b([^>]*)/?>',
+        re.IGNORECASE,
+    )
+    for m in mult_pattern.finditer(content):
+        attrs_str = m.group(1)
+        try:
+            # 解析属性
+            f1_m = re.search(r'F1="([^"]+)"', attrs_str)
+            f2_m = re.search(r'F2="([^"]+)"', attrs_str)
+            int_m = re.search(r'intensity="([^"]+)"', attrs_str)
+            j_m = re.search(r'J="([^"]+)"', attrs_str)
+            mult_m = re.search(r'multiplicity="([^"]+)"', attrs_str)
+
+            if f1_m:
+                f1 = float(f1_m.group(1))
+                f2 = float(f2_m.group(1)) if f2_m else f1
+                center = (f1 + f2) / 2.0
+            else:
+                continue
+
+            integral = float(int_m.group(1)) if int_m else 0.0
+
+            # J 值: 逗号或分号分隔
+            j_vals: List[float] = []
+            if j_m:
+                for jv in re.split(r'[,;\s]+', j_m.group(1)):
+                    try:
+                        j_vals.append(float(jv))
+                    except ValueError:
+                        pass
+
+            multiplicity = mult_m.group(1) if mult_m else ''
+
+            multiplets.append(Multiplet(
+                center_ppm=round(center, 4),
+                integral=integral,
+                j_couplings=j_vals,
+                multiplicity=multiplicity,
+                pattern_type=_multiplicity_to_pattern(multiplicity),
+            ))
+        except (ValueError, AttributeError):
+            continue  # 容错: 单个 multiplet 解析失败不影响其他
+
+    # 策略 2: 查找带 multiplicity 属性的 <Peak1D> (部分 TopSpin 版本)
+    if not multiplets:
+        peak_mult_pattern = re.compile(
+            r'<Peak1D\b([^>]*multiplicity[^>]*)/?>',
+            re.IGNORECASE,
+        )
+        for m in peak_mult_pattern.finditer(content):
+            attrs_str = m.group(1)
+            try:
+                f1_m = re.search(r'F1="([^"]+)"', attrs_str)
+                int_m = re.search(r'intensity="([^"]+)"', attrs_str)
+                j_m = re.search(r'J="([^"]+)"', attrs_str)
+                mult_m = re.search(r'multiplicity="([^"]+)"', attrs_str)
+
+                if not f1_m:
+                    continue
+
+                center = float(f1_m.group(1))
+                integral = float(int_m.group(1)) if int_m else 0.0
+
+                j_vals = []
+                if j_m:
+                    for jv in re.split(r'[,;\s]+', j_m.group(1)):
+                        try:
+                            j_vals.append(float(jv))
+                        except ValueError:
+                            pass
+
+                multiplicity = mult_m.group(1) if mult_m else ''
+
+                multiplets.append(Multiplet(
+                    center_ppm=round(center, 4),
+                    integral=integral,
+                    j_couplings=j_vals,
+                    multiplicity=multiplicity,
+                    pattern_type=_multiplicity_to_pattern(multiplicity),
+                ))
+            except (ValueError, AttributeError):
+                continue
+
+    # 策略 3 (fallback): 从 <Peak1D> 峰间距自动推断
+    if not multiplets and field_mhz > 0:
+        multiplets = infer_multiplets_from_peaks(peaklist_path, field_mhz=field_mhz)
+
+    return multiplets
+
+
+def infer_multiplets_from_peaks(
+    peaklist_path: str,
+    field_mhz: float = 0.0,
+    cluster_gap_hz: float = 50.0,
+    min_peak_intensity_ratio: float = 0.05,
+) -> List[Multiplet]:
+    """从 peaklist.xml 的 <Peak1D> 列表自动检测多重峰并反推 J 耦合.
+
+    适用场景: 原始 Bruker 数据未做手工多重峰分析(peaklist.xml 无 <Multiplet>
+    标签, 也无 multiplicity 属性)时, 作为 fallback 从峰间距估算 J 值.
+
+    算法:
+      1. 解析所有 Peak1D (F1=ppm, intensity)
+      2. 按 ppm 降序排序 (NMR 惯例)
+      3. 聚类: 相邻峰间距 < cluster_gap_hz Hz (默认 50 Hz, 覆盖 99% 的
+         多重峰跨度) 归为同一簇
+      4. 过滤噪声: 簇总强度 < 所有峰中位数 × min_peak_intensity_ratio
+         的簇视为噪声, 丢弃
+      5. 簇内峰数推断 multiplicity (1=s, 2=d, 3=t, 4=q, 5+=m)
+      6. J = 簇内相邻峰平均间距 × field_mhz (Hz)
+         若 field_mhz <= 0, 无法计算 J, 返回空 J 列表
+      7. center_ppm = 簇内加权平均 (权重 = intensity)
+      8. integral = 簇总强度
+
+    Args:
+        peaklist_path: peaklist.xml 路径
+        field_mhz: 谱仪 1H 共振频率 (MHz); 0 表示未知, J 无法计算
+        cluster_gap_hz: 同一多重峰内允许的最大相邻间距 (Hz)
+        min_peak_intensity_ratio: 簇总强度占全部峰中位数的最低比例 (噪声门)
+
+    Returns:
+        Multiplet 列表 (峰数不足时可能为空, 不报错)
+    """
+    import re
+
+    if not os.path.isfile(peaklist_path):
+        return []
+
+    try:
+        with open(peaklist_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return []
+
+    # 解析所有 Peak1D
+    peaks: List[tuple] = []  # (ppm, intensity)
+    for m in re.finditer(r'<Peak1D\b([^/>]*)/?>', content, re.IGNORECASE):
+        f1_m = re.search(r'F1="([^"]+)"', m.group(1))
+        int_m = re.search(r'intensity="([^"]+)"', m.group(1))
+        if not f1_m:
+            continue
+        try:
+            ppm = float(f1_m.group(1))
+            intensity = float(int_m.group(1)) if int_m else 0.0
+        except (ValueError, TypeError):
+            continue
+        peaks.append((ppm, intensity))
+
+    if len(peaks) < 2:
+        return []
+
+    # 按 ppm 降序排序 (NMR 习惯)
+    peaks.sort(key=lambda x: -x[0])
+
+    # 噪声门: 总峰强度的中位数
+    intensities_sorted = sorted(p[1] for p in peaks)
+    median_intensity = intensities_sorted[len(intensities_sorted) // 2]
+    min_total_intensity = median_intensity * min_peak_intensity_ratio
+
+    # Hz/ppm 转换系数
+    hz_per_ppm = field_mhz if field_mhz > 0 else 0.0
+
+    # 聚类阈值: cluster_gap_hz 转 ppm (无频率时用 0.3 ppm 作为寤底)
+    cluster_gap_ppm = (cluster_gap_hz / hz_per_ppm) if hz_per_ppm > 0 else 0.3
+
+    # 贪心聚类: 相邻峰 ppm 距离 < cluster_gap_ppm 归同一簇
+    clusters: List[List[tuple]] = []
+    current: List[tuple] = [peaks[0]]
+    for p in peaks[1:]:
+        prev_ppm = current[-1][0]
+        if abs(p[0] - prev_ppm) <= cluster_gap_ppm:
+            current.append(p)
+        else:
+            clusters.append(current)
+            current = [p]
+    clusters.append(current)
+
+    multiplets: List[Multiplet] = []
+    for cluster in clusters:
+        n_peaks = len(cluster)
+        if n_peaks < 1:
+            continue
+
+        total_intensity = sum(p[1] for p in cluster)
+
+        # 噪声过滤: 单峰且低于门限才丢 (不丢多重峰)
+        if n_peaks == 1 and total_intensity < min_total_intensity:
+            continue
+
+        # center = 加权平均
+        if total_intensity > 0:
+            center = sum(p[0] * p[1] for p in cluster) / total_intensity
+        else:
+            center = sum(p[0] for p in cluster) / n_peaks
+
+        # 簇内相邻间距 (ppm) → J 值 (Hz)
+        diffs_ppm = [abs(cluster[i][0] - cluster[i + 1][0])
+                     for i in range(n_peaks - 1)]
+        j_couplings: List[float] = []
+        if hz_per_ppm > 0 and diffs_ppm:
+            j_couplings = [round(d * hz_per_ppm, 2) for d in diffs_ppm]
+
+        # 多重性推断
+        if n_peaks == 1:
+            multiplicity, pattern_type = 's', 'singlet'
+        elif n_peaks == 2:
+            multiplicity, pattern_type = 'd', 'doublet'
+        elif n_peaks == 3:
+            multiplicity, pattern_type = 't', 'triplet'
+        elif n_peaks == 4:
+            multiplicity, pattern_type = 'q', 'quartet'
+        else:
+            multiplicity, pattern_type = 'm', 'multiplet'
+
+        multiplets.append(Multiplet(
+            center_ppm=round(center, 4),
+            integral=round(total_intensity, 3),
+            j_couplings=j_couplings,
+            multiplicity=multiplicity,
+            pattern_type=pattern_type,
+        ))
+
+    # 按 ppm 降序输出
+    multiplets.sort(key=lambda m: -m.center_ppm)
+    return multiplets
+
+
+def analyze_multiplet_at_ppm(
+    peaklist_path: str,
+    center_ppm: float,
+    field_mhz: float = 0.0,
+    window_ppm: float = 0.15,
+    cluster_gap_hz: float = 30.0,
+) -> dict:
+    """在以 center_ppm 为中心的窗口内做精细化多重峰分析 (对标 TopSpin Manual).
+
+    用途: 对某个 C-H 对 (CHPair) 的 1H 位移, 取附近 peaklist 峰, 拟合该
+    H 处的多重峰结构. 输出结果可与 TopSpin "Multiple Peak Analysis"
+    报告对应.
+
+    算法:
+      1. 取 center_ppm ± window_ppm 范围内的 Peak1D
+      2. 在窗口内贪心聚类 (相邻峰间距 < cluster_gap_hz Hz) - 取含峰数最多的簇
+      3. 簇内峰数 → multiplicity (s/d/t/q/m)
+      4. J = 簇内相邻峰平均间距 × field_mhz
+      5. halfwidth_Hz ≈ J_median / 3 (NMR 经验: 子峰半高宽约为 J 间距的 1/3)
+      6. intensity_uniformity: 子峰强度剖面与理论 1:1/1:2:1/1:3:3:1 比值的吻合度
+      7. quality_grade: Excellent (uniform>0.9), Good (>0.7), Poor (>0.5), Very Poor (<0.5)
+
+    Args:
+        peaklist_path: peaklist.xml 路径
+        center_ppm: CHPair 的 1H 化学位移 (ppm)
+        field_mhz: 谱仪 1H 频率 (MHz); 0 表示未知, J 无法计算
+        window_ppm: 取峰窗口半宽 (ppm, 默认 ±0.15)
+        cluster_gap_hz: 簇内峰间允许的最大间距 (Hz, 默认 30)
+
+    Returns:
+        dict 包含:
+          - center_ppm: 实际加权中心
+          - pattern: 's'/'d'/'t'/'q'/'m'/''
+          - num_subpeaks: int
+          - j_couplings_Hz: List[float]
+          - halfwidth_Hz: float (估算)
+          - intensity_uniformity: 0-1 (子峰强度均匀性)
+          - quality_grade: 'Excellent'/'Good'/'Poor'/'Very Poor'/''
+          - subpeak_ppms: List[float]
+          - subpeak_intensities: List[float]
+          - note: str (说明)
+    """
+    import re
+
+    result = {
+        'center_ppm': round(center_ppm, 4),
+        'pattern': '',
+        'num_subpeaks': 0,
+        'j_couplings_Hz': [],
+        'halfwidth_Hz': 0.0,
+        'intensity_uniformity': 0.0,
+        'quality_grade': '',
+        'subpeak_ppms': [],
+        'subpeak_intensities': [],
+        'note': '',
+    }
+
+    if not os.path.isfile(peaklist_path):
+        result['note'] = 'peaklist 不存在'
+        return result
+
+    try:
+        with open(peaklist_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        result['note'] = 'peaklist 读取失败'
+        return result
+
+    # 解析窗口内 Peak1D
+    peaks: List[tuple] = []  # (ppm, intensity)
+    for m in re.finditer(r'<Peak1D\b([^/>]*)/?>', content, re.IGNORECASE):
+        f1_m = re.search(r'F1="([^"]+)"', m.group(1))
+        int_m = re.search(r'intensity="([^"]+)"', m.group(1))
+        if not f1_m:
+            continue
+        try:
+            ppm = float(f1_m.group(1))
+            intensity = float(int_m.group(1)) if int_m else 0.0
+        except (ValueError, TypeError):
+            continue
+        if abs(ppm - center_ppm) <= window_ppm:
+            peaks.append((ppm, intensity))
+
+    if not peaks:
+        result['note'] = f'窗口 ±{window_ppm:.2f} ppm 内无 Peak1D'
+        return result
+
+    # 按 ppm 降序
+    peaks.sort(key=lambda x: -x[0])
+
+    hz_per_ppm = field_mhz if field_mhz > 0 else 0.0
+    cluster_gap_ppm = (cluster_gap_hz / hz_per_ppm) if hz_per_ppm > 0 else 0.1
+
+    # 贪心聚类
+    clusters: List[List[tuple]] = []
+    current: List[tuple] = [peaks[0]]
+    for p in peaks[1:]:
+        if abs(p[0] - current[-1][0]) <= cluster_gap_ppm:
+            current.append(p)
+        else:
+            clusters.append(current)
+            current = [p]
+    clusters.append(current)
+
+    # 取含峰数最多的簇 (主多重峰)
+    cluster = max(clusters, key=lambda c: len(c))
+    n_peaks = len(cluster)
+
+    # center = 加权平均
+    total_intensity = sum(p[1] for p in cluster)
+    if total_intensity > 0:
+        center = sum(p[0] * p[1] for p in cluster) / total_intensity
+    else:
+        center = sum(p[0] for p in cluster) / n_peaks
+
+    # 子峰 ppm + intensity (取实际位置)
+    subpeak_ppms = [round(p[0], 4) for p in cluster]
+    subpeak_intensities = [round(p[1], 3) for p in cluster]
+
+    # J 值
+    diffs_ppm = [abs(cluster[i][0] - cluster[i + 1][0])
+                 for i in range(n_peaks - 1)]
+    j_couplings: List[float] = []
+    if hz_per_ppm > 0 and diffs_ppm:
+        j_couplings = [round(d * hz_per_ppm, 2) for d in diffs_ppm]
+
+    # 多重性推断
+    if n_peaks == 1:
+        pattern = 's'
+    elif n_peaks == 2:
+        pattern = 'd'
+    elif n_peaks == 3:
+        pattern = 't'
+    elif n_peaks == 4:
+        pattern = 'q'
+    else:
+        pattern = 'm'
+
+    # 强度均匀性: 与理论 1:1 / 1:2:1 / 1:3:3:1 比值的吻合度
+    intensity_uniformity = 0.0
+    if n_peaks >= 2:
+        # 理论比值 (二项式系数, n-1 次偶合)
+        # n=2 (d): 1:1; n=3 (t): 1:2:1; n=4 (q): 1:3:3:1; n>=5 (m): 不估计
+        theoretical = _binomial_ratios(n_peaks)
+        # 实际归一化强度剖面 (取正顺序, 使强度从低到高再匹配)
+        actual = [p[1] for p in cluster]
+        max_a = max(actual) if max(actual) > 0 else 1.0
+        actual_norm = [a / max_a for a in actual]
+        # 计算与理论比值的吻合度 (1 - 平均相对偏差)
+        if theoretical and len(actual_norm) == len(theoretical):
+            deviations = []
+            for a, t in zip(actual_norm, theoretical):
+                if t > 0:
+                    deviations.append(abs(a - t) / t)
+            if deviations:
+                mean_dev = sum(deviations) / len(deviations)
+                intensity_uniformity = round(max(0.0, 1.0 - mean_dev), 3)
+
+    # 半高宽估算 (Hz)
+    halfwidth_hz = 0.0
+    if j_couplings:
+        # NMR 经验: 子峰半高宽约为 J 的 1/3 (避免重叠但保持可辨)
+        halfwidth_hz = round(sum(j_couplings) / len(j_couplings) / 3.0, 2)
+
+    # 质量等级
+    if intensity_uniformity >= 0.9:
+        quality = 'Excellent'
+    elif intensity_uniformity >= 0.7:
+        quality = 'Good'
+    elif intensity_uniformity >= 0.5:
+        quality = 'Poor'
+    elif intensity_uniformity > 0:
+        quality = 'Very Poor'
+    else:
+        quality = 'N/A'  # 仅 s 或 m (无法评估)
+
+    result.update({
+        'center_ppm': round(center, 4),
+        'pattern': pattern,
+        'num_subpeaks': n_peaks,
+        'j_couplings_Hz': j_couplings,
+        'halfwidth_Hz': halfwidth_hz,
+        'intensity_uniformity': intensity_uniformity,
+        'quality_grade': quality,
+        'subpeak_ppms': subpeak_ppms,
+        'subpeak_intensities': subpeak_intensities,
+        'note': f'{n_peaks}个子峰, J={j_couplings}Hz',
+    })
+    return result
+
+
+def _binomial_ratios(n: int) -> List[float]:
+    """理论偶合多重峰的强度比 (二项式系数)."""
+    if n <= 0:
+        return []
+    # n 个子峰 → n-1 个偶合 → 系数 = C(n-1, k), k=0..n-1
+    from math import comb
+    coefs = [comb(n - 1, k) for k in range(n)]
+    max_c = max(coefs) if coefs else 1
+    return [c / max_c for c in coefs]
+
+
+def _multiplicity_to_pattern(mult: str) -> str:
+    """将简写多重性转为完整名称."""
+    mapping = {
+        's': 'singlet',
+        'd': 'doublet',
+        't': 'triplet',
+        'q': 'quartet',
+        'm': 'multiplet',
+        'dd': 'doublet of doublets',
+        'dt': 'doublet of triplets',
+        'td': 'triplet of doublets',
+        'tt': 'triplet of triplets',
+        'br': 'broad',
+    }
+    return mapping.get(mult.lower().strip(), mult)

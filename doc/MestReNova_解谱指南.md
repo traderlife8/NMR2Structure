@@ -405,6 +405,19 @@ Mnova 默认自动相位校正，必要时手动调整：
 - **谱图数据库检索**：把 2D 谱作为查询条件检索 Mnova DB（~26 万 ¹³C / ~10 万 ¹H）；
 - **归属表自动编号**：在结构上标注原子编号，与谱峰表联动。
 
+**本项目程序化实现对标**：
+
+| Mnova 功能 | 本项目实现 | 输出文件 |
+|---|---|---|
+| 2D 峰检测 + 标注 | `io_bruker_2d.pick_peaks_2d` (MAD-SNR 自适应) | 内存中 `Spectrum2D.peaks` |
+| COSY 自旋系统 | `interpret_2d._step2_cosy_spin_systems` (Union-Find + J 验证) | `step2_cosy_spin_systems.csv` |
+| TOCSY 长程自旋系统 | `interpret_2d._step2_tocsy_spin_systems` (h_tol=0.6) | `step2_tocsy_spin_systems.csv` |
+| HMBC 远程连接 + 2J/3J | `interpret_2d._step3_hmbc_connections` + `_annotate_hmbc_bond_type` | `step3_hmbc_connections.csv` |
+| NOESY/ROESY 空间近邻 | `interpret_2d._step5_extract_noe_contacts` (对角线排除 + 强度分级) | `step5_noe_spatial_contacts.csv` |
+| NOE 3D 构象验证 | `correlation_2d.verify_candidate_3d_noe` (RDKit ETKDG 多构象) | `step6_noe_3d_verification.csv` |
+| 归属完整性核对 | `interpret_2d.validate_assignment` | `step7_assignment_validation.csv` |
+| 1H 多重峰 J 耦合 | `io_bruker.parse_multiplets_from_peaklist` (regex 容错) | `step1_hsqc_ch_pairs.csv` J 列 |
+
 ### 5.6 用 Mnova Verify 进行 2D 结构验证
 
 当已有候选结构时，Mnova Verify 可自动验证：
