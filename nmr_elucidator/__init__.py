@@ -42,11 +42,19 @@ from .correlation_2d import (
     AssignmentRow,
     Correlation2DScore,
     FullAssignmentTable,
+    JVerificationResult,
     NOEVerificationResult,
     build_full_assignment_table,
     score_candidate_2d,
+    verify_candidate_3d_j,
     verify_candidate_3d_noe,
     write_assignment_table_csv,
+)
+from .solvent_filter import (
+    SOLVENT_RESIDUAL_PEAKS_1H,
+    SOLVENT_RESIDUAL_PEAKS_13C,
+    filter_peaks_by_solvent,
+    is_solvent_peak,
 )
 from .interpret_2d import (
     AssignmentValidation,
@@ -106,4 +114,13 @@ __all__ = [
     "write_report_json",
     "write_report_markdown",
     "write_unmatched_summary_csv",
-]
+    "filter_peaks_by_solvent",
+    "is_solvent_peak",
+    "NOEVerificationResult",
+    "verify_candidate_3d_noe",
+    "write_assignment_table_csv",
+    "JVerificationResult",
+    "verify_candidate_3d_j",
+    "SOLVENT_RESIDUAL_PEAKS_1H",
+    "SOLVENT_RESIDUAL_PEAKS_13C",
+]  # Part 2.A/2.B/2.C 已实现

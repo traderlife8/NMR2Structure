@@ -46,6 +46,9 @@ class ProblemPeaks:
     proton_integrals: List[tuple] = field(default_factory=list)  # [(shift, integral), ...]
     solvent: Optional[str] = None
     field_mhz: Optional[float] = None
+    # Part 2.B: 溶剂过滤统计 (从 _build_problem_from_bruker 传入)
+    n_h_solvent_filtered: int = 0  # 1H 谱中标记为溶剂残余峰的个数
+    n_c_solvent_filtered: int = 0  # 13C 谱中标记为溶剂残余峰的个数
 
     @property
     def has_13c(self) -> bool:

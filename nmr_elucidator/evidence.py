@@ -41,6 +41,8 @@ def score_candidates(
     use_2d_scoring: bool = False,
     use_noe_scoring: bool = False,
     noe_scores: dict = None,
+    use_j_scoring: bool = False,
+    j_scores: dict = None,
 ) -> List[ScoredCandidate]:
     """综合打分.
 
@@ -62,6 +64,9 @@ def score_candidates(
 
     有 NOE 数据时 (use_noe_scoring=True):
     score += noe_match_rate * 10 - 5 * noe_conflict_count
+
+    有 J 数据时 (Part 2.C, use_j_scoring=True):
+    score += j_match_rate * 8 - 4 * j_conflict_count
     """
     scored: List[ScoredCandidate] = []
     for h in hits:
@@ -107,6 +112,15 @@ def score_candidates(
                 match_rate = noe_info['n_matched'] / noe_info['n_total']
                 noe_bonus = match_rate * 10 - 5 * noe_info.get('n_conflict', 0)
                 s += noe_bonus
+
+        # Part 2.C: J 加分 (Karplus 3D 二面角验证)
+        if use_j_scoring and j_scores:
+            smiles = h.entry.canonical_smiles or h.entry.smiles
+            j_info = j_scores.get(smiles)
+            if j_info and j_info.get('n_total', 0) > 0:
+                match_rate_j = j_info['n_matched'] / j_info['n_total']
+                j_bonus = match_rate_j * 8 - 4 * j_info.get('n_conflict', 0)
+                s += j_bonus
 
         scored.append(ScoredCandidate(hit=h, score=s))
     # 降序

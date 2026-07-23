@@ -574,6 +574,53 @@ Mnova 默认自动相位校正，必要时手动调整：
 
 > **注意**：当前实现仅检测并可视化重叠峰，尚未实现自动分峰拟合。化学家需查看 `step1_hsqc_ch_pairs/` 文件夹中的等高线图，人工确认重叠峰的分解结果。
 
+### 5.10 本项目范围与未来工作 (Part 2.G)
+
+#### 5.10.1 已对标 Mnova 能力 (Part 1 + Part 2 全部落地)
+
+| Mnova 能力 | 本项目实现 | 状态 |
+|---|---|---|
+| 1D 谱读取 (Bruker peaklist + 1r) | `io_bruker.read_bruker_folder` + `io_processed.read_processed_folder` | 已对标 |
+| TopSpin Manual 多重峰分析 | `io_bruker.analyze_multiplet_at_ppm` + `step1b_multiplet_analysis.csv` | 已对标 |
+| 自动溶剂过滤 (Part 2.B) | `solvent_filter.py` + `--keep-solvent` 开关 | 已对标 |
+| HSQC 峰检测 | `io_bruker_2d.pick_peaks_2d` (SNR 自适应) | 已对标 |
+| COSY 自旋系统 | `interpret_2d._step2_cosy_spin_systems` (Union-Find + J 验证) | 已对标 |
+| TOCSY 长程自旋系统 | `interpret_2d._step2_tocsy_spin_systems` (h_tol=0.6 ppm) | 已对标 |
+| HMBC 远程连接 + 2J/3J | `interpret_2d._step3_hmbc_connections` + `_annotate_hmbc_bond_type` | 已对标 |
+| **HMBC ¹J 残留过滤** (Part 2.A) | `extract_hmbc_pairs(hsqc_pairs=...)` 自动过滤 | 已对标 |
+| NOESY/ROESY 空间近邻 | `interpret_2d._step5_extract_noe_contacts` | 已对标 |
+| NOE 3D 距离验证 | `correlation_2d.verify_candidate_3d_noe` (RDKit ETKDG + MMFF) | 已对标 |
+| **Karplus 3D J 二面角验证** (Part 2.C) | `correlation_2d.verify_candidate_3d_j` (距腦 + 二面角双维度) | 已对标 |
+| StereoFitter (NOE 3D 验证) | `verify_candidate_3d_noe` + `verify_candidate_3d_j` 简化版 | 部分对标 |
+| 归属完整性核对 | `interpret_2d.validate_assignment` | 已对标 |
+| Database 检索 (谱图数据库) | `retrieve.retrieve_candidates` (nmrshiftdb2) + `retrieve_pubchem` | 已对标 |
+| Verify 打分 (1D/2D 综合) | `evidence.score_candidates` + `correlation_2d.score_candidate_2d` | 已对标 |
+| **置信度评估 (多源融合, J 一致性降级)** (Part 2.F) | `determination.assess_determination(j_match_rates=...)` | 已对标 |
+| HTML/JSON/Markdown 报告 (内嵌 base64) | `report.write_report_{json,markdown,html}` | 已对标 |
+
+#### 5.10.2 Mnova 能力 - 本项目范围外 (需其他工具补充)
+
+| 能力 | Mnova 路径 | 本项目方案 |
+|---|---|---|
+| **绝对构型** | Mosher 酯法 + CD 圆二色谱 + X-ray 单晶 | 集成 Mnova CD 插件 + 输出层调用 |
+| **变温 NMR / rotamers** | 温度序列实验 + 谱图叠合 | 文档说明, 不在本项目路径 |
+| **混合 2D (HSQC-TOCSY/HSQC-NOESY/LR-HSQMBC)** | 高级 2D 实验 | 需 Bruker 新脉冲程序 + 独立分析器 |
+| **²J(CH) / ³J(CH) 直接读取** | J-resolved 实验 | peaklist.xml 不含此字段, 文档说明 |
+| **qNMR 定量** | ERETIC / 校准曲线 | nmrpy 已支持, 需接入 |
+| **完整 CASE 自动解谱 (无库)** | `Structure Elucidation` 插件 | 可对接 `external/lucy-ng/` 或 `external/LSDos-3.5.3/` |
+| **ML 谱图预测 (谱图驱动)** |  需要 GPU | `external/NMR2Struct/` (Huawei 中心) / `external/chefnmr/` |
+| **蛋白-配体 HSQC 滴定** | Binding 插件 | 需完全独立的 binding 分析框架 |
+
+#### 5.10.3 Part 2 改进点与对应入口
+
+| Part | 能力 | 模块 / 函数 | 文档 |
+|---|---|---|---|
+| 2.A | HMBC ¹J 残留过滤 | `correlation_2d.extract_hmbc_pairs(hsqc_pairs=...)` | `step3*.csv is_oneJ_residue 列全 False` |
+| 2.B | 溶剂残余峰过滤 | `solvent_filter.is_solvent_peak` + `io_bruker.annotate_solvent_residual` | `step1*.csv is_solvent_residual 列` |
+| 2.C | Karplus 3D J 验证 | `correlation_2d.verify_candidate_3d_j` | `step6b_j_karplus_3d_verification.csv` |
+| 2.E | NOE + J 回喂 score_candidates | `__main__.py` 步骤 [9.6b] | `meta['score_breakdown']` |
+| 2.F | J 一致性降级维度 | `determination.assess_determination(j_match_rates=...)` | `evidence_summary[]` |
+
 ---
 
 ## 六、结构解析核心：Structure Elucidation（CASE）

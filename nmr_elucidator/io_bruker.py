@@ -34,6 +34,9 @@ class Peak:
     #   'negative'  = 负峰 (CH2 in DEPT-135)
     #   'unknown'   = 1H 谱, DEPT-90, 或无法判断
     sign: str = 'unknown'
+    # Part 2.B: 溶剂残余峰标记. 从 spectrum.solvent 推断, 不阻断主流程.
+    # 视为溶剂残余峰的 peak 不参与候选检索/2D 解读, 但保留原始记录.
+    is_solvent_residual: bool = False
 
 
 @dataclass
@@ -65,6 +68,14 @@ class BrukerSpectrum:
 
     def shift_values(self) -> List[float]:
         return [p.shift for p in self.peaks]
+
+    @property
+    def n_solvent_filtered(self) -> int:
+        """被标记为溶剂残余峰的个数 (Part 2.B)."""
+        return sum(
+            1 for p in self.peaks
+            if getattr(p, 'is_solvent_residual', False)
+        )
 
 
 # ---- 错误类型 ----
@@ -402,6 +413,16 @@ def read_bruker_experiment(exp_dir: str) -> BrukerSpectrum:
             f"未在 peaklist.xml 中找到任何峰（{peaklist_path}）",
             peaklist_path, stage="peaklist-empty",
         )
+
+    # Part 2.B: 溶剂残余峰标记 (不主动过滤, 仅标记, 让后续环节决策)
+    if nucleus in ('1H', '13C') and solvent:
+        from .solvent_filter import annotate_solvent_residual
+        mask = annotate_solvent_residual(
+            [(p.shift, p.intensity) for p in peaks],
+            nucleus=nucleus, solvent=solvent, tolerance_ppm=0.05,
+        )
+        for p, is_sol in zip(peaks, mask):
+            p.is_solvent_residual = is_sol
 
     return BrukerSpectrum(
         exp_no=exp_no,

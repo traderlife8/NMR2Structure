@@ -665,6 +665,15 @@ def write_report_html(
                          f'<td>{len(noe_verif)} 个候选</td>'
                          '<td><code>step6_noe_3d_verification.csv</code></td></tr>')
 
+        # Part 2.C: 步骤 6b: Karplus J 3D 二面角验证 (若有)
+        j_verif = meta.get('j_verification', [])
+        if j_verif:
+            parts.append('<tr>'
+                         '<td><strong>步骤 6b</strong></td>'
+                         '<td>Karplus J 3D 二面角验证 (Top-N)</td>'
+                         f'<td>{len(j_verif)} 个候选</td>'
+                         '<td><code>step6b_j_karplus_3d_verification.csv</code></td></tr>')
+
         # 步骤 7: 归属完整性核对
         av = interp.get('assignment_validation')
         if av:

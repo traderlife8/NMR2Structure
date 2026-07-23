@@ -47,6 +47,12 @@ class Correlation2DScore:
     noe_match_rate: Optional[float] = None   # NOE 命中率 (0-1)
     noe_conflict_count: int = 0              # NOE 冲突数
     noe_rms_distance: Optional[float] = None # NOE RMS 距离偏差 (A)
+    # Part 2.A: HMBC ¹J 残留过滤统计
+    n_hmbc_filtered_oneJ: int = 0            # 滤掉的 ¹J 直接连接残留数
+    # Part 2.C: Karplus ³J 二面角验证
+    j_match_rate: Optional[float] = None     # J 命中率 (0-1)
+    j_conflict_count: int = 0                # J 冲突数
+    j_rms_error_hz: Optional[float] = None   # J RMS 偏差 (Hz)
     notes: List[str] = field(default_factory=list)
 
 
@@ -77,18 +83,40 @@ def extract_hmbc_pairs(
     spectrum: Spectrum2D,
     min_snr: float = 10.0,
     max_peaks: int = 300,
-) -> List[Tuple[float, float]]:
+    hsqc_pairs: Optional[List[Tuple[float, float]]] = None,
+    h_tol: float = 0.05,
+    c_tol: float = 1.0,
+) -> Tuple[List[Tuple[float, float]], int]:
     """从 HMBC 谱提取 (1H_ppm, 13C_ppm) 远程关联对.
 
     HMBC 的 F1=13C, F2=1H. 返回 (1H, 13C) 对.
     过滤: SNR >= min_snr, 最多 max_peaks 个.
     """
     if spectrum.experiment_type != 'HMBC':
-        return []
+        return [], 0
     peaks = [p for p in spectrum.peaks if (p.snr or 0) >= min_snr]
     peaks.sort(key=lambda p: p.intensity, reverse=True)
     peaks = peaks[:max_peaks]
-    return [(p.f2_ppm, p.f1_ppm) for p in peaks]
+    pairs = [(p.f2_ppm, p.f1_ppm) for p in peaks]
+
+    # Part 2.A: 过滤已知 ¹J 直接连接残留
+    if hsqc_pairs:
+        hsqc_normalized = [(round(h, 3), round(c, 3)) for h, c in hsqc_pairs]
+        filtered: List[Tuple[float, float]] = []
+        n_filtered = 0
+        for h_ppm, c_ppm in pairs:
+            is_oneJ = False
+            for kh, kc in hsqc_normalized:
+                if abs(h_ppm - kh) <= h_tol and abs(c_ppm - kc) <= c_tol:
+                    is_oneJ = True
+                    break
+            if is_oneJ:
+                n_filtered += 1
+            else:
+                filtered.append((h_ppm, c_ppm))
+        return filtered, n_filtered
+
+    return pairs, 0
 
 
 def extract_cosy_pairs(
@@ -379,7 +407,12 @@ def score_candidate_2d(
     if 'HSQC' in spectra_2d:
         obs_hsqc = extract_hsqc_pairs(spectra_2d['HSQC'], min_snr=hsqc_min_snr)
     if 'HMBC' in spectra_2d:
-        obs_hmbc = extract_hmbc_pairs(spectra_2d['HMBC'], min_snr=hmbc_min_snr)
+        # Part 2.A: 传入 HSQC 配对, 过滤已知 ¹J 残留
+        obs_hmbc, n_oneJ_filtered = extract_hmbc_pairs(
+            spectra_2d['HMBC'], min_snr=hmbc_min_snr,
+            hsqc_pairs=obs_hsqc if obs_hsqc else None,
+        )
+        result.n_hmbc_filtered_oneJ = n_oneJ_filtered  # 类型需要定义
     if 'COSY' in spectra_2d:
         obs_cosy = extract_cosy_pairs(spectra_2d['COSY'], min_snr=cosy_min_snr)
 
@@ -661,6 +694,37 @@ def write_assignment_table_csv(
 
 # ---- NOE 3D 构象验证 ----
 
+# Part 2.C: Karplus ³J 三维二面角验证
+# Karplus 公式: ³J(H-C-C-H) = A·cos²(θ) + B·cos(θ) + C
+# 化学家经典常数:
+#   脂肪饱和: A=7, B=-1, C=0 (Karplus 1963)
+#   烯烃:      A=7, B=-1.5, C=2
+#   芳香:      A=8.5, B=-1, C=0.5
+_DEFAULT_KARPLUS = {
+    'aliphatic': (7.0, -1.0, 0.0),
+    'olefinic': (7.0, -1.5, 2.0),
+    'aromatic':  (8.5, -1.0, 0.5),
+}
+
+
+@dataclass
+class JVerificationResult:
+    """Karplus 3D 二面角 J 耦合验证结果 (Part 2.C).
+
+    区别于 NOE 距离验证: 走二面角 + Karplus 方程路向验证.
+    与 NOE 3D 距离一起构成“距离 + 二面角”双维度反向验证.
+    """
+
+    n_total: int = 0                # 可验证的 J 约束数 (两个 H 都有归属 + 有 4 键路径)
+    n_matched: int = 0              # 预测 J 与实测 J 偏差 ≤ j_tolerance_hz 的
+    n_conflict: int = 0             # 偏差 ≥ 2 * j_tolerance_hz 的
+    rms_j_error_hz: float = 0.0     # 预测 vs 实测 J 的 RMS (Hz)
+    conflicts: List[dict] = field(default_factory=list)  # {h_ppm, j_obs, j_pred, theta_deg}
+    best_conformer_idx: int = 0
+    verification_status: str = ''   # 'good' / 'partial' / 'conflict' / 'fallback_2d' / 'skipped'
+    karplus_constants: dict = field(default_factory=dict)  # 使用的 A/B/C 参数, e.g. {'aliphatic': (7,-1,0)}
+
+
 @dataclass
 class NOEVerificationResult:
     """候选结构 NOE 约束验证结果."""
@@ -805,6 +869,284 @@ def verify_candidate_3d_noe(
     result.best_conformer_idx = best_conf_idx
 
     # 状态判定
+    if best_rate >= 0.8:
+        result.verification_status = 'good'
+    elif best_rate >= 0.5:
+        result.verification_status = 'partial'
+    else:
+        result.verification_status = 'conflict'
+
+    return result
+
+
+# ---- Part 2.C: Karplus 3D J 二面角验证 ----
+
+
+def _find_h_c_c_h_path(mol, h1_idx: int, h2_idx: int,
+                        max_bond_path: int = 5) -> Optional[List[int]]:
+    """BFS 找 h1 -> h2 间长度 ≤ max_bond_path (默认 5 = 4 键) 的最短键路径.
+
+    返回 4 原子路径 [h1, c1, c2, h2]. 若路径含 4 个原子 (即 H-C-C-H), 可用于
+    二面角计算. 失败返回 None.
+    """
+    try:
+        from rdkit import Chem
+    except ImportError:
+        return None
+
+    if h1_idx == h2_idx:
+        return None
+    # BFS
+    from collections import deque
+    queue = deque()
+    visited = {h1_idx}
+    # parent: idx -> (prev_idx, bond_path_atom_indices)
+    parent: Dict[int, Tuple[int, List[int]]] = {h1_idx: (-1, [h1_idx])}
+    queue.append(h1_idx)
+
+    # 收集每个原子的邻居
+    def neighbors(idx: int):
+        atom = mol.GetAtomWithIdx(idx)
+        out = []
+        for bond in atom.GetBonds():
+            out.append(bond.GetOtherAtomIdx(idx))
+        return out
+
+    while queue:
+        cur = queue.popleft()
+        path = parent[cur][1]
+        if len(path) > max_bond_path:
+            continue
+        for nxt in neighbors(cur):
+            if nxt in visited:
+                continue
+            new_path = path + [nxt]
+            parent[nxt] = (cur, new_path)
+            if nxt == h2_idx:
+                # 检查路径原子数 = 4 (H-C-C-H), 即 len=4 的路径包含 3 个键
+                if len(new_path) == 4:
+                    return new_path
+                # 若更长, 不在 4 键路径范围内, 继续找
+                # (BFS 已保证最短, 不会再短于此)
+                if len(new_path) < max_bond_path:
+                    visited.add(nxt)
+                    queue.append(nxt)
+                # 否则放弃
+                continue
+            visited.add(nxt)
+            queue.append(nxt)
+    return None
+
+
+def _calculate_dihedral_rad(conf, atom_indices: List[int]) -> Optional[float]:
+    """从 conformer 取 4 原子位置计算二面角 (弧度)."""
+    try:
+        from rdkit.Chem import rdMolTransforms
+        if len(atom_indices) != 4:
+            return None
+        return rdMolTransforms.GetDihedralRad(conf, *atom_indices)
+    except (ImportError, ValueError, RuntimeError):
+        return None
+
+
+def _classify_karplus_type(mol, path: List[int]) -> str:
+    """根据 H-C-C-H 路径中间 C-C 键的杂化选择 Karplus 常数."""
+    if len(path) < 4:
+        return 'aliphatic'
+    try:
+        from rdkit import Chem as _Chem
+    except ImportError:
+        return 'aliphatic'
+    c1, c2 = path[1], path[2]
+    a1 = mol.GetAtomWithIdx(c1)
+    a2 = mol.GetAtomWithIdx(c2)
+    # 芳香: c 原子在芳香环中
+    if a1.GetIsAromatic() and a2.GetIsAromatic():
+        return 'aromatic'
+    # 烯烃: 任一 c 是 sp2 (= 或 C=C)
+    if a1.GetHybridization() == _Chem.HybridizationType.SP2 or \
+            a2.GetHybridization() == _Chem.HybridizationType.SP2:
+        return 'olefinic'
+    return 'aliphatic'
+
+
+def _karplus_predict(theta_rad: float, A: float, B: float, C: float) -> float:
+    """Karplus 方程预测 ³J."""
+    cos_theta = float(np.cos(theta_rad))
+    return float(A * cos_theta * cos_theta + B * cos_theta + C)
+
+
+def verify_candidate_3d_j(
+    candidate_smiles: str,
+    j_constraints: List[dict],
+    h_assignments: dict,
+    karplus_constants: Optional[dict] = None,
+    j_tolerance_hz: float = 1.5,
+    max_conflict_hz: float = 3.0,
+    num_confs: int = 10,
+) -> JVerificationResult:
+    """对候选结构用 RDKit 多构象 + Karplus 预测 J, 与实测 J 对比 (Part 2.C).
+
+    算法:
+    1. Chem.AddHs + EmbedMultipleConfs + MMFFOptimizeMolecule
+    2. 对每个 j_constraint:
+       a. 从 h_assignments 找两个 H 原子 idx
+       b. BFS 找 H-C-C-H 4 原子路径
+       c. 计算 H-C-C-H 二面角
+       d. 由路径中间 C-C 杂化选 Karplus 常数
+       e. 预测 J, 与实测 j_obs_hz 对比
+    3. 取 J 命中率最高的 conformer 为 best
+
+    Args:
+        candidate_smiles: 候选 SMILES
+        j_constraints: [{h1_label, h2_label, h1_ppm, h2_ppm, j_obs_hz, multiplicity}, ...]
+        h_assignments: {dH_ppm: atom_index} 从 FullAssignmentTable 构建
+        karplus_constants: {type: (A, B, C)} 覆盖默认
+        j_tolerance_hz: matched 判定容差 (Hz, 默认 1.5)
+        max_conflict_hz: conflict 判定阈值 (Hz, 默认 3.0)
+        num_confs: 嵌入构象数
+
+    Returns:
+        JVerificationResult
+    """
+    result = JVerificationResult()
+    if karplus_constants:
+        result.karplus_constants = dict(karplus_constants)
+    else:
+        result.karplus_constants = dict(_DEFAULT_KARPLUS)
+
+    if not j_constraints or not h_assignments:
+        result.verification_status = 'skipped'
+        return result
+
+    try:
+        from rdkit import Chem
+        from rdkit import RDLogger
+        RDLogger.DisableLog('rdApp.*')
+        from rdkit.Chem import AllChem
+    except ImportError:
+        result.verification_status = 'skipped'
+        result.conflicts.append({'error': 'RDKit 未安装'})
+        return result
+
+    mol = Chem.MolFromSmiles(candidate_smiles)
+    if mol is None:
+        result.verification_status = 'skipped'
+        return result
+
+    mol = Chem.AddHs(mol)
+
+    try:
+        conf_ids = AllChem.EmbedMultipleConfs(
+            mol, numConfs=num_confs, randomSeed=42,
+            useBasicKnowledge=True, pruneRmsThresh=0.5)
+        if len(conf_ids) == 0:
+            result.verification_status = 'fallback_2d'
+            return result
+    except Exception:
+        result.verification_status = 'fallback_2d'
+        return result
+
+    for conf_id in conf_ids:
+        try:
+            AllChem.MMFFOptimizeMolecule(mol, confId=int(conf_id))
+        except Exception:
+            pass
+
+    # 过滤 j_constraints: 两个 H 都能解析到 RDKit atom index
+    verifiable: List[tuple] = []  # (idx1, idx2, j_obs, h1_ppm, h2_ppm)
+    for jc in j_constraints:
+        h1_ppm = round(jc.get('h1_ppm', 0.0), 3)
+        h2_ppm = round(jc.get('h2_ppm', 0.0), 3)
+        j_obs = jc.get('j_obs_hz', 0.0)
+        if j_obs <= 0:
+            continue
+        idx1 = h_assignments.get(h1_ppm)
+        idx2 = h_assignments.get(h2_ppm)
+        if idx1 is None or idx2 is None or idx1 == idx2:
+            continue
+        verifiable.append((idx1, idx2, j_obs, h1_ppm, h2_ppm))
+
+    result.n_total = len(verifiable)
+    if result.n_total == 0:
+        result.verification_status = 'skipped'
+        return result
+
+    # 对每个 conformer 计算命中率
+    best_rate = -1.0
+    best_conf_idx = 0
+    best_matched = 0
+    best_conflicts_list: List[dict] = []
+    best_rms = 0.0
+
+    for conf_id in conf_ids:
+        conf = mol.GetConformer(int(conf_id))
+        n_matched = 0
+        n_conflict = 0
+        conflicts_list: List[dict] = []
+        j_errors: List[float] = []
+
+        for idx1, idx2, j_obs, h1_ppm, h2_ppm in verifiable:
+            # BFS 找 4 原子路径
+            path = _find_h_c_c_h_path(mol, int(idx1), int(idx2))
+            if path is None:
+                n_conflict += 1
+                conflicts_list.append({
+                    'h1_ppm': h1_ppm, 'h2_ppm': h2_ppm,
+                    'j_obs': j_obs, 'j_pred': None,
+                    'theta_deg': None,
+                    'reason': 'no_4bond_path',
+                })
+                continue
+
+            theta_rad = _calculate_dihedral_rad(conf, path)
+            if theta_rad is None:
+                n_conflict += 1
+                conflicts_list.append({
+                    'h1_ppm': h1_ppm, 'h2_ppm': h2_ppm,
+                    'j_obs': j_obs, 'j_pred': None,
+                    'theta_deg': None,
+                    'reason': 'dihedral_calc_fail',
+                })
+                continue
+
+            karplus_type = _classify_karplus_type(mol, path)
+            A, B, C = result.karplus_constants.get(
+                karplus_type, _DEFAULT_KARPLUS['aliphatic'])
+            j_pred = _karplus_predict(theta_rad, A, B, C)
+            err = abs(j_pred - j_obs)
+
+            if err <= j_tolerance_hz:
+                n_matched += 1
+                j_errors.append(err)
+            elif err >= max_conflict_hz:
+                n_conflict += 1
+                conflicts_list.append({
+                    'h1_ppm': h1_ppm, 'h2_ppm': h2_ppm,
+                    'j_obs': round(j_obs, 2),
+                    'j_pred': round(j_pred, 2),
+                    'theta_deg': round(np.degrees(theta_rad), 1),
+                    'karplus_type': karplus_type,
+                    'reason': 'large_j_error',
+                })
+            else:
+                # 中间偏差: 不计 matched 也不计 conflict, 仅记录
+                j_errors.append(err)
+
+        rate = n_matched / result.n_total if result.n_total > 0 else 0.0
+        if rate > best_rate:
+            best_rate = rate
+            best_conf_idx = int(conf_id)
+            best_matched = n_matched
+            best_conflicts_list = conflicts_list
+            best_rms = (sum(e**2 for e in j_errors) / len(j_errors))**0.5 if j_errors else 0.0
+
+    result.n_matched = best_matched
+    result.n_conflict = len(best_conflicts_list)
+    result.rms_j_error_hz = round(best_rms, 3)
+    result.conflicts = best_conflicts_list
+    result.best_conformer_idx = best_conf_idx
+
     if best_rate >= 0.8:
         result.verification_status = 'good'
     elif best_rate >= 0.5:

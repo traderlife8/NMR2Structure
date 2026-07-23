@@ -74,7 +74,7 @@ def _filter_peaks_by_intensity(shifts, intensities, percentile=0.20):
     return sorted(p for i, p in paired if i >= thresh)
 
 
-def _build_problem_from_bruker(specs) -> ProblemPeaks:
+def _build_problem_from_bruker(specs, keep_solvent: bool = False) -> ProblemPeaks:
     """从读到的 BrukerSpectrum 列表构造 ProblemPeaks.
 
     选择规则：
@@ -106,12 +106,33 @@ def _build_problem_from_bruker(specs) -> ProblemPeaks:
             solvent = s.solvent
             break
 
+    # Part 2.B: 溶剂残余峰过滤 (默认启用, 可通过 --keep-solvent 跳过)
+    # 1D 与候选检索可见一个明显的 CDCl3 残余峰 7.26 ppm 时, 它会污染检索.
+    # 这里采用过滤策略: 检测到可用溶剂名时, 简单调用溶剂表过滤 proton/c shifts.
+    n_h_filtered = 0
+    n_c_filtered = 0
+    if solvent and not keep_solvent:
+        from .solvent_filter import is_solvent_peak as _is_sol_peak
+        # 先统计原始谱中的溶剂残余峰 (用于 meta)
+        if h_spec:
+            n_h_filtered = sum(
+                1 for p in h_spec.peaks if _is_sol_peak(p.shift, '1H', solvent)
+            )
+        if c_spec:
+            n_c_filtered = sum(
+                1 for p in c_spec.peaks if _is_sol_peak(p.shift, '13C', solvent)
+            )
+        h_shifts = [v for v in h_shifts if not _is_sol_peak(v, '1H', solvent)]
+        c_shifts = [v for v in c_shifts if not _is_sol_peak(v, '13C', solvent)]
+
     return ProblemPeaks(
         carbon_shifts=c_shifts,
         proton_shifts=h_shifts,
         proton_integrals=h_integrals,
         solvent=solvent,
         field_mhz=h_spec.field_mhz if h_spec else (c_spec.field_mhz if c_spec else None),
+        n_h_solvent_filtered=n_h_filtered,
+        n_c_solvent_filtered=n_c_filtered,
     )
 
 
@@ -174,6 +195,10 @@ def main(argv=None):
                              '每次运行生成 NMR2Structure_YYYY-MM-DD_HH-MM-SS.log')
     parser.add_argument('--no-log', action='store_true',
                         help='禁用日志记录 (默认每次运行都会把屏幕内容写入日志文件)')
+    # Part 2.B: 溶剂残余峰过滤开关
+    parser.add_argument('--keep-solvent', action='store_true',
+                        help='禁用溶剂残余峰过滤 (默认启用 -- 仪器记录的 CDCl3 7.26 '
+                             '/ DMSO 2.50 等溶剂信号会被剔除, 避免污染检索)')
     args = parser.parse_args(argv)
 
     # 初始化日志 (默认开启, --no-log 可禁用)
@@ -230,7 +255,7 @@ def main(argv=None):
         print(f"[1.5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
 
     # 2. 构造问题
-    problem = _build_problem_from_bruker(specs)
+    problem = _build_problem_from_bruker(specs, keep_solvent=args.keep_solvent)
     print(f"[2/5] 观测峰: 13C={len(problem.carbon_shifts)} 1H={len(problem.proton_shifts)} "
           f"solvent={problem.solvent}", file=sys.stderr)
 
@@ -291,6 +316,7 @@ def main(argv=None):
                 multiplets=multiplets,
                 h1_peaklist_path=h1_peaklist_path,
                 h1_field_mhz=h1_field_mhz,
+                solvent=problem.solvent or '',
                 quiet=args.quiet,
             )
             # 中间结果写入独立 CSV (化学家复核用)
@@ -514,9 +540,30 @@ def main(argv=None):
         print(f"[9] 结构推断置信度评估 ...", file=sys.stderr)
         try:
             from .determination import assess_determination
+            # Part 2.F: 提取 NOE / J 命中率
+            noe_match_rates = None
+            j_match_rates = None
+            if noe_verification_results:
+                noe_match_rates = []
+                for r in noe_verification_results:
+                    n_total = r.get('n_total', 0)
+                    n_matched = r.get('n_matched', 0)
+                    noe_match_rates.append(
+                        n_matched / n_total if n_total > 0 else 0.0
+                    )
+            if j_verification_results:
+                j_match_rates = []
+                for r in j_verification_results:
+                    n_total = r.get('n_total', 0)
+                    n_matched = r.get('n_matched', 0)
+                    j_match_rates.append(
+                        n_matched / n_total if n_total > 0 else 0.0
+                    )
             determination_result = assess_determination(
                 evidences=evidences[:args.top_n],
                 hose_verifications=hose_verifications if hose_verifications else None,
+                noe_match_rates=noe_match_rates,
+                j_match_rates=j_match_rates,
             )
             print(f"  -> 结论: {determination_result.conclusion_label} "
                   f"(置信度={determination_result.confidence:.3f})", file=sys.stderr)
@@ -651,6 +698,109 @@ def main(argv=None):
                 print(f"  -> NOE 验证: {len(noe_verification_results)} 个候选 -> "
                       f"step6_noe_3d_verification.csv", file=sys.stderr)
 
+    # 9.6b Karplus 3D J 二面角验证 (Part 2.C)
+    j_verification_results: List[dict] = []
+    if (interpretation_2d is not None
+            and interpretation_2d.multiplet_analyses
+            and full_assignments_topn):
+        from .correlation_2d import verify_candidate_3d_j
+        print(f"[9.6b] Karplus 3D J 验证 (Part 2.C) ...", file=sys.stderr)
+        for ev in evidences[:min(args.top_n, len(evidences))]:
+            # 构建 h_assignments (与 NOE 验证共用)
+            h_assignments_j: dict = {}
+            try:
+                from rdkit import Chem as _Chem
+                mol_j = _Chem.MolFromSmiles(ev.smiles)
+                if mol_j is None:
+                    continue
+                mol_j = _Chem.AddHs(mol_j)
+                h_atoms_j = [a.GetIdx() for a in mol_j.GetAtoms() if a.GetSymbol() == 'H']
+                # 简化: 用观测 proton_shifts 顺序匹配 H 原子
+                for i, h_ppm in enumerate(problem.proton_shifts):
+                    if i < len(h_atoms_j):
+                        h_assignments_j[round(h_ppm, 3)] = h_atoms_j[i]
+            except Exception:
+                pass
+
+            if not h_assignments_j:
+                continue
+
+            # 构建 j_constraints: 从 multiplet_analyses 提取
+            j_constraints: List[dict] = []
+            mas = interpretation_2d.multiplet_analyses
+            # 对每个 multiplet 找对应的 H label 和 J pattern
+            for ma in mas:
+                if not ma.j_couplings_Hz or ma.num_subpeaks < 2:
+                    continue
+                if ma.pattern not in ('d', 't', 'q', 'm'):
+                    continue
+                # 取第一个 J (从 spin_systems 中找相邻 H 是 Part 1 已做的, 但
+                # 当前 Karplus 验证只需要单条 J 与 3D 二面角的预测对比)
+                j_obs = ma.j_couplings_Hz[0]
+                if j_obs <= 0:
+                    continue
+                # 简化: partner_h 用该 multiplet 所在 spin_system 中的其他 H
+                partner_h = None
+                for ss in interpretation_2d.spin_systems:
+                    if round(ma.h_ppm, 3) in [round(h, 3) for h in ss.h_ppms]:
+                        # 取另一个 H 作为 partner
+                        for h in ss.h_ppms:
+                            if round(h, 3) != round(ma.h_ppm, 3):
+                                partner_h = h
+                                break
+                        break
+                if partner_h is None:
+                    # 无 partner: 跳过此 J (单 J 无法做 Karplus 二面角)
+                    continue
+                j_constraints.append({
+                    'h1_label': ma.h_label,
+                    'h2_label': ma.h_label + "-neighbor",  # 简化标签
+                    'h1_ppm': ma.h_ppm,
+                    'h2_ppm': partner_h,
+                    'j_obs_hz': j_obs,
+                    'multiplicity': ma.pattern,
+                })
+
+            if not j_constraints:
+                continue
+
+            try:
+                j_result = verify_candidate_3d_j(
+                    ev.smiles, j_constraints, h_assignments_j)
+                j_verification_results.append({
+                    'rank': ev.rank,
+                    'smiles': ev.smiles,
+                    'n_total': j_result.n_total,
+                    'n_matched': j_result.n_matched,
+                    'n_conflict': j_result.n_conflict,
+                    'rms_j_error_hz': j_result.rms_j_error_hz,
+                    'best_conformer_idx': j_result.best_conformer_idx,
+                    'status': j_result.verification_status,
+                    'karplus_constants': j_result.karplus_constants,
+                })
+            except Exception as ex:
+                print(f"  WARN: Top-{ev.rank} Karplus J 验证失败: {ex}",
+                      file=sys.stderr)
+
+        # 写 step6b_j_karplus_3d_verification.csv
+        if j_verification_results:
+            import csv as csv_mod
+            path6b = os.path.join(output_dir, 'step6b_j_karplus_3d_verification.csv')
+            with open(path6b, 'w', newline='', encoding='utf-8') as f:
+                w = csv_mod.writer(f)
+                w.writerow(['候选rank', 'SMILES', 'J约束数', '匹配', '冲突',
+                            'RMS误差Hz', 'best_conf_idx', '状态'])
+                for r in j_verification_results:
+                    w.writerow([
+                        r['rank'], r['smiles'], r['n_total'],
+                        r['n_matched'], r['n_conflict'],
+                        f"{r['rms_j_error_hz']:.3f}", r['best_conformer_idx'],
+                        r['status'],
+                    ])
+            if not args.quiet:
+                print(f"  -> Karplus J 验证: {len(j_verification_results)} 个候选 -> "
+                      f"step6b_j_karplus_3d_verification.csv", file=sys.stderr)
+
     # 输出 (out_prefix 已在 main() 开头构造, 路径 = output_root / compound_name / compound_name.*)
     meta = {
         'folder': folder,
@@ -730,8 +880,15 @@ def main(argv=None):
                     'n_hsqc_obs': s2d.n_hsqc_obs,
                     'n_hmbc_obs': s2d.n_hmbc_obs,
                     'n_cosy_obs': s2d.n_cosy_obs,
+                    'n_hmbc_filtered_oneJ': getattr(s2d, 'n_hmbc_filtered_oneJ', 0),  # Part 2.A
                     'notes': s2d.notes,
                 }
+    # Part 2.B: 溶剂过滤统计 (总是启用, 与有无 2D 无关)
+    meta['solvent_filter_stats'] = {
+        'observed_solvent': problem.solvent or '',
+        'n_h_filtered': problem.n_h_solvent_filtered,
+        'n_c_filtered': problem.n_c_solvent_filtered,
+    }
     # 2D 逐步解读中间结果 (化学家可审查)
     if interpretation_2d is not None:
         meta['interpretation_2d'] = {
@@ -749,7 +906,8 @@ def main(argv=None):
             ],
             'hmbc_connections': [
                 {'h_ppm': conn.h_ppm, 'c_ppm': conn.c_ppm,
-                 'bond_type': conn.bond_type}
+                 'bond_type': conn.bond_type,
+                 'is_oneJ_residue': conn.is_oneJ_residue}  # Part 2.A
                 for conn in interpretation_2d.hmbc_connections
             ],
             'n_cq_inferred': interpretation_2d.n_cq_inferred,
@@ -773,6 +931,16 @@ def main(argv=None):
                  'expected_distance': nc.expected_distance}
                 for nc in interpretation_2d.noe_contacts
             ],
+            # Part 2.C 暴露: TopSpin Manual 多重峰精细化结果
+            'multiplet_analyses': [
+                {'h_ppm': ma.h_ppm, 'c_ppm': ma.c_ppm,
+                 'pattern': ma.pattern, 'num_subpeaks': ma.num_subpeaks,
+                 'j_couplings_Hz': ma.j_couplings_Hz,
+                 'halfwidth_Hz': ma.halfwidth_Hz,
+                 'quality_grade': ma.quality_grade,
+                 'c_label': ma.c_label, 'h_label': ma.h_label}
+                for ma in interpretation_2d.multiplet_analyses
+            ],
             'assignment_validation': {
                 'total_observed_c': interpretation_2d.assignment_validation.total_observed_c,
                 'assigned_c': interpretation_2d.assignment_validation.assigned_c,
@@ -787,6 +955,56 @@ def main(argv=None):
     # NOE 3D 验证结果
     if noe_verification_results:
         meta['noe_verification'] = noe_verification_results
+
+    # Part 2.E: Karplus J 3D 验证结果
+    if j_verification_results:
+        meta['j_verification'] = j_verification_results
+
+    # Part 2.E: NOE/J 验证结果回喂 score_candidates, 重新打分 (仅 Top-N)
+    # 范围限制: 只对 Top-N 个候选 (有 NOE/J 结果) 重打分, 避免无谓的计算
+    if (noe_verification_results or j_verification_results) and evidences:
+        try:
+            noe_dict = {r['smiles']: r for r in noe_verification_results}
+            j_dict = {r['smiles']: r for r in j_verification_results}
+            # 取有 NOE/J 验证结果的 SMILES 集合
+            verified_smiles = set(noe_dict.keys()) | set(j_dict.keys())
+            # 仅重打分有 verified 分数的候选
+            hits_to_rescore = []
+            for ev in evidences:
+                if ev.smiles in verified_smiles:
+                    hits_to_rescore.append((ev.rank, ev.smiles))
+            if hits_to_rescore:
+                # 对全部命中候选重打分 (但只有 verified 部分会拿到 NOE/J bonus)
+                # 用 scored[i].hit 重建 RetrievalHit 列表 (scored 与 evidences 等长同序)
+                final_scored = score_candidates(
+                    [s.hit for s in scored],
+                    use_2d_scoring=use_hsqc_mode,
+                    use_noe_scoring=bool(noe_verification_results),
+                    noe_scores=noe_dict if noe_dict else None,
+                    use_j_scoring=bool(j_verification_results),
+                    j_scores=j_dict if j_dict else None,
+                )
+                final_scored.sort(key=lambda s: s.score, reverse=True)
+                for i, s in enumerate(final_scored, 1):
+                    s.rank = i
+                # 按 rank 重新排序 evidences (依据 SMILES)
+                rank_map = {s.hit.entry.canonical_smiles or s.hit.entry.smiles: s
+                            for s in final_scored}
+                evidences.sort(key=lambda e: rank_map.get(e.smiles).rank
+                               if rank_map.get(e.smiles) else 999)
+                if not args.quiet:
+                    print(f"  -> NOE/J 验证回喂: 重打分 {len(evidences)} 个候选, "
+                          f"最终 Top-1 score={evidences[0].score:.1f}",
+                          file=sys.stderr)
+                meta['score_breakdown'] = {
+                    'base_used_2d': use_hsqc_mode,
+                    'noe_bonus_applied': bool(noe_verification_results),
+                    'j_bonus_applied': bool(j_verification_results),
+                    'n_rescored': len(hits_to_rescore),
+                    'final_top1_score': final_scored[0].score if final_scored else None,
+                }
+        except Exception as ex:
+            print(f"  WARN: NOE/J 回喂打分失败: {ex}", file=sys.stderr)
     # 全归属表 (Top-1)
     if full_assignment is not None:
         meta['full_assignment'] = {

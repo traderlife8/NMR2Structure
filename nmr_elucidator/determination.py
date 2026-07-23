@@ -178,6 +178,8 @@ def compute_unified_score(
 def assess_determination(
     evidences: List[CandidateEvidence],
     hose_verifications: Optional[List[VerificationScore]] = None,
+    noe_match_rates: Optional[List[float]] = None,
+    j_match_rates: Optional[List[float]] = None,
     weights: Optional[dict] = None,
 ) -> DeterminationResult:
     """对所有候选进行置信度评估, 输出结构推断结论.
@@ -185,6 +187,8 @@ def assess_determination(
     Args:
         evidences: 候选证据链列表 (已按 rank 排序)
         hose_verifications: 对应的 HOSE 验证结果 (可选, 与 evidences 等长)
+        noe_match_rates: 对应的 NOE 命中率 (Part 1, 可选)
+        j_match_rates: 对应的 Karplus J 命中率 (Part 2.C, 可选)
         weights: 融合权重
 
     Returns:
@@ -241,12 +245,45 @@ def assess_determination(
     hsqc_rate = (top_ev.correlation_2d_score.hsqc_match_rate
                  if top_ev.correlation_2d_score else 0.0)
 
+    # Part 2.F: NOE 命中率 (Top-1)
+    noe_rate_top1: Optional[float] = None
+    if noe_match_rates and top_idx < len(noe_match_rates):
+        noe_rate_top1 = noe_match_rates[top_idx]
+
+    # Part 2.F: Karplus J 命中率 (Top-1)
+    j_rate_top1: Optional[float] = None
+    if j_match_rates and top_idx < len(j_match_rates):
+        j_rate_top1 = j_match_rates[top_idx]
+
+    # Part 2.F: J 一致性降级 规则
+    # 若 j_match_rate 存在但 < 0.5 (仅一半 J 一致), 
+    #   说明 3D 二面角与实测 J 严重不一致, 候选可能不合理
+    #   -> 将 determined 降级 probable, 记录 warning
+    j_consistency_warning = ''
+    j_consistency_downgrade = False
+    if j_rate_top1 is not None and j_rate_top1 < 0.5:
+        if top_score >= 0.85:
+            j_consistency_downgrade = True
+            j_consistency_warning = (
+                f'Karplus J 命中率低 ({j_rate_top1:.0%}), 3D 二面角与实测 J '
+                f'显著不一致, 候选结构 3D 构象可能不准, 推荐手动复核'
+            )
+
     if top_score >= 0.85 and gap >= 0.15:
-        conclusion = CONFIDENCE_DETERMINED
-        confidence = min(1.0, top_score)
-        recommendations.append('结构已确定, 可直接用于后续研究')
+        if j_consistency_downgrade:
+            # J 一致性不足, 降级为 probable
+            conclusion = CONFIDENCE_PROBABLE
+            confidence = top_score * 0.9
+            recommendations.append(f'Karplus J 命中率 {j_rate_top1:.0%} 偏低, 结构疑点')
+            recommendations.append(j_consistency_warning)
+        else:
+            conclusion = CONFIDENCE_DETERMINED
+            confidence = min(1.0, top_score)
+            recommendations.append('结构已确定, 可直接用于后续研究')
         if has_2d_support and hsqc_rate >= 0.8:
             recommendations.append(f'2D NMR 支持: HSQC 匹配率 {hsqc_rate:.0%}')
+        if j_rate_top1 is not None and j_rate_top1 >= 0.5:
+            recommendations.append(f'Karplus J 验证: 命中率 {j_rate_top1:.0%}')
     elif top_score >= 0.70 and gap >= 0.08:
         conclusion = CONFIDENCE_PROBABLE
         confidence = top_score
@@ -256,6 +293,8 @@ def assess_determination(
             recommendations.append(f'结构很可能正确, 2D NMR 支持 (HSQC={hsqc_rate:.0%})')
         else:
             recommendations.append('结构很可能正确, 建议用 2D NMR (HSQC/HMBC) 进一步确认')
+        if j_rate_top1 is not None:
+            recommendations.append(f'Karplus J 命中率: {j_rate_top1:.0%}')
     elif top_score >= 0.50:
         conclusion = CONFIDENCE_AMBIGUOUS
         confidence = top_score * 0.7  # 不确定时降低置信度
@@ -272,6 +311,12 @@ def assess_determination(
         confidence = top_score
         recommendations.append('所有候选验证分数过低, 可能是新骨架化合物')
         recommendations.append('建议: 1) 检查分子式是否正确; 2) 获取 2D NMR; 3) 考虑片段组装')
+
+    # Part 2.F: 附加 NOE 命中率到 evidence_summary
+    if noe_rate_top1 is not None:
+        evidence_summary.append(f'NOE 3D 验证 (Top-1): {noe_rate_top1:.0%}')
+    if j_rate_top1 is not None:
+        evidence_summary.append(f'Karplus J 验证 (Top-1): {j_rate_top1:.0%}')
 
     return DeterminationResult(
         conclusion=conclusion,

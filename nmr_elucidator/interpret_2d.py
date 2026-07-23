@@ -35,6 +35,8 @@ class CHPair:
     assigned_h_label: Optional[str] = None  # 归属标签 (如 'H-3')
     j_couplings: List[float] = field(default_factory=list)  # 该 H 的 J 耦合 (Hz)
     h_neighbors: List[float] = field(default_factory=list)  # 邻位 H 的 δH (ppm)
+    # Part 2.B: 溶剂残余峰标记. 该 C-H 对若来自溶剂残余峰, 不进入归属表.
+    is_solvent_residual: bool = False
 
 
 @dataclass
@@ -56,6 +58,9 @@ class HMBCConnection:
     connects_fragments: Optional[str] = None  # 如 'spin-A -> Cq-170.5'
     inferred_distance: int = 0  # 推断键数 (2/3)
     inference_basis: str = ''   # 'topology'/'unresolved'
+    # Part 2.A: 是否为 ¹J 直接连接残留. 默认为 False (远程相关) 在
+    # 过滤后. True 表示可能是 ¹J 残留但未被滤掉 (阈值边缘).
+    is_oneJ_residue: bool = False
 
 
 @dataclass
@@ -150,6 +155,7 @@ def _step1_hsqc_to_ch_pairs(
     dept_summary: List[dict],
     proton_integrals: List[tuple] = None,
     multiplets: List = None,
+    solvent: str = '',
     h_tol: float = 0.3,
     c_tol: float = 2.5,
     min_snr: float = 20.0,
@@ -160,9 +166,13 @@ def _step1_hsqc_to_ch_pairs(
     碳级数来源优先级: DEPT 推断 > 1H 积分推断 > 化学位移经验 > 'unknown'.
     若提供 multiplets (1H 多重峰分析结果), 会按 h_ppm 匹配将 J 耦合填入 CHPair.
 
+    Part 2.B: 若提供 solvent, HSQC 中位于溶剂残余 (h, c) 位置的交叉峰会被标记
+    为 is_solvent_residual, 仍在列表中返回 (供人工复核), 但不阻塞下游处理.
+
     Args:
         proton_integrals: [(center_ppm, integral_value), ...] 1H 积分数据
         multiplets: [Multiplet, ...] 1H 多重峰分析结果 (J 耦合)
+        solvent: 溶剂名 (e.g. 'CDCl3', 'DMSO-D6') 用于标记溶剂残余峰
     """
     from .correlation_2d import extract_hsqc_pairs
 
@@ -232,6 +242,9 @@ def _step1_hsqc_to_ch_pairs(
         return []
 
     ch_pairs: List[CHPair] = []
+    # Part 2.B: 溶剂残余交叉峰检测
+    from .solvent_filter import is_solvent_peak as _is_sol
+    n_solvent_filtered = 0
     for h_ppm, c_ppm in hsqc_pairs_raw:
         # 用 DEPT 确定碳级数 (容差内匹配)
         mult = 'unknown'
@@ -250,12 +263,21 @@ def _step1_hsqc_to_ch_pairs(
         # 查找该 H 的 J 耦合 (按 h_ppm 匹配 multiplet)
         j_vals = _find_j_couplings(round(h_ppm, 3))
 
+        # Part 2.B: 检查是否为溶剂残余 HSQC 交叉峰
+        is_sol_residual = False
+        if solvent:
+            if (_is_sol(h_ppm, '1H', solvent, 0.05)
+                    and _is_sol(c_ppm, '13C', solvent, 1.0)):
+                is_sol_residual = True
+                n_solvent_filtered += 1
+
         ch_pairs.append(CHPair(
             h_ppm=round(h_ppm, 3),
             c_ppm=round(c_ppm, 3),
             multiplicity=mult,
             h_integral=round(h_integral, 3) if h_integral is not None else None,
             j_couplings=j_vals,
+            is_solvent_residual=is_sol_residual,
         ))
 
     # 按 13C 位移降序排列 (高场到低场, 与化学家习惯一致)
@@ -648,7 +670,13 @@ def _step3_hmbc_connections(
     if 'HMBC' not in spectra_2d:
         return []
 
-    hmbc_pairs = extract_hmbc_pairs(spectra_2d['HMBC'], min_snr=min_snr)
+    # Part 2.A: 传入 HSQC 配对过滤 ¹J 残留. ch_pairs (h_ppm, c_ppm)
+    # 来自 HSQC 视为 ¹J 真值. HMBC 中相同 (h, c) 视为 ¹J 残留删除.
+    hsqc_known = [(p.h_ppm, p.c_ppm) for p in ch_pairs]
+    hmbc_pairs, n_oneJ_filtered = extract_hmbc_pairs(
+        spectra_2d['HMBC'], min_snr=min_snr,
+        hsqc_pairs=hsqc_known if hsqc_known else None,
+    )
     if not hmbc_pairs:
         return []
 
@@ -1097,6 +1125,7 @@ def interpret_2d_sequential(
     multiplets: List = None,
     h1_peaklist_path: Optional[str] = None,
     h1_field_mhz: float = 0.0,
+    solvent: str = '',
     quiet: bool = False,
 ) -> Interpretation2D:
     """按化学家顺序逐步解读 2D NMR, 返回结构化中间结果.
@@ -1118,6 +1147,7 @@ def interpret_2d_sequential(
         multiplets: [Multiplet, ...] 1H 多重峰 (全局峰聚类结果)
         h1_peaklist_path: 1H peaklist.xml 路径 (用于精细化多重峰分析)
         h1_field_mhz: 谱仪 1H 频率 (MHz)
+        solvent: 溶剂名 (Part 2.B: 标记 HSQC 溶剂残余 HSQC 交叉峰)
         quiet: 不打印进度
 
     Returns:
@@ -1131,7 +1161,7 @@ def interpret_2d_sequential(
 
     # 步骤 1: HSQC → C-H 对 (结合 DEPT + 1H 积分推断碳级数, 填充 J 耦合)
     ch_pairs = _step1_hsqc_to_ch_pairs(
-        spectra_2d, dept_summary, proton_integrals, multiplets)
+        spectra_2d, dept_summary, proton_integrals, multiplets, solvent=solvent)
     result.ch_pairs = ch_pairs
 
     # 步骤 1b: 重叠峰分解 (对标 5.9 流程: ¹³C 切片 + 分峰检测)
@@ -1475,7 +1505,8 @@ def write_step_files(
     with open(path1, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['编号', 'C_label', 'H_label', 'dH_ppm', 'dC_ppm', '1H积分', 'H个数',
-                    '碳级数', 'J_couplings_Hz', 'h_neighbors_ppm'])
+                    '碳级数', 'J_couplings_Hz', 'h_neighbors_ppm',
+                    'is_solvent_residual'])  # Part 2.B
         for i, p in enumerate(result.ch_pairs, 1):
             h_int = f'{p.h_integral:.3f}' if p.h_integral is not None else ''
             n_h = str(round(p.h_integral)) if p.h_integral is not None else ''
@@ -1483,7 +1514,8 @@ def write_step_files(
             hn_str = '; '.join(f'{h:.3f}' for h in p.h_neighbors) if p.h_neighbors else ''
             w.writerow([i, p.assigned_c_label, p.assigned_h_label,
                         f'{p.h_ppm:.4f}', f'{p.c_ppm:.4f}', h_int, n_h,
-                        p.multiplicity, j_str, hn_str])
+                        p.multiplicity, j_str, hn_str,
+                        'Y' if p.is_solvent_residual else ''])
     written.append(path1)
 
     # 步骤 1 附加: 所有 C-H 对等高线图 (分 overlap/normal 两个子文件夹)
@@ -1549,11 +1581,14 @@ def write_step_files(
     path3 = os.path.join(output_dir, 'step3_hmbc_connections.csv')
     with open(path3, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
-        w.writerow(['序号', 'dH_ppm', 'dC_ppm', '键类型', '推断键数', '推断依据', '连接描述'])
+        # Part 2.A: 新增 is_oneJ_residue 列 (应全 False, 仅含远程相关)
+        w.writerow(['序号', 'dH_ppm', 'dC_ppm', '键类型', '推断键数',
+                    '推断依据', '连接描述', 'is_oneJ_residue'])
         for i, conn in enumerate(result.hmbc_connections, 1):
             w.writerow([i, f'{conn.h_ppm:.4f}', f'{conn.c_ppm:.4f}',
                         conn.bond_type, conn.inferred_distance or '',
-                        conn.inference_basis, conn.connects_fragments or ''])
+                        conn.inference_basis, conn.connects_fragments or '',
+                        'Y' if conn.is_oneJ_residue else ''])
     written.append(path3)
 
     # 步骤 4: 季碳

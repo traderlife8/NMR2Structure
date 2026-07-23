@@ -864,3 +864,29 @@ python -X utf8 -m nmr_elucidator \
 4. **CSV 报告**：`<sample>_unmatched.csv` 每行一个候选，列 `rank/smiles/unmatched_*.shifts + note`
 
 后续可对接 ML 模型（chefnmr/NMR2Struct/lucy-ng）输入：`SMILES` + `unmatched_*.shifts`。
+
+## 不在项目范围 (Part 2.G)
+
+补全 8 项核心解谱步骤后, 以下能力**明确不在 CPU-only 本项目范围内**, 需要外部工具补充:
+
+| 不支持项 | 需要补足 | 外部路径 |
+|---|---|---|
+| **绝对构型** | Mosher 酯法 / CD 圆二色谱 / X-ray 单晶 | external 工具 (Mnova CD) |
+| **变温 NMR / rotamers** | 变温实验 + 动态核磁分析 | 温度序列 (180-340K) + 谱图叠合 |
+| **混合 2D (HSQC-TOCSY/HSQC-NOESY/LR-HSQMBC)** | 高级 2D 实验 | Bruker 脉冲程序 + 后续解析 |
+| **²J(CH) / ³J(CH) 直接读取** | J-resolved / J-HMBC 实验 | peaklist.xml 不含此字段 |
+| **qNMR 定量** | ERETIC / 校准曲线 | nmrpy 已支持 ERETIC, 需单独接入 |
+| **完整 CASE 自动解谱 (无分子式已知)** | 2D 约束驱动的结构生成 | `external/lucy-ng/` 或 `external/LSDos-3.5.3/` |
+| **ML 谱图预测** | HSQC + SMILES 端到端 | `external/NMR2Struct/` (GPU) / `external/chefnmr/` (GPU) |
+| **蛋白-配体相互作用 / HSQC 滴定** | 配体浓度梯度 HSQC | 自由衰减 / 化学位移扰动分析 |
+
+### 已实现: Part 2 改进矩阵
+
+| Part | 能力 | 模块 | 文档 |
+|---|---|---|---|
+| 2.A | HMBC ¹J 残留过滤 (与 HSQC 比对, `c_tol=1.0 ppm` / `h_tol=0.05 ppm`) | `extract_hmbc_pairs(hsqc_pairs=...)` | `meta['hmbc_stats']` |
+| 2.B | 溶剂残余峰过滤 (CDCl3/DMSO/MeOD/H2O/C6D6/CD2Cl2/Pyr/TFA/THF/MeCN, 默认启用, `--keep-solvent` 关闭) | `solvent_filter.py` | `step1*.csv` 新列 `is_solvent_residual` |
+| 2.C | **Karplus 3D J 二面角验证** (距离 + 二面角双维度, 文献经典常数) | `verify_candidate_3d_j` | `step6b_j_karplus_3d_verification.csv` |
+| 2.E | NOE + J 验证回喂 `score_candidates` (最终打分时序修正) | `__main__.py` 步骤 [9.6b] | `meta['score_breakdown']` |
+| 2.F | J 一致性降级维度 (Top-1 `j_match_rate<0.5` 时 determined → probable) | `assess_determination(j_match_rates=...)` | `evidence_summary[]` |
+| 2.G | 本节文档归档 | `AGENTS.md` / 本文档 / `MestReNova_解谱指南.md` 5.10 节 | 同左 |
