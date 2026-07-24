@@ -19,6 +19,10 @@ Bruker 原始谱 (NMR/<sample>/)
 [2] ProblemPeaks (1H + 13C, 20% 强度阈值去噪) + Constraints
 [2.5] DEPT 推断 (CH/CH2/CH3/Cq, 用 exp 23+24)
         ↓
+[2.7] **已知化合物检测**: 如 E:\NMR2Structure\真实结构/<sample>/ 下存在 *数据归属*.xlsx
+        → 加载标准归属表 + 已知 SMILES (仅复核用, 不参与推导)
+[2.8] 2D NMR 逐步解读 (化学家工作流 HSQC→COSY→HMBC→季碳)
+        ↓
 [3] stream_nmrshiftdb2_sdf → retrieve_candidates (窗口匹配 + DEPT 软约束)
         ↓
 [4] score_candidates (coverage + RMS penalty) + build_evidence
@@ -37,6 +41,11 @@ Bruker 原始谱 (NMR/<sample>/)
         ↓
 [9] (可选) 结构推断置信度评估 (assess_determination: determined/probable/ambiguous/no_match)
         ↓
+[9.8] **已知化合物复核**: 如存在标准归属表, 自动对 derive 输出做行级联合匹配
+        (13C ±0.5 ppm / 1H ±0.1 ppm, 兼容 CH2/CH3 占位符).
+        → 写出 assignment_table_joint.xlsx + comparison_report.txt
+        (SMILES 仅用于化合物结构判等, 不参与行匹配)
+        ↓
 output/<sample>/<sample>.{json,md,html}  (HTML 内嵌所有图片 base64)
             <sample>_unmatched.csv
             step1_hsqc_ch_pairs.csv      (2D 解读中间结果, 化学家复核用)
@@ -48,6 +57,10 @@ output/<sample>/<sample>.{json,md,html}  (HTML 内嵌所有图片 base64)
             step4_quaternary_carbons.csv (含 DEPT 证据来源)
             完整NMR归属表(论文Table1)/   (--use-2d 启用，生成 Top-N 个 CSV, 论文 Table 1 格式)
             <sample>_nmrpy_validation.{json,md,png}  (--validate-with-nmrpy)
+            derive_归属表/assignment_table.xlsx       (derive 主输出, 第 1 行表头, 后续数据行, 贴近化学家 Excel)
+            derive_归属表/meta.txt                    (元信息: Solvent / Formula / Field_MHz / HRESIMS 等, 独立存放)
+            derive_归属表/assignment_table_joint.xlsx (已知化合物复核时生成, 双 sheet 拼接: '按标准表为准' + '按程序表为准')
+            derive_归属表/comparison_report.txt        (已知化合物复核时生成, 行级联合匹配明细 + 结论)
 ```
 
 详见 `从NMR谱图反推分子结构代码库.md`（调研 + 升级路径），本文档只讲**如何使用**。
@@ -309,6 +322,56 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 | `--no-derive` | 禁用 derive 模式, 直接走候选检索+打分流程 | — |
 | `--retrieve` | derive 完成后继续执行候选检索+打分 (默认仅推导不检索) | — |
 | `--no-2d` | 禁用 2D NMR 检测, 强制使用 1D 流程 (默认 2D 开启) | — |
+| `--real-structure-dir <path>` | 已知化合物根目录 (默认 `E:\NMR2Structure\真实结构`). 当该目录下存在 `<sample>/数据归属*.xlsx` 时自动切换到已知化合物流程 (derive 不使用 SMILES, 复核阶段才用于结构判等); 根目录/子目录/归属表缺失时自动跳过复核 | `derive_归属表/assignment_table_joint.xlsx` + `comparison_report.txt` |
+| `--known-c-tol <ppm>` | 已知化合物复核对比 13C 匹配容差 (默认 0.5 ppm, 覆盖实际推导偏差) | — |
+| `--known-h-tol <ppm>` | 已知化合物复核对比 1H 匹配容差 (默认 0.1 ppm) | — |
+
+### 已知化合物复核流程
+
+如果 `E:\NMR2Structure\真实结构/<compound_name>/` 目录下存在化学家 Excel 标准归属表
+(`*数据归属*.xlsx`, 同时推荐同目录放 `smiles.txt`), 运行主流程时会自动:
+
+1. **推导阶段不依赖 SMILES**: 仍然从 1D + 2D 谱图直接推导归属表 (与未知化合物流程一致).
+   SMILES **不参与推导**, 只用于复核阶段的化合物结构判等 (RDKit canonical SMILES 一致性).
+2. **复核对比**: derive 完成后, 自动以 (13C ±0.5 ppm, 1H ±0.1 ppm, 碳类型含 CH2/CH3 占位符兼容) 做行级联合匹配.
+3. **产出文件**:
+   - `derive_归属表/assignment_table_joint.xlsx` 双 sheet 左右拼接表:
+     - Sheet 1 **按标准表为准**: 行为标准表所有行 (行序与标准表一致);匹配上的程序输出行拼接在右侧并填 ΔdC / ΔdH / 类型一致;未匹配行的程序侧列填 `—`.
+     - Sheet 2 **按程序表为准**: 行为程序输出所有行 (行序与程序 xlsx 一致);匹配上的标准表行拼接在右侧并填 ΔdC / ΔdH / 类型一致;未匹配行的标准侧列填 `—`.
+     - 列结构 (左右两例): [表 A 全部列] + '拼接' + [表 B 全部列] + ΔdC (ppm) + ΔdH (ppm) + 类型一致
+   - `derive_归属表/comparison_report.txt` (含化合物结构信息 + 逐行匹配明细 + 综合判定)
+4. **判定等级**: 匹配率 ≥80% & 碳类型全一致 → "一致"; ≥60% → "部分一致"; <60% → "不一致".
+
+设计原则: **化学家标号 = ground truth**. SMILES 仅作为最终结构判等依据 (InChIKey / canonical SMILES),
+不参与行匹配. 推导过程的化合物结构验证完全依赖谱图推断.
+
+**Python API**:
+
+```python
+from nmr_elucidator.standard_assignment import (
+    discover_known_compound, read_standard_assignment_table,
+    compare_program_to_standard, write_matched_xlsx, write_comparison_report,
+)
+
+# 1. 发现
+result = discover_known_compound('clxh100', r'E:\NMR2Structure\真实结构')
+table_path, smiles = result  # table_path, smiles 或 None
+
+# 2. 读取标准归属表
+std_table = read_standard_assignment_table(table_path, known_smiles=smiles)
+
+# 3. 对比程序输出
+comparison = compare_program_to_standard(
+    'output/clxh100/derive_归属表/assignment_table.xlsx', std_table,
+    c_tol=0.5, h_tol=0.1, use_smiles=True,
+)
+
+# 4. 写匹配 xlsx + 报告
+write_matched_xlsx('output/.../assignment_table.xlsx',
+                   'output/.../assignment_table_matched.xlsx', comparison)
+write_comparison_report('output/.../comparison_report.txt',
+                        'output/.../assignment_table.xlsx', std_table, comparison)
+```
 
 ### 运行日志
 
@@ -934,6 +997,8 @@ python -m nmr_elucidator \
 | `shift_ranges.py` | 13C 化学位移经验范围表 + 官能团推断 | `infer_functional_groups`, `assign_shift_ranges`, `SHIFT_RANGES` |
 | `fragment_assembler.py` | 片段组装候选生成器（库外新骨架，从 1D 约束出发） | `build_constraints`, `assemble_candidates`, `FragmentConstraint` |
 | `log_setup.py` | 项目统一日志初始化（Tee stdout/stderr + logging，多入口共用） | `setup_logging`, `get_logger`, `get_current_log_file`, `auto_setup` |
+| `standard_assignment.py` | **已知化合物流程**：读取化学家 Excel 标准归属表 + 自动发现 + 行级联合匹配 + SMILES 结构判等（SMILES 仅复核用） | `read_standard_assignment_table`, `discover_known_compound`, `compare_program_to_standard`, `write_matched_xlsx`, `write_comparison_report`, `StandardAssignmentTable` |
+| `atom_labeler.py` | SMILES → RDKit mol → 化学家标号映射（仅在人工复核阶段用于结构验证，不参与推导） | `assign_chemist_labels`, `parse_smiles_to_mol`, `format_h_cell` |
 | `__main__.py` | CLI 入口（端到端主流程） | `main` |
 
 ## 未匹配峰处理（重点关注）

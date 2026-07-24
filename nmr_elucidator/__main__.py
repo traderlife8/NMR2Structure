@@ -45,10 +45,22 @@ from .io_processed import ProcessedReadError, read_processed_folder
 from .nmrsim_check import check_candidate_with_nmrsim
 from .report import write_report_html, write_report_json, write_report_markdown
 from .retrieve import ProblemPeaks, retrieve_candidates
+from .standard_assignment import (
+    discover_known_compound as _discover_known_compound,
+    read_standard_assignment_table as _read_standard_assignment_table,
+    compare_program_to_standard as _compare_program_to_standard,
+    write_joint_xlsx as _write_joint_xlsx,
+    write_comparison_report as _write_comparison_report,
+)
 
 # 默认数据库目录: NMR2Structure 包外层平级的 data 文件夹
 # 即 <project_root>/data (与 NMR2Structure/ 同级)
 _DEFAULT_DB_DIR = str(Path(__file__).resolve().parent.parent.parent / 'data')
+
+# 默认已知化合物根目录: E:\\NMR2Structure\\真实结构
+# 当 <real_structure_dir>/<compound_name>/ 下存在 *数据归属*.xlsx 时,
+# 走"已知化合物流程" (derive 不用 SMILES, 复核阶段才用 SMILES 做结构判等).
+_DEFAULT_REAL_STRUCTURE_DIR = r'E:\NMR2Structure\真实结构'
 
 # 项目 logger (在需要时调用 setup_logging() 初始化)
 from .log_setup import setup_logging as _setup_logging
@@ -324,6 +336,16 @@ def main(argv=None):
     parser.add_argument('--keep-solvent', action='store_true',
                         help='禁用溶剂残余峰过滤 (默认启用 -- 仪器记录的 CDCl3 7.26 '
                              '/ DMSO 2.50 等溶剂信号会被剔除, 避免污染检索)')
+    # 已知化合物流程: 自动检测 + 复核对比
+    parser.add_argument('--real-structure-dir', default=_DEFAULT_REAL_STRUCTURE_DIR,
+                        help='已知化合物 (真实结构 + 数据归属表) 所在根目录. '
+                             '当 --folder 路径末段化合物名的子目录中存在 *数据归属*.xlsx 时, '
+                             '自动切换到已知化合物流程 (derive + 复核). '
+                             '默认 E:\\NMR2Structure\\真实结构.')
+    parser.add_argument('--known-c-tol', type=float, default=0.5,
+                        help='已知化合物复核对比时的 13C 匹配容差 (ppm, 默认 0.5)')
+    parser.add_argument('--known-h-tol', type=float, default=0.1,
+                        help='已知化合物复核对比时的 1H 匹配容差 (ppm, 默认 0.1)')
     args = parser.parse_args(argv)
 
     # 处理 --no-2d / --no-derive 互斥开关
@@ -343,6 +365,30 @@ def main(argv=None):
         print(f"ERROR: 原始数据目录不存在: {folder}", file=sys.stderr)
         return 2
 
+    # 推断化合物名 (优先 --compound-name, 否则取 folder 路径最后一段)
+    compound_name = args.compound_name or os.path.basename(folder.rstrip(r'\/'))
+
+    # Part 3.5: 检测已知化合物 (在 E:\NMR2Structure\真实结构/<compound_name>/ 下查找 *数据归属*.xlsx)
+    # 已知化合物流程: derive 不用 SMILES, 复核阶段才用 SMILES 做结构判等
+    known_table_path: str | None = None
+    known_smiles: str = ''
+    # 自动检测: real_structure_dir 不存在 / <compound> 子目录缺失 / 无 *数据归属*.xlsx
+    # 时 _discover_known_compound 返回 None, 自动跳过已知化合物复核 (无需额外参数).
+    try:
+        known_result = _discover_known_compound(compound_name, args.real_structure_dir)
+        if known_result:
+            known_table_path, known_smiles = known_result
+            print(f"[已知化合物] 检测到标准归属表: {known_table_path}", file=sys.stderr)
+            if known_smiles:
+                print(f"[已知化合物] 已知 SMILES (仅复核用): "
+                      f"{known_smiles[:60]}{'...' if len(known_smiles) > 60 else ''}",
+                      file=sys.stderr)
+            else:
+                print(f"[已知化合物] 未检测到同目录 smiles.txt (仅复核数据可用, "
+                      f"无法做 SMILES 结构判等)", file=sys.stderr)
+    except Exception as ex:
+        print(f"WARN: 已知化合物检测失败: {ex}", file=sys.stderr)
+
     # 数据库自动发现 (--db 支持目录或单文件)
     dbs = _discover_databases(args.db)
     # --lucy-ng-db 显式指定时覆盖自动发现
@@ -355,8 +401,7 @@ def main(argv=None):
               f"lucy-ng={os.path.basename(lucy_ng_path) if lucy_ng_path else '无'}",
               file=sys.stderr)
 
-    # 推断化合物名 (优先 --compound-name, 否则取 folder 路径最后一段)
-    compound_name = args.compound_name or os.path.basename(folder.rstrip(r'\/'))
+    # 推断化合物名 (已在前面定义)
     output_dir = os.path.join(os.path.abspath(args.output_root), compound_name)
     os.makedirs(output_dir, exist_ok=True)
     out_prefix = os.path.join(output_dir, compound_name)
@@ -483,7 +528,10 @@ def main(argv=None):
             args.derive = False  # 降级
 
     if args.derive:
-        from .assembly import assemble_assignment_table, write_assignment_csv, write_assignment_xlsx
+        from .assembly import (
+            assemble_assignment_table, write_assignment_csv,
+            write_assignment_xlsx, write_assignment_meta,
+        )
         from .correlation_2d import extract_cosy_pairs, extract_hmbc_pairs
         print(f"[Derive] 从谱图数据直接推导归属表 ...", file=sys.stderr)
 
@@ -523,15 +571,26 @@ def main(argv=None):
         os.makedirs(derive_dir, exist_ok=True)
         csv_path = os.path.join(derive_dir, 'assignment_table.csv')
         xlsx_path = os.path.join(derive_dir, 'assignment_table.xlsx')
+        meta_path = os.path.join(derive_dir, 'meta.txt')
         write_assignment_csv(derive_rows, csv_path)
-        meta_lines = []
+        # 元信息 (Solvent / Formula / HRESIMS / Field 等) 单独写到 meta.txt
+        meta = {}
         if args.formula:
-            meta_lines.append(('Formula', args.formula))
+            meta['Formula'] = args.formula
         if problem.solvent:
-            meta_lines.append(('Solvent', problem.solvent))
-        write_assignment_xlsx(derive_rows, xlsx_path, meta_lines=meta_lines or None)
+            meta['Solvent'] = problem.solvent
+        if problem.field_mhz:
+            meta['Field_MHz'] = f'{problem.field_mhz:.2f}'
+        for key in ('hresims', 'optical_rotation', 'ir', 'compound_class'):
+            val = getattr(args, key, None) or ''
+            if val:
+                meta[key.replace('_', ' ').upper()] = val
+        write_assignment_xlsx(derive_rows, xlsx_path)
+        write_assignment_meta(meta_path, meta)
         print(f"  输出: {csv_path}", file=sys.stderr)
         print(f"  输出: {xlsx_path}", file=sys.stderr)
+        if meta:
+            print(f"  输出: {meta_path}", file=sys.stderr)
 
         # 统计
         n_cosy = sum(1 for r in derive_rows if r.cosy_partners)
@@ -541,6 +600,57 @@ def main(argv=None):
         print(f"  统计: 季碳={n_cq}, COSY非空={n_cosy}, "
               f"HMBC非空={n_hmbc}, ROESY非空={n_roesy}", file=sys.stderr)
         print(f"[Derive] 归属表推导完成.", file=sys.stderr)
+
+    # 已知化合物复核: derive 完成后, 用 SMILES (仅复核用) + 标准归属表做对比
+    # 重要: SMILES 不参与推导过程, 仅在结果复核阶段用于化合物结构判等
+    if known_table_path and args.derive:
+        derive_xlsx_path = xlsx_path  # derive_归属表/assignment_table.xlsx
+        derive_meta_path = meta_path  # derive_归属表/meta.txt
+        if os.path.isfile(derive_xlsx_path):
+            print(f"[复核] 检测到已知化合物, 开始对比标准归属表 ...", file=sys.stderr)
+            try:
+                std_table = _read_standard_assignment_table(
+                    known_table_path, known_smiles=known_smiles,
+                )
+                comparison = _compare_program_to_standard(
+                    derive_xlsx_path, std_table,
+                    prog_meta_path=derive_meta_path,
+                    c_tol=args.known_c_tol, h_tol=args.known_h_tol,
+                    use_smiles=bool(known_smiles),
+                    type_placeholder_ok=True,
+                )
+                # 写出匹配 xlsx + 报告 (到 derive_归属表/ 目录, 与程序 xlsx 同级)
+                matched_xlsx = os.path.join(
+                    os.path.dirname(derive_xlsx_path),
+                    'assignment_table_joint.xlsx',
+                )
+                comparison_txt = os.path.join(
+                    os.path.dirname(derive_xlsx_path),
+                    'comparison_report.txt',
+                )
+                try:
+                    # 双 sheet 拼接表: '按标准表为准' + '按程序表为准'
+                    _write_joint_xlsx(
+                        derive_xlsx_path, std_table, comparison, matched_xlsx,
+                    )
+                    _write_comparison_report(
+                        comparison_txt, derive_xlsx_path, std_table, comparison,
+                        c_tol=args.known_c_tol, h_tol=args.known_h_tol,
+                        prog_meta_path=derive_meta_path,
+                    )
+                    print(f"  -> 拼接表 (双sheet): {matched_xlsx}", file=sys.stderr)
+                    print(f"  -> 对比报告: {comparison_txt}", file=sys.stderr)
+                except Exception as ex:
+                    print(f"  WARN: 复核文件写入失败: {ex}", file=sys.stderr)
+                print(f"  -> 匹配率: {comparison.match_rate:.1f}% "
+                      f"({len(comparison.matches)}/{max(comparison.n_prog, comparison.n_std)})",
+                      file=sys.stderr)
+                print(f"  -> 判定: {comparison.verdict}", file=sys.stderr)
+                if comparison.smiles_equal is not None:
+                    eq_str = '一致' if comparison.smiles_equal else '不一致'
+                    print(f"  -> SMILES 结构判等: {eq_str}", file=sys.stderr)
+            except Exception as ex:
+                print(f"WARN: 已知化合物复核失败: {ex}", file=sys.stderr)
 
     # derive 完成后默认结束 (不进入检索); 仅当 --retrieve 或 --no-derive 时才继续检索
     if args.derive and not args.retrieve:

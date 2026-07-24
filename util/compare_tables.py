@@ -8,11 +8,18 @@
 默认仅比较 NMR 归属表, 不进行化合物结构判等.
 行序可以不同, 列数/元信息行数/表头位置均可自适应.
 
+默认行为 (变更):
+  在程序输出的归属表 xlsx 同目录下另存为两个文件:
+    - assignment_table_matched.xlsx  (复制原表 + 新增 "化学家No." 列, 未匹配填 "—")
+    - comparison_report.txt          (文本报告, 含综合结论与匹配明细)
+
 用法:
     python compare_tables.py
     python compare_tables.py --prog /path/to/output.xlsx
     python compare_tables.py --ref /path/to/reference.xlsx
     python compare_tables.py --smiles    # 额外启用 SMILES 结构判等
+    python compare_tables.py --no-write  # 仅打印到 stdout, 不写文件
+    python compare_tables.py --in-place  # 原地修改原 xlsx (不开新文件)
 """
 
 import re
@@ -113,10 +120,13 @@ def _normalize_type(t) -> str:
     return s.upper()
 
 
-def load_table(filepath: str | Path) -> tuple[pd.DataFrame, str | None]:
-    """加载归属表 xlsx, 返回 (数据 DataFrame, SMILES 或 None).
+def load_table(filepath: str | Path) -> tuple[pd.DataFrame, str | None, int]:
+    """加载归属表 xlsx, 返回 (数据 DataFrame, SMILES 或 None, 表头所在行号).
 
     自适应: 表头位置 / 列数 / 列序 / 元信息行数.
+
+    DataFrame 中每行附带 '_xlsx_row' 列, 表示该行在原 xlsx 中的实际行号
+    (从 1 开始, 用于后续写回原文件时定位).
     """
     raw = pd.read_excel(filepath, header=None)
     header_idx = _find_header_row(raw)
@@ -126,11 +136,13 @@ def load_table(filepath: str | Path) -> tuple[pd.DataFrame, str | None]:
     if 'No' not in col_map or '13C' not in col_map:
         raise ValueError(f'表头缺少必要列 (No/13C), 实际识别到: {list(col_map.keys())}')
 
-    # 取表头下方的数据行
-    data = raw.iloc[header_idx + 1:].reset_index(drop=True)
+    # 取表头下方的数据行 (记录原 xlsx 行号 = header_idx + 1 + 局部行号, header_idx 本身 0-based, xlsx 行号从 1 开始)
+    data = raw.iloc[header_idx + 1:].reset_index(drop=True).copy()
+    data['_xlsx_row'] = data.index + header_idx + 2  # +2 = +1 表头行偏移, +1 1-based
 
     # 按映射提取列
     result = pd.DataFrame()
+    result['_xlsx_row'] = data['_xlsx_row']
     result['No'] = data.iloc[:, col_map['No']]
     result['13C_raw'] = data.iloc[:, col_map['13C']]
     result['Types'] = (data.iloc[:, col_map['Types']]
@@ -150,7 +162,7 @@ def load_table(filepath: str | Path) -> tuple[pd.DataFrame, str | None]:
     result['1H_shift'] = result['1H_raw'].apply(_extract_1h_shift)
     result['Type_norm'] = result['Types'].apply(_normalize_type)
 
-    return result.reset_index(drop=True), smiles
+    return result.reset_index(drop=True), smiles, header_idx
 
 
 # ============ 联合匹配 ============
@@ -255,6 +267,360 @@ def print_section(title: str):
     print('=' * 80)
 
 
+# ============ 写回 xlsx 与报告 ============
+
+def write_matched_xlsx(src_path: Path, dst_path: Path,
+                       header_row_1based: int,
+                       prog_to_ref_no: dict[int, str],
+                       placeholder: str = '—') -> None:
+    """在原程序输出 xlsx 基础上加一列 "化学家No.", 另存为 dst_path.
+
+    参数:
+        src_path: 原 xlsx 路径
+        dst_path: 输出 xlsx 路径
+        header_row_1based: 原 xlsx 中表头所在行号 (1-based)
+        prog_to_ref_no: 程序输出行号 (1-based) → 化学家归属表 No 值的映射.
+                        未匹配的行不在 dict 中, 在写入时填 placeholder.
+    """
+    from openpyxl import load_workbook
+
+    wb = load_workbook(src_path)
+    ws = wb.active
+
+    new_col = ws.max_column + 1
+    # 表头行 (header_row_1based) 写列名
+    ws.cell(row=header_row_1based, column=new_col, value='化学家No.')
+
+    # 数据行: 从 header_row_1based + 1 开始, 写到 ws.max_row
+    for r in range(header_row_1based + 1, ws.max_row + 1):
+        # 只填充被 load_table 识别为数据行的行 (即 prog_to_ref_no 键或
+        # 实际是 df_prog['_xlsx_row'] 的取值集合). 未匹配行不写入映射
+        # 时也写入 placeholder, 保持行序对齐.
+        if r in prog_to_ref_no:
+            ws.cell(row=r, column=new_col, value=prog_to_ref_no[r])
+        else:
+            # 判断是否为空行/注释行 (与 load_table 过滤逻辑一致):
+            # No. 列为空 或 以 No 开头 或 包含 NMR/ppm/归属 等则跳过
+            no_val = ws.cell(row=r, column=1).value
+            c13_val = ws.cell(row=r, column=2).value
+            if no_val is None or str(no_val).strip().startswith('No') \
+                    or (c13_val is not None and 'NMR' in str(c13_val)):
+                # 元信息行 / 注释行: 不填任何东西
+                continue
+            ws.cell(row=r, column=new_col, value=placeholder)
+
+    wb.save(dst_path)
+
+
+def write_joint_xlsx(prog_path: Path, ref_path: Path,
+                     df_prog: pd.DataFrame, df_ref: pd.DataFrame,
+                     matches: list,
+                     out_path: Path,
+                     placeholder: str = '—') -> None:
+    """生成双 sheet 的左右拼接 xlsx. 取代旧的 write_matched_xlsx(单 sheet).
+
+    Sheet 1 '按标准表为准': 每行 = df_ref 的一行, 匹配上的 df_prog 行接右侧.
+    Sheet 2 '按程序表为准': 每行 = df_prog 的一行, 匹配上的 df_ref 行接右侧.
+
+    参数:
+        prog_path: 程序输出 xlsx (提供列定义 / 原始数据)
+        ref_path:  标准/参考 xlsx (提供列定义 / 原始数据)
+        df_prog:   load_table(prog_path) 的结果 DataFrame (供快速定位原 xlsx_row)
+        df_ref:    load_table(ref_path) 的结果 DataFrame
+        matches:   joint_match() 返回的 matches 列表
+        out_path:  输出 xlsx 路径
+        placeholder: 未匹配单元格的占位符
+    """
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, Border, Side
+
+    thin = Side(style='thin', color='CCCCCC')
+    border = Border(top=thin, bottom=thin, left=thin, right=thin)
+    bold = Font(bold=True)
+    sep_marker = '拼接'
+    diff_cols = ['ΔdC (ppm)', 'ΔdH (ppm)', '类型一致']
+
+    # 读取程序 xlsx (源)
+    src_wb = load_workbook(str(prog_path), data_only=True)
+    src_ws = src_wb.active
+    prog_header_row = _find_header_row(pd.read_excel(prog_path, header=None)) + 1
+    prog_col_count = src_ws.max_column
+    prog_headers = [
+        (str(src_ws.cell(row=prog_header_row, column=c).value or '').strip()
+         or f'col{c}')
+        for c in range(1, prog_col_count + 1)
+    ]
+    # 程序逐行原始数据 (仅保留 load_table 识别的数据行)
+    prog_row_xlsx_ids: list[int] = []
+    prog_rows_raw: list[list] = []
+    for xrow in df_prog['_xlsx_row'].tolist():
+        row = [src_ws.cell(row=int(xrow), column=c).value
+               for c in range(1, prog_col_count + 1)]
+        prog_row_xlsx_ids.append(int(xrow))
+        prog_rows_raw.append(row)
+    src_wb.close()
+
+    # 读取标准 xlsx (源)
+    ref_wb = load_workbook(str(ref_path), data_only=True)
+    ref_ws = ref_wb.active
+    ref_header_row = _find_header_row(pd.read_excel(ref_path, header=None)) + 1
+    ref_col_count = ref_ws.max_column
+    ref_headers = [
+        (str(ref_ws.cell(row=ref_header_row, column=c).value or '').strip()
+         or f'col{c}')
+        for c in range(1, ref_col_count + 1)
+    ]
+    ref_row_raw_by_xrow: dict[int, list] = {}
+    for xrow in df_ref['_xlsx_row'].tolist():
+        ref_row_raw_by_xrow[int(xrow)] = [
+            ref_ws.cell(row=int(xrow), column=c).value
+            for c in range(1, ref_col_count + 1)
+        ]
+    ref_wb.close()
+
+    # 映射: (1) ref No. → (prog row raw, cd, hd, ok) (2) prog xrow → (ref row raw, cd, hd, ok)
+    # matches 元素: (r1, r2, c_diff, h_diff, type_ok) 其中 r1=prog, r2=ref
+    ref_no_to_match: dict[str, tuple] = {}
+    for r1, r2, cd, hd, ok in matches:
+        ref_no = str(r2['No']).strip()
+        if ref_no in ('', '.', 'None'):
+            continue
+        try:
+            pidx = prog_row_xlsx_ids.index(int(r1['_xlsx_row']))
+            prog_raw = prog_rows_raw[pidx]
+        except ValueError:
+            prog_raw = None
+        ref_no_to_match[ref_no] = (prog_raw, cd, hd, ok)
+
+    prog_xrow_to_match: dict[int, tuple] = {}
+    for r1, r2, cd, hd, ok in matches:
+        ref_raw = ref_row_raw_by_xrow.get(int(r2['_xlsx_row']))
+        prog_xrow_to_match[int(r1['_xlsx_row'])] = (ref_raw, cd, hd, ok)
+
+    wb = Workbook()
+
+    # ===== Sheet 1: 按标准表为准 =====
+    ws1 = wb.active
+    ws1.title = '按标准表为准'
+    headers1 = ref_headers + [sep_marker] + prog_headers + diff_cols
+    for c, h in enumerate(headers1, 1):
+        cell = ws1.cell(row=1, column=c, value=h)
+        cell.font = bold
+        cell.border = border
+    # 逐行: 标准表为基
+    for i, (_, row) in enumerate(df_ref.iterrows()):
+        row_num = i + 2
+        ref_xrow = int(row['_xlsx_row'])
+        ref_raw = ref_row_raw_by_xrow.get(ref_xrow)
+        if ref_raw is not None:
+            for c, v in enumerate(ref_raw, 1):
+                ws1.cell(row=row_num, column=c, value=v)
+        sep_col = len(ref_headers) + 1
+        ws1.cell(row=row_num, column=sep_col, value='|')
+        match = ref_no_to_match.get(str(row['No']).strip())
+        right_offset = sep_col
+        if match is not None:
+            prog_raw, cd, hd, ok = match
+            if prog_raw is not None:
+                for c_off, v in enumerate(prog_raw):
+                    ws1.cell(row=row_num, column=right_offset + 1 + c_off, value=v)
+            dc_col = right_offset + len(prog_headers) + 1
+            ws1.cell(row=row_num, column=dc_col,
+                     value=f'{cd:.2f}' if cd is not None else '')
+            ws1.cell(row=row_num, column=dc_col + 1,
+                     value=f'{hd:.3f}' if hd is not None else '')
+            ws1.cell(row=row_num, column=dc_col + 2,
+                     value='OK' if ok else 'DIFF')
+        else:
+            for c_off in range(len(prog_headers) + len(diff_cols)):
+                ws1.cell(row=row_num, column=right_offset + 1 + c_off,
+                         value=placeholder)
+
+    # ===== Sheet 2: 按程序表为准 =====
+    ws2 = wb.create_sheet('按程序表为准')
+    headers2 = prog_headers + [sep_marker] + ref_headers + diff_cols
+    for c, h in enumerate(headers2, 1):
+        cell = ws2.cell(row=1, column=c, value=h)
+        cell.font = bold
+        cell.border = border
+    for i, (_, row) in enumerate(df_prog.iterrows()):
+        row_num = i + 2
+        prog_xrow = int(row['_xlsx_row'])
+        idx = prog_row_xlsx_ids.index(prog_xrow) if prog_xrow in prog_row_xlsx_ids else i
+        prog_raw = prog_rows_raw[idx]
+        for c, v in enumerate(prog_raw, 1):
+            ws2.cell(row=row_num, column=c, value=v)
+        sep_col = len(prog_headers) + 1
+        ws2.cell(row=row_num, column=sep_col, value='|')
+        match = prog_xrow_to_match.get(prog_xrow)
+        right_offset = sep_col
+        if match is not None:
+            ref_raw, cd, hd, ok = match
+            if ref_raw is not None:
+                for c_off, v in enumerate(ref_raw):
+                    ws2.cell(row=row_num, column=right_offset + 1 + c_off, value=v)
+            dc_col = right_offset + len(ref_headers) + 1
+            ws2.cell(row=row_num, column=dc_col,
+                     value=f'{cd:.2f}' if cd is not None else '')
+            ws2.cell(row=row_num, column=dc_col + 1,
+                     value=f'{hd:.3f}' if hd is not None else '')
+            ws2.cell(row=row_num, column=dc_col + 2,
+                     value='OK' if ok else 'DIFF')
+        else:
+            for c_off in range(len(ref_headers) + len(diff_cols)):
+                ws2.cell(row=row_num, column=right_offset + 1 + c_off,
+                         value=placeholder)
+
+    for ws in (ws1, ws2):
+        for c in range(1, ws.max_column + 1):
+            col_letter = ws.cell(row=1, column=c).column_letter
+            ws.column_dimensions[col_letter].width = 14
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(out_path))
+
+
+def write_report(dst_path: Path, lines: list[str]) -> None:
+    """把报告行写入文件 (UTF-8)."""
+    dst_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+def build_report_lines(file_prog: Path, file_ref: Path,
+                       df_prog: pd.DataFrame, df_ref: pd.DataFrame,
+                       smiles_prog: str | None, smiles_ref: str | None,
+                       known_smiles: str | None,
+                       use_smiles: bool,
+                       matches: list, unmatched_prog: pd.DataFrame,
+                       unmatched_ref: pd.DataFrame,
+                       type_mismatches: list) -> tuple[list[str], str, str, dict]:
+    """构造报告文本行, 同时返回判定与匹配率信息.
+
+    Returns: (lines, verdict, match_rate_str, prog_to_ref_no)
+    """
+    n_prog_c = df_prog['13C_num'].notna().sum()
+    n_ref_c = df_ref['13C_num'].notna().sum()
+    n_prog_h = df_prog['1H_shift'].notna().sum()
+    n_ref_h = df_ref['1H_shift'].notna().sum()
+
+    max_rows = max(len(df_prog), len(df_ref))
+    match_rate = len(matches) / max_rows * 100 if max_rows > 0 else 0
+    c13_matched_with_c = sum(1 for _, _, cd, _, _ in matches if cd is not None)
+
+    # 构造 prog_xlsx_row -> ref No. 映射
+    # 过滤 No='.' 等异常空行 (这些不是真实归属编号)
+    prog_to_ref_no: dict[int, str] = {}
+    for r1, r2, cd, hd, ok in matches:
+        prog_xlsx_row = int(r1['_xlsx_row'])
+        ref_no_str = str(r2['No']).strip()
+        if ref_no_str in ('', '.', 'None'):
+            # 异常空行 → 当作未匹配
+            continue
+        prog_to_ref_no[prog_xlsx_row] = ref_no_str
+
+    lines: list[str] = []
+    lines.append('=' * 80)
+    lines.append('  归属表化合物结构一致性对比报告')
+    lines.append('=' * 80)
+    lines.append(f'程序输出: {file_prog}')
+    lines.append(f'真实结构: {file_ref}')
+    lines.append(f'生成时间: {pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    lines.append('')
+
+    # ---- 【1】化合物结构信息 ----
+    lines.append('-' * 80)
+    lines.append('【1】化合物结构信息')
+    lines.append('-' * 80)
+    if known_smiles:
+        lines.append(f'  真实结构 SMILES: {known_smiles}')
+    else:
+        lines.append('  真实结构 SMILES: (未提供)')
+    if smiles_prog:
+        lines.append(f'  程序输出 SMILES: {smiles_prog}')
+    else:
+        lines.append('  程序输出 SMILES: (未包含)')
+    if use_smiles:
+        from rdkit import Chem
+        can_eq = None
+        try:
+            if known_smiles and smiles_prog:
+                mk = Chem.MolFromSmiles(known_smiles)
+                mp = Chem.MolFromSmiles(smiles_prog)
+                if mk and mp:
+                    can_eq = (Chem.MolToSmiles(mk) == Chem.MolToSmiles(mp))
+                    lines.append(f'  RDKit canonical SMILES: 一致={can_eq}')
+                    if not can_eq:
+                        lines.append(f'  InChIKey 真实: {Chem.inchi.MolToInchiKey(mk)}')
+                        lines.append(f'  InChIKey 程序: {Chem.inchi.MolToInchiKey(mp)}')
+        except ImportError:
+            lines.append('  (RDKit 未安装, 跳过结构判等)')
+    else:
+        lines.append('  SMILES 结构判等: 未启用 (传 --smiles 启用)')
+    lines.append('')
+
+    # ---- 【2】逐行联合匹配 ----
+    lines.append('-' * 80)
+    lines.append(f'【2】逐行联合匹配 (13C ±{C13_TOLERANCE} ppm, 1H ±{H1_TOLERANCE} ppm, 碳类型)')
+    lines.append('-' * 80)
+    lines.append(f'  程序输出: {len(df_prog)} 行 ({n_prog_c} 个 13C, {n_prog_h} 个 1H)')
+    lines.append(f'  真实结构: {len(df_ref)} 行 ({n_ref_c} 个 13C, {n_ref_h} 个 1H)')
+    lines.append(f'  成功匹配: {len(matches)} 对')
+    lines.append(f'  碳类型不一致: {len(type_mismatches)}/{len(matches)}')
+    lines.append('')
+    if matches:
+        lines.append(f"  {'程序No':>10} {'程序13C':>8} {'程序Type':>8} {'程序1H':>7}"
+                     f" | {'真实No':>10} {'真实13C':>8} {'真实Type':>8} {'真实1H':>7}"
+                     f" | {'dC':>5} {'dH':>5} {'类型':>4}")
+        lines.append('  ' + '-' * 100)
+        for r1, r2, cd, hd, ok in sorted(matches, key=lambda x: -(x[2] or 0)):
+            c1 = f"{r1['13C_num']:.1f}" if pd.notna(r1['13C_num']) else '-'
+            c2 = f"{r2['13C_num']:.1f}" if pd.notna(r2['13C_num']) else '-'
+            h1 = f"{r1['1H_shift']:.2f}" if pd.notna(r1['1H_shift']) else '-'
+            h2 = f"{r2['1H_shift']:.2f}" if pd.notna(r2['1H_shift']) else '-'
+            cd_s = f'{cd:.2f}' if cd is not None else '-'
+            hd_s = f'{hd:.3f}' if hd is not None else '-'
+            flag = 'OK' if ok else 'DIFF'
+            lines.append(f"  {str(r1['No']):>10} {c1:>8} {r1['Type_norm']:>8} {h1:>7}"
+                         f" | {str(r2['No']):>10} {c2:>8} {r2['Type_norm']:>8} {h2:>7}"
+                         f" | {cd_s:>5} {hd_s:>5} {flag:>4}")
+    lines.append('')
+
+    if len(unmatched_prog) > 0:
+        lines.append(f'  --- 程序输出中未匹配 ({len(unmatched_prog)} 行) ---')
+        for _, row in unmatched_prog.iterrows():
+            c = f"13C={row['13C_num']:.1f}" if pd.notna(row['13C_num']) else '13C=-'
+            h = f"1H={row['1H_shift']:.2f}" if pd.notna(row['1H_shift']) else '1H=-'
+            lines.append(f"    {str(row['No']):>10}  {c}  {row['Type_norm']:>4}  {h}")
+        lines.append('')
+    if len(unmatched_ref) > 0:
+        lines.append(f'  --- 真实结构中未匹配 ({len(unmatched_ref)} 行) ---')
+        for _, row in unmatched_ref.iterrows():
+            c = f"13C={row['13C_num']:.1f}" if pd.notna(row['13C_num']) else '13C=-'
+            h = f"1H={row['1H_shift']:.2f}" if pd.notna(row['1H_shift']) else '1H=-'
+            lines.append(f"    {str(row['No']):>10}  {c}  {row['Type_norm']:>4}  {h}")
+        lines.append('')
+
+    # ---- 【3】综合结论 ----
+    lines.append('-' * 80)
+    lines.append('【3】综合结论')
+    lines.append('-' * 80)
+    lines.append(f'  总行匹配率: {len(matches)}/{max_rows} = {match_rate:.1f}%')
+    lines.append(f'  13C 匹配对数: {c13_matched_with_c} (程序 {n_prog_c} vs 真实 {n_ref_c})')
+    lines.append(f'  碳类型不一致: {len(type_mismatches)}/{len(matches)}')
+    lines.append('')
+    if match_rate >= 80 and len(type_mismatches) == 0:
+        verdict = '一致 ✓ — 两个归属表代表同一化合物'
+    elif match_rate >= 60:
+        verdict = '部分一致 △ — 可能同一化合物但归属有差异'
+    else:
+        verdict = '不一致 ✗ — 两个归属表代表不同化合物'
+    lines.append(f'  判定结果: {verdict}')
+    lines.append('')
+    lines.append('=' * 80)
+
+    match_rate_str = f'{len(matches)}/{max_rows} = {match_rate:.1f}%'
+    return lines, verdict, match_rate_str, prog_to_ref_no
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='归属表化合物结构一致性对比')
@@ -262,6 +628,10 @@ def main():
     parser.add_argument('--ref', default=None, help='真实结构 xlsx 路径')
     parser.add_argument('--smiles', action='store_true',
                         help='启用 SMILES 结构判等 (默认仅做 NMR 归属表比较)')
+    parser.add_argument('--no-write', action='store_true',
+                        help='仅打印到 stdout, 不写文件')
+    parser.add_argument('--in-place', action='store_true',
+                        help='原地修改原 xlsx (不开新文件, 会覆盖原 assignment_table.xlsx)')
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent
@@ -276,8 +646,8 @@ def main():
         return
 
     # 加载
-    df_prog, smiles_prog = load_table(file_prog)
-    df_ref, smiles_ref = load_table(file_ref)
+    df_prog, smiles_prog, header_idx_prog = load_table(file_prog)
+    df_ref, smiles_ref, _ = load_table(file_ref)
 
     print(f'程序输出: {file_prog.name} ({len(df_prog)} 行)')
     print(f'真实结构: {file_ref.name} ({len(df_ref)} 行)')
@@ -410,6 +780,44 @@ def main():
 
     print(f'  判定结果: {verdict}')
     print()
+
+    # ---- 写文件 (默认行为) ----
+    if args.no_write:
+        return
+
+    # 构造报告行 + prog_to_ref_no 映射 (复用 main 中已有结果)
+    lines, _, _, prog_to_ref_no = build_report_lines(
+        file_prog=file_prog, file_ref=file_ref,
+        df_prog=df_prog, df_ref=df_ref,
+        smiles_prog=smiles_prog, smiles_ref=smiles_ref,
+        known_smiles=known_smiles, use_smiles=args.smiles,
+        matches=matches, unmatched_prog=unmatched_prog,
+        unmatched_ref=unmatched_ref, type_mismatches=type_mismatches)
+
+    out_dir = file_prog.parent
+    if args.in_place:
+        dst_xlsx = file_prog
+    else:
+        dst_xlsx = out_dir / (file_prog.stem + '_matched.xlsx')
+    report_path = out_dir / 'comparison_report.txt'
+
+    try:
+        write_joint_xlsx(
+            prog_path=file_prog,
+            ref_path=file_ref,
+            df_prog=df_prog, df_ref=df_ref,
+            matches=matches,
+            out_path=dst_xlsx,
+        )
+        write_report(report_path, lines)
+        print('=' * 80)
+        print(f'  已写入拼接 xlsx (双sheet): {dst_xlsx}')
+        print(f'    Sheet 1: 按标准表为准 (以标准为基, 行 {len(df_ref)} 行)')
+        print(f'    Sheet 2: 按程序表为准 (以程序为基, 行 {len(df_prog)} 行)')
+        print(f'  已写入报告:   {report_path}')
+        print('=' * 80)
+    except Exception as e:
+        print(f'写入文件失败: {e}')
 
 
 if __name__ == '__main__':

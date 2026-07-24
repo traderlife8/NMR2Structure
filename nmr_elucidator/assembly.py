@@ -136,8 +136,8 @@ def assemble_assignment_table(
 
                 rows.append(AssignmentRow(
                     label=label,
-                    c_ppm=round(c_ppm, 1) if si == 0 else None,  # 仅首行显示 dC
-                    carbon_type=mult if si == 0 else '',
+                    c_ppm=round(c_ppm, 1),
+                    carbon_type=mult,
                     h_ppm=round(pair.h_ppm, 2),
                     h_mult=h_mult_str,
                     h_j=list(pair.j_couplings) if hasattr(pair, 'j_couplings') else [],
@@ -337,15 +337,15 @@ def write_assignment_csv(rows: List[AssignmentRow], path: str) -> None:
             ])
 
 
-def write_assignment_xlsx(rows: List[AssignmentRow], path: str,
-                          meta_lines: Optional[List[Tuple[str, str]]] = None) -> None:
-    """写出归属表 XLSX (化学家格式, 加粗/边框).
+def write_assignment_xlsx(rows: List[AssignmentRow], path: str) -> None:
+    """写出归属表 XLSX (化学家 Excel 格式: 表头 + 数据行).
 
-    meta_lines: 顶部元信息行 [(key, value), ...] 如 [('HRESIMS', '[M+Na]+ 647.3407')]
+    **不写任何顶部元信息行** (Solvent / Formula / HRESIMS 等另行写到 meta.txt).
+    与化学家手工 Excel 格式完全一致 (第 1 行表头, 后续数据行).
     """
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, Border, Side, Alignment
+        from openpyxl.styles import Font, Border, Side
     except ImportError:
         # openpyxl 未装, 回退到 CSV
         write_assignment_csv(rows, path.replace('.xlsx', '.csv'))
@@ -360,26 +360,16 @@ def write_assignment_xlsx(rows: List[AssignmentRow], path: str,
     border = Border(top=thin, bottom=thin, left=thin, right=thin)
     bold = Font(bold=True)
 
-    row_num = 1
-
-    # 元信息行
-    if meta_lines:
-        for key, val in meta_lines:
-            ws.cell(row=row_num, column=6, value=key).font = bold
-            ws.cell(row=row_num, column=7, value=val)
-            row_num += 1
-        row_num += 1  # 空行
-
-    # 表头
+    # 表头 (第 1 行, 化学家 Excel 格式)
     headers = ['No.', '13C NMR', 'Types', '1H NMR (mult., J in Hz)',
                '1H-1H COSY', 'HMBC', 'ROESY']
     for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=row_num, column=col, value=h)
+        cell = ws.cell(row=1, column=col, value=h)
         cell.font = bold
         cell.border = border
-    row_num += 1
 
-    # 数据行
+    # 数据行 (从第 2 行开始)
+    row_num = 2
     for arow in rows:
         h_str = ''
         if arow.h_ppm is not None:
@@ -405,3 +395,31 @@ def write_assignment_xlsx(rows: List[AssignmentRow], path: str,
         ws.column_dimensions[chr(64 + i)].width = w
 
     wb.save(path)
+
+
+def write_assignment_meta(path: str,
+                          meta: Optional[Dict[str, str]] = None) -> None:
+    """写出归属表元信息到独立 .txt 文件 (UTF-8).
+
+    用于存放 Solvent / Formula / HRESIMS / [α] / IR / Field_MHz 等元信息.
+    与化学家 Excel 表分开存放, 便于手工修改 + 程序读取.
+
+    Args:
+        path: meta.txt 输出路径
+        meta: 字典, key 为字段名 (Solvent / Formula / HRESIMS 等), value 为字符串值.
+              字段顺序按字典插入顺序输出 (Python 3.7+ 字典有序保证).
+    """
+    if meta is None:
+        meta = {}
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    lines = []
+    lines.append('# NMR 归属表元信息 (与 assignment_table.xlsx 分离存放)')
+    lines.append('# 生成时间: ' + __import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    lines.append('')
+    if not meta:
+        lines.append('(无元信息)')
+    else:
+        for key, val in meta.items():
+            lines.append(f'{key}: {val}')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
