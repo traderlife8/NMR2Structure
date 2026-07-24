@@ -2,13 +2,14 @@
 
 用法:
     python -m nmr_elucidator --folder <原始数据/<sample>>
-                             [--sdf <SDF path>] [--formula <分子式>]
-                             [--top-n 10] [--no-derive] [--no-2d]
+                             [--db <数据库目录>] [--formula <分子式>]
+                             [--top-n 10] [--retrieve] [--no-derive] [--no-2d]
 
 默认行为:
     - 启用 --derive (从谱图直接推导归属表) 和 --use-2d (自动检测 2D 数据)
+    - 默认仅推导, 不进入候选检索/打分 (加 --retrieve 继续检索)
     - 不强制 --formula (适用于未知化合物)
-    - 不强制 --sdf (derive 模式无需数据库; 候选检索时提供)
+    - --db 默认为 NMR2Structure 外层平级 data/ 目录
     - 程序内部强制 UTF-8 编码, 无需 python -X utf8
 """
 from __future__ import annotations
@@ -267,6 +268,11 @@ def main(argv=None):
                              '默认: 本地库无命中时自动触发')
     parser.add_argument('--no-pubchem', action='store_true',
                         help='禁用 PubChem 扩展检索 (即使本地库无命中也不联网)')
+    parser.add_argument('--use-coconut', action='store_true', default=None,
+                        help='强制启用 COCONUT (开放天然产物库, 69.5万+ NP 结构) 联网检索. '
+                             '默认: 本地库无命中时自动触发 (天然产物类样本优先)')
+    parser.add_argument('--no-coconut', action='store_true',
+                        help='禁用 COCONUT 检索 (即使本地库无命中也不联网)')
     parser.add_argument('--use-fragment-assembly', action='store_true',
                         help='启用片段组装候选生成 (库外新骨架)')
     parser.add_argument('--use-2d', action='store_true', default=True,
@@ -278,7 +284,9 @@ def main(argv=None):
                         help='从谱图数据直接推导归属表 '
                              '(不依赖候选检索/打分, 仅用 HSQC/COSY/HMBC/ROESY; 默认开启)')
     parser.add_argument('--no-derive', action='store_true', default=False,
-                        help='禁用 derive 模式, 走候选检索+打分流程')
+                        help='禁用 derive 模式, 直接走候选检索+打分流程')
+    parser.add_argument('--retrieve', action='store_true', default=False,
+                        help='derive 完成后继续执行候选检索+打分 (默认仅推导不检索)')
     parser.add_argument('--determine', action='store_true',
                         help='输出结构推断结论 (含置信度分级)')
     parser.add_argument('--hose-cache', default=None,
@@ -534,7 +542,13 @@ def main(argv=None):
               f"HMBC非空={n_hmbc}, ROESY非空={n_roesy}", file=sys.stderr)
         print(f"[Derive] 归属表推导完成.", file=sys.stderr)
 
-    # 3. 候选检索 (derive 完成后自动串联; 无数据库时跳过)
+    # derive 完成后默认结束 (不进入检索); 仅当 --retrieve 或 --no-derive 时才继续检索
+    if args.derive and not args.retrieve:
+        print(f"DONE. 归属表已输出. 提示: 加 --retrieve 可继续候选检索+打分.",
+              file=sys.stderr)
+        return 0
+
+    # 3. 候选检索 (--retrieve 或 --no-derive 时执行)
     if not sdf_path and not lucy_ng_path:
         print(f"[3] 跳过候选检索 (未发现数据库). "
               f"提示: 用 --db 指定数据库目录", file=sys.stderr)
@@ -676,10 +690,89 @@ def main(argv=None):
             print(f"WARN: lucy-ng 检索失败: {ex}", file=sys.stderr)
 
     if not hits:
-        # 本地库无命中 → 自动扩大到 PubChem (需联网)
+        # 本地库无命中 → 自动扩大到联网数据库
+        # 顺序: COCONUT (天然产物专属, 69.5万+ NP) → PubChem (通用兑底, 1亿+)
+        from .retrieve import RetrievalHit as _RH
+
+        def _hits_from_online(candidates, source_tag: str):
+            """将联网库候选 (COCONUT/PubChem) 转为 RetrievalHit 列表."""
+            out = []
+            for cand in candidates:
+                mock_entry = type('Entry', (), {})()
+                mock_entry.canonical_smiles = cand.smiles
+                mock_entry.smiles = cand.smiles
+                mock_entry.inchi = None
+                mock_entry.inchi_key = None
+                mock_entry.inchikey = None
+                mock_entry.mol_block = ''
+                mock_entry.spectrum_13c = []
+                mock_entry.spectrum_1h = []
+                mock_entry.formula = cand.molecular_formula
+                mock_entry.heavy_atoms = cand.heavy_atom_count
+                mock_entry.rec_id = None
+                mock_entry.shiftdb2_id = None
+                mock_entry.source = source_tag
+                mock_entry.solvent = None
+                # 字段名按 source_tag 区分 (PubChem: cid; COCONUT: coconut_id)
+                if source_tag == 'pubchem':
+                    mock_entry.pubchem_cid = cand.cid
+                    mock_entry.iupac_name = cand.iupac_name
+                    mock_entry.extra_tags = {'source': 'pubchem', 'pubchem_cid': str(cand.cid)}
+                else:  # coconut
+                    mock_entry.coconut_id = cand.coconut_id
+                    mock_entry.iupac_name = cand.name
+                    mock_entry.extra_tags = {'source': 'coconut', 'coconut_id': str(cand.coconut_id)}
+                from rdkit import Chem as _Chem
+                def _make_mol(entry_self):
+                    try:
+                        return _Chem.MolFromSmiles(entry_self.smiles)
+                    except Exception:
+                        return None
+                mock_entry.mol = lambda e=mock_entry: _make_mol(e)
+                out.append(_RH(
+                    entry=mock_entry,
+                    c_match_count=0,
+                    c_total_obs=len(problem.carbon_shifts),
+                    c_total_lib=0,
+                    c_coverage=0.0,
+                    c_rms=99.0,
+                    h_match_count=0,
+                    h_total_obs=len(problem.proton_shifts),
+                    h_total_lib=0,
+                    h_coverage=0.0,
+                    h_rms=99.0,
+                    formula_ok=True,
+                    solvent_ok=True,
+                    heavy_atoms=cand.heavy_atom_count,
+                ))
+            return out
+
+        # 3c. COCONUT (天然产物专属, 69.5万+ NP 结构, 联网)
+        _coconut_auto = (not args.no_coconut)
+        if _coconut_auto:
+            print(f"[3c] 本地库无命中, 自动扩大到 COCONUT 检索 (天然产物, 联网) ...",
+                  file=sys.stderr)
+            try:
+                from .retrieve_coconut import retrieve_coconut_candidates
+                coconut_results = retrieve_coconut_candidates(
+                    formula=constraints.formula,
+                    c13_shifts=problem.carbon_shifts,
+                    max_results=50,
+                    quiet=args.quiet,
+                )
+                if coconut_results:
+                    print(f"  -> COCONUT 候选: {len(coconut_results)} 条", file=sys.stderr)
+                    hits.extend(_hits_from_online(coconut_results, 'coconut'))
+                else:
+                    print(f"  -> COCONUT 也无候选", file=sys.stderr)
+            except Exception as ex:
+                print(f"WARN: COCONUT 检索失败 (网络异常?): {ex}", file=sys.stderr)
+
+        # 3d. PubChem (通用兑底, 1亿+ 结构, 联网)
         _pubchem_auto = (not args.no_pubchem)
-        if _pubchem_auto:
-            print(f"[3c] 本地库无命中, 自动扩大到 PubChem 检索 (联网) ...", file=sys.stderr)
+        if _pubchem_auto and not hits:
+            print(f"[3d] 本地库+COCONUT 仍无命中, 自动扩大到 PubChem 检索 (联网) ...",
+                  file=sys.stderr)
             try:
                 from .retrieve_pubchem import retrieve_pubchem_candidates
                 pubchem_results = retrieve_pubchem_candidates(
@@ -690,52 +783,7 @@ def main(argv=None):
                 )
                 if pubchem_results:
                     print(f"  -> PubChem 候选: {len(pubchem_results)} 条", file=sys.stderr)
-                    # 将 PubChem 候选转为 RetrievalHit 兼容格式
-                    from .retrieve import RetrievalHit
-                    from .io_sdf import SpectrumSignal
-                    for pc in pubchem_results:
-                        mock_entry = type('Entry', (), {})()
-                        mock_entry.canonical_smiles = pc.smiles
-                        mock_entry.smiles = pc.smiles
-                        mock_entry.inchi = None
-                        mock_entry.inchi_key = None
-                        mock_entry.inchikey = None
-                        mock_entry.mol_block = ''
-                        mock_entry.spectrum_13c = []
-                        mock_entry.spectrum_1h = []
-                        mock_entry.formula = pc.molecular_formula
-                        mock_entry.heavy_atoms = pc.heavy_atom_count
-                        mock_entry.rec_id = None
-                        mock_entry.shiftdb2_id = None
-                        mock_entry.source = 'pubchem'
-                        mock_entry.solvent = None
-                        mock_entry.extra_tags = {'source': 'pubchem', 'pubchem_cid': str(pc.cid)}
-                        mock_entry.pubchem_cid = pc.cid
-                        mock_entry.iupac_name = pc.iupac_name
-                        from rdkit import Chem as _Chem
-                        def _make_mol_pc(entry_self):
-                            try:
-                                return _Chem.MolFromSmiles(entry_self.smiles)
-                            except Exception:
-                                return None
-                        mock_entry.mol = lambda e=mock_entry: _make_mol_pc(e)
-                        mock_hit = RetrievalHit(
-                            entry=mock_entry,
-                            c_match_count=0,
-                            c_total_obs=len(problem.carbon_shifts),
-                            c_total_lib=0,
-                            c_coverage=0.0,
-                            c_rms=99.0,
-                            h_match_count=0,
-                            h_total_obs=len(problem.proton_shifts),
-                            h_total_lib=0,
-                            h_coverage=0.0,
-                            h_rms=99.0,
-                            formula_ok=True,
-                            solvent_ok=True,
-                            heavy_atoms=pc.heavy_atom_count,
-                        )
-                        hits.append(mock_hit)
+                    hits.extend(_hits_from_online(pubchem_results, 'pubchem'))
                 else:
                     print(f"  -> PubChem 也无候选", file=sys.stderr)
             except Exception as ex:
@@ -869,11 +917,25 @@ def main(argv=None):
     else:
         print(f"[6] 跳过 HOSE 预测验证", file=sys.stderr)
 
-    # 7. PubChem 强制扩展检索 (--use-pubchem 显式传入时, 即使本地库有命中也检索)
-    # 注: 本地库无命中时的自动触发已在 step 3c 处理
+    # 7. COCONUT + PubChem 强制扩展检索 (--use-coconut/--use-pubchem 显式传入时执行)
+    # 注: 本地库无命中时的自动触发已在 step 3c/3d 处理
+    coconut_candidates = []
+    if args.use_coconut:
+        print(f"[7a] COCONUT 强制扩展检索 (--use-coconut) ...", file=sys.stderr)
+        try:
+            from .retrieve_coconut import retrieve_coconut_candidates
+            coconut_candidates = retrieve_coconut_candidates(
+                formula=constraints.formula,
+                c13_shifts=problem.carbon_shifts,
+                max_results=50,
+                quiet=args.quiet,
+            )
+            print(f"  -> COCONUT 候选: {len(coconut_candidates)} 条", file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: COCONUT 检索失败: {ex}", file=sys.stderr)
     pubchem_candidates = []
     if args.use_pubchem:
-        print(f"[7] PubChem 强制扩展检索 (--use-pubchem) ...", file=sys.stderr)
+        print(f"[7b] PubChem 强制扩展检索 (--use-pubchem) ...", file=sys.stderr)
         try:
             from .retrieve_pubchem import retrieve_pubchem_candidates
             pubchem_candidates = retrieve_pubchem_candidates(
@@ -885,8 +947,8 @@ def main(argv=None):
             print(f"  -> PubChem 候选: {len(pubchem_candidates)} 条", file=sys.stderr)
         except Exception as ex:
             print(f"WARN: PubChem 检索失败: {ex}", file=sys.stderr)
-    else:
-        print(f"[7] 跳过 PubChem 强制检索 (本地库已有命中或 --no-pubchem)", file=sys.stderr)
+    if not args.use_coconut and not args.use_pubchem:
+        print(f"[7] 跳过 COCONUT + PubChem 强制检索", file=sys.stderr)
 
     # 8. 片段组装（可选）
     fragment_candidates = []
@@ -1266,6 +1328,9 @@ def main(argv=None):
         'used_hose_source': 'lucy-ng-derep.db' if (args.use_hose and lucy_ng_path) else 'local-sdf',
         'used_pubchem': bool(args.use_pubchem) or any(
             getattr(h.entry, 'source', None) == 'pubchem' for h in hits
+        ),
+        'used_coconut': bool(args.use_coconut) or any(
+            getattr(h.entry, 'source', None) == 'coconut' for h in hits
         ),
         'used_fragment_assembly': bool(args.use_fragment_assembly),
         'used_2d': bool(args.use_2d and spectra_2d),

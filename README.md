@@ -90,14 +90,36 @@ pip install git+https://github.com/Ratsemaat/HOSE_code_generator.git --no-deps
 放置：`E:\NMR2Structure\data\nmrshiftdb2\nmrshiftdb2withsignals.sd`
 不需要下载：无信号的 `nmrshiftdb2.sd`、1.1 GB 的 SQL dump、`predictor*.jar`（Java 工具用不上）。
 
+## 未来升级: 天然产物专属数据库 (留待下载)
+
+以下两个数据库包含天然产物专属 NMR 位移数据，命中精度高于通用库，但需手工下载后集成:
+
+| 数据库 | 规模 | 位移类型 | 下载来源 | 预计体积 |
+|---|---|---|---|---|
+| **LOTUS+13C** | 21.8万 NP | ACD 预测 13C | Zenodo 搜 `LOTUS predicted 13C NMR Nuzillard` (文件名 `acd_lotusv9.sdf.zip`) | ~200-400 MB |
+| **NP-MRD** | 28万 NP, 550万谱 | 实验 13C/1H/J/2D | https://np-mrd.org/downloads → 2D Structures SDF (7卷) + Peaklist TXT (7卷) + Assignments CSV (453 KB) | ~510 MB |
+
+目标放置位置 (暂未实现自动发现):
+```
+data/lotus_13c/acd_lotusv9.sdf
+data/np-mrd/structures/
+data/np-mrd/peaklists/
+data/np-mrd/assignments.csv
+```
+
+计划升级: 下载后实现 `retrieve_lotus_13c.py` (复用现有 SDF 解析器) 和 `retrieve_npmrd.py` (解析 SDF + TXT + CSV), 接入检索级联 [3a-3b] 之间。
+
 ## 快速开始
 
 ```bash
 cd E:/NMR2Structure/NMR2Structure
-# 默认模式 (derive + 2D): 从谱图直接推导归属表, 无需数据库
+# 默认模式 (derive + 2D): 从谱图直接推导归属表, 不进入检索
 python -m nmr_elucidator --folder "E:/NMR2Structure/NMR/clxh100"
 
-# 候选检索模式: 禁用 derive, 走数据库检索+打分
+# 推导 + 检索: derive 完成后继续候选检索+打分
+python -m nmr_elucidator --folder "E:/NMR2Structure/NMR/clxh100" --retrieve
+
+# 纯检索模式: 跳过 derive, 直接走数据库检索+打分
 python -m nmr_elucidator --folder "E:/NMR2Structure/NMR/clxh3" --no-derive
 ```
 
@@ -112,15 +134,16 @@ python -m nmr_elucidator --folder <原始数据/<sample>> [选项...]
 ```
 
 默认行为:
-- `--derive` 开启: 从谱图直接推导归属表 (HSQC/COSY/HMBC/ROESY), 完成后自动串联候选检索
+- `--derive` 开启: 从谱图直接推导归属表 (HSQC/COSY/HMBC/ROESY), 默认仅推导不检索
 - `--use-2d` 开启: 自动检测 2D 数据, 无则回退 1D
 - `--formula` 不传: 适用于未知化合物
 - `--db` 默认: NMR2Structure 外层平级 `data/` 目录 (自动发现 nmrshiftdb2 + lucy-ng)
 - UTF-8 编码: 程序内部配置, 无需 `-X utf8`
 
-关闭默认: `--no-derive` (跳过归属表推导) / `--no-2d` (强制 1D)
+关闭默认: `--no-derive` (跳过推导, 直接检索) / `--no-2d` (强制 1D)
+开启检索: `--retrieve` (derive 后继续检索) / `--no-derive` (纯检索模式)
 
-检索级联: nmrshiftdb2 SDF → lucy-ng 928K → PubChem 1亿+ (本地无命中时自动联网, `--no-pubchem` 禁用)
+检索级联: nmrshiftdb2 SDF → lucy-ng 928K → COCONUT 69.5万 (本地无命中自动联网, `--no-coconut` 禁用) → PubChem 1亿+ (`--no-pubchem` 禁用)
 
 ### 辅助工具脚本（util/）
 
@@ -242,7 +265,7 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 - **目录**: 自动扫描 `nmrshiftdb2/nmrshiftdb2withsignals.sd` + `lucy-ng-derep_db/lucy-ng-derep.db`
 - **文件**: 按扩展名判断 (.sd → nmrshiftdb2, .db → lucy-ng)
 
-检索级联: nmrshiftdb2 SDF → lucy-ng 928K → PubChem 1亿+ (本地无命中时自动联网)
+检索级联: nmrshiftdb2 SDF → lucy-ng 928K → COCONUT 69.5万 (天然产物) → PubChem 1亿+ (本地无命中自动联网)
 
 ### 检索控制
 
@@ -273,6 +296,8 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 | `--use-hose` | HOSE code 13C 预测验证；**双数据源策略**：默认自动查找 `data/lucy-ng-derep_db/lucy-ng-derep.db` (928K 化合物, MAE ~3.5 ppm)；不存在时自动从 nmrshiftdb2 SDF 自建轻量本地表 (默认 50K, MAE ~5 ppm) | JSON/MD 报告里追加 `hose_verifications[]` + `meta.used_hose_source` (`lucy-ng-derep.db` 或 `local-sdf`) |
 | `--use-pubchem` | PubChem **强制**扩展检索：即使本地库有命中也联网检索 PubChem (1亿+ 化合物)。默认行为: 本地库无命中时自动触发, 无需此参数 | JSON/MD 报告里追加 `pubchem_candidates[]` 列表 |
 | `--no-pubchem` | 禁用 PubChem 检索 (即使本地库无命中也不联网) | — |
+| `--use-coconut` | COCONUT **强制**扩展检索：即使本地库有命中也联网检索 COCONUT (69.5万+ 天然产物结构)。默认行为: 本地库无命中时自动触发 (天然产物类样本优先) | JSON/MD 报告里追加 `coconut_candidates[]` 列表 |
+| `--no-coconut` | 禁用 COCONUT 检索 (即使本地库无命中也不联网) | — |
 | `--use-fragment-assembly` | 片段组装候选生成：当数据库检索均无命中时，从 13C 位移范围 + DEPT 约束组装结构（仅 1D 谱可走） | JSON 报告里追加 `fragment_candidates[]` |
 | `--use-2d` | 2D NMR 关联验证（**默认开启**, `--no-2d` 关闭）：自动检测 COSY/HSQC/HMBC/ROESY 实验；按化学家工作流顺序解读（HSQC → COSY → HMBC → 季碳）；含重叠峰分解；Top-1 生成完整 NMR 归属表；无 2D 数据时自动回退到 1D 流程 | JSON/MD/HTML 报告里追加 `interpretation_2d` + `full_assignment` 章节；中间结果独立 CSV 落盘 |
 | `--determine` | 结构推断置信度评估：多源证据融合打分，输出 determined / probable / ambiguous / no_match 四级结论 | JSON/MD/HTML 报告顶部追加 `determination` 章节 |
@@ -281,7 +306,8 @@ def verify_candidate_3d_j(candidate_smiles, j_observations, h_assignments,
 | `--lucy-ng-db <path>` | lucy-ng 完整 HOSE 数据库路径（`lucy-ng-derep.db`, ~2.8 GB SQLite）; **默认已自动查找** `data/lucy-ng-derep_db/lucy-ng-derep.db`, 无需手动指定; 用此选项可指向备份位置 | — |
 | `--log-dir <path>` | 日志输出目录 (默认 `E:\NMR2Structure\logs`); 每次运行自动生成 `NMR2Structure_YYYY-MM-DD_HH-MM-SS.log` 文件, 包含屏幕上的所有内容 (print + logging) | — |
 | `--no-log` | 禁用日志记录 (默认每次运行都写日志) | — |
-| `--no-derive` | 禁用 derive 模式, 走候选检索+打分流程 (默认 derive 开启) | — |
+| `--no-derive` | 禁用 derive 模式, 直接走候选检索+打分流程 | — |
+| `--retrieve` | derive 完成后继续执行候选检索+打分 (默认仅推导不检索) | — |
 | `--no-2d` | 禁用 2D NMR 检测, 强制使用 1D 流程 (默认 2D 开启) | — |
 
 ### 运行日志
