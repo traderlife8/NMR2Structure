@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 
@@ -162,6 +163,93 @@ def _nucleus_from_parm(p: dict) -> str:
     if n:
         return n
     return ''
+
+
+# ---- 产物 E: audita.txt 元数据冗余校验 ----
+
+def _parse_audita_pulprog(audita_path: str) -> Optional[str]:
+    """从 Bruker audita.txt 提取 PULPROG (冗余元数据源).
+
+    audita.txt 主要记录审计日志, 但在 'created by <pulprog>' 行包含脉冲程序名.
+    优先级: 优先使用 'created by <pulprog>', 缺失则返回 None.
+
+    Args:
+        audita_path: audita.txt 文件路径
+
+    Returns:
+        PULPROG 字符串 (e.g. 'zg', 'hmbcgplpndqf') 或 None
+    """
+    if not audita_path or not os.path.isfile(audita_path):
+        return None
+    try:
+        with open(audita_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return None
+    import re as _re
+    # 匹配 'created by <pulprog>' (允许换行后的缩进)
+    m = _re.search(r'created\s+by\s+([A-Za-z0-9_\-\.]+)', content)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def validate_solvent_and_pulprog_consistency(
+    specs: List['BrukerSpectrum'],
+    folder: str = '',
+) -> dict:
+    """产物 E: audita.txt 与 parm.txt 的溶剂/PULPROG 一致性校验.
+
+    Args:
+        specs: BrukerSpectrum 列表 (来自 read_bruker_folder)
+        folder: 原始数据根目录 (用于定位 audita.txt)
+
+    Returns:
+        dict with keys:
+          - n_total: int (检查的 1H/13C 实验数)
+          - consistent: int (一致数)
+          - inconsistent: int (不一致数)
+          - details: [{exp, nucleus, solvent_parm, solvent_audita, pulprog_parm,
+                        pulprog_audita, solvent_consistent, pulprog_consistent}, ...]
+          - corrected: int (用 audita 修正 parm 缺失的数)
+    """
+    out = {
+        'n_total': 0,
+        'consistent': 0,
+        'inconsistent': 0,
+        'corrected': 0,
+        'details': [],
+    }
+    for spec in specs:
+        if spec.nucleus not in ('1H', '13C'):
+            continue
+        out['n_total'] += 1
+        audita_path = os.path.join(folder, spec.exp_no, 'audita.txt') if folder else ''
+        pulprog_audita = _parse_audita_pulprog(audita_path)
+        # parm PULPROG (从 spec.pulse_program)
+        pulprog_parm = (spec.pulse_program or '').strip()
+        solvent_parm = (spec.solvent or '').strip()
+        pulprog_consistent = (
+            pulprog_audita is None or
+            pulprog_parm == '' or
+            pulprog_parm == pulprog_audita
+        )
+        out['details'].append({
+            'exp': spec.exp_no,
+            'nucleus': spec.nucleus,
+            'solvent_parm': solvent_parm,
+            'pulprog_parm': pulprog_parm,
+            'pulprog_audita': pulprog_audita or '',
+            'pulprog_consistent': pulprog_consistent,
+        })
+        if pulprog_consistent:
+            out['consistent'] += 1
+        else:
+            out['inconsistent'] += 1
+            print(f'WARN: exp {spec.exp_no} ({spec.nucleus}) PULPROG 不一致: '
+                  f'parm={pulprog_parm!r}, audita={pulprog_audita!r}',
+                  file=sys.stderr)
+    return out
 
 
 def _strip_unit(s: str) -> str:
@@ -459,6 +547,169 @@ def read_bruker_folder(folder: str) -> List[BrukerSpectrum]:
             continue
         out.append(read_bruker_experiment(exp_dir))
     return out
+
+
+def select_h_specs_by_process(
+    specs: List[BrukerSpectrum],
+    spectra_2d: Optional[Dict] = None,
+) -> Tuple[Optional[BrukerSpectrum], Optional[BrukerSpectrum], dict]:
+    """按 1D / 2D 流程分组选择 1H 谱.
+
+    推导场景：clxh100 这类化合物常在不同溶剂下分别测 1D 和 2D 数据，例如：
+      - 1D 流程（实验 21-24）溶剂 = CDCl3：1H 谱（exp 21）含 16 积分区间，可作 1D 流程主谱
+      - 2D 流程（实验 25-28 + 31）溶剂 = Pyr-d5：1H 谱（exp 31）被 2D 实验 portf 引用作投影源，
+        应作 2D 流程主谱
+
+    规则（用户指定）：
+      - h_1d：与 13C/DEPT 谱同溶剂的 1H 谱（CDCl3 优先；缺则用 Pyr）
+      - h_2d：与 2D 实验同溶剂的 1H 谱（Pyr 优先；缺则用 CDCl3）
+      - 兜底：若 2D 实验不存在，h_2d 与 h_1d 取相同谱
+
+    Args:
+        specs: read_bruker_folder 返回的所有 1D 实验
+        spectra_2d: io_bruker_2d 读出的 2D 实验 dict（可选；用于探测 2D 溶剂）
+
+    Returns:
+        (h_1d, h_2d, info)
+        h_1d / h_2d: 选出的 1H 实验（任一可能为 None）
+        info: 诊断字典，含
+            - h_1d_exp / h_2d_exp: 选中的 exp_no
+            - h_1d_solvent / h_2d_solvent: 选中的溶剂
+            - h_specs_all: 所有 1H 实验的 (exp_no, solvent, n_peaks, has_integrals)
+            - 2d_solvents: 2D 实验的溶剂列表（去重）
+            - consistency: 'ok' / 'warn:...' 告警
+    """
+    # 1. 筛选所有 1H 实验
+    h_specs = [s for s in specs if s.nucleus == '1H']
+    info: dict = {
+        'h_specs_all': [
+            {
+                'exp_no': s.exp_no,
+                'solvent': s.solvent,
+                'n_peaks': len(s.peaks),
+                'has_integrals': bool(s.integrals),
+                'field_mhz': s.field_mhz,
+            }
+            for s in h_specs
+        ],
+    }
+
+    if not h_specs:
+        return None, None, info
+
+    # 2. 探测 2D 实验溶剂集合
+    d_solvents = []
+    if spectra_2d:
+        for exp_type, sp in spectra_2d.items():
+            if getattr(sp, 'solvent', None):
+                d_solvents.append(sp.solvent)
+    d_solvents_set = sorted(set(d_solvents))
+    info['2d_solvents'] = d_solvents_set
+
+    # 3. 按溶剂分组
+    cdcl3_h = [s for s in h_specs if (s.solvent or '').upper() == 'CDCL3']
+    pyr_h = [s for s in h_specs if (s.solvent or '').upper() == 'PYR']
+    other_h = [s for s in h_specs if s not in cdcl3_h and s not in pyr_h]
+
+    # 4. h_1d 选择: 优先 CDCl3 (与 1D 13C/DEPT 同溶剂)，缺则 Pyr，缺则 other，最后兜底任意
+    h_1d: Optional[BrukerSpectrum] = None
+    if cdcl3_h:
+        # 多个 CDCl3 实验时，选有积分的（说明是精细 1H 主谱）
+        with_int = [s for s in cdcl3_h if s.integrals]
+        h_1d = with_int[0] if with_int else cdcl3_h[0]
+    elif pyr_h:
+        h_1d = pyr_h[0]
+    elif other_h:
+        h_1d = other_h[0]
+    else:
+        h_1d = h_specs[0]
+
+    # 5. h_2d 选择: 优先与 2D 同溶剂 (多数表决), 否则 Pyr
+    h_2d: Optional[BrukerSpectrum] = None
+    # 取 2D 溶剂中频次最高者
+    target_2d_solvent: Optional[str] = None
+    if d_solvents:
+        from collections import Counter
+        cnt = Counter(d_solvents)
+        target_2d_solvent = cnt.most_common(1)[0][0]
+
+    # 匹配候选：溶剂严格等于 target_2d_solvent
+    if target_2d_solvent:
+        cand = [s for s in h_specs
+                if (s.solvent or '').upper() == target_2d_solvent.upper()]
+        if cand:
+            # 多个候选时，选 SW 最大的（高分辨率）
+            h_2d = max(cand, key=lambda s: len(s.peaks))
+
+    if h_2d is None and pyr_h:
+        h_2d = pyr_h[0]
+    if h_2d is None:
+        h_2d = h_1d  # 兜底
+
+    # 6. 一致性检查
+    consistency_msgs = []
+    if target_2d_solvent and h_2d and (h_2d.solvent or '').upper() != target_2d_solvent.upper():
+        consistency_msgs.append(
+            f"2D 溶剂 {target_2d_solvent} 与选中 1H 溶剂 {h_2d.solvent} 不一致")
+    if h_1d and h_2d and h_1d.exp_no == h_2d.exp_no:
+        consistency_msgs.append("h_1d 和 h_2d 选中了同一个 1H 实验")
+    info['consistency'] = 'ok' if not consistency_msgs else 'warn:' + '; '.join(consistency_msgs)
+
+    info['h_1d_exp'] = h_1d.exp_no if h_1d else None
+    info['h_2d_exp'] = h_2d.exp_no if h_2d else None
+    info['h_1d_solvent'] = h_1d.solvent if h_1d else None
+    info['h_2d_solvent'] = h_2d.solvent if h_2d else None
+    info['target_2d_solvent'] = target_2d_solvent
+
+    return h_1d, h_2d, info
+
+
+def write_h_spec_selection_csv(
+    info: dict,
+    output_path: str,
+) -> None:
+    """把 1H 谱分组选择结果落盘到 CSV (产物 A).
+
+    Args:
+        info: select_h_specs_by_process 返回的 info dict
+        output_path: 输出 CSV 路径
+    """
+    import csv as _csv
+
+    rows = []
+    rows.append(['# 1H 谱分组选择报告 (1D 流程 vs 2D 流程)'])
+    rows.append(['# 生成时间', str(__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S'))])
+    rows.append([])
+    rows.append(['选择结果', 'exp', 'solvent', 'n_peaks', 'has_integrals'])
+    rows.append(['h_1d (1D 流程)',
+                 str(info.get('h_1d_exp')),
+                 str(info.get('h_1d_solvent', '')),
+                 '-', '-'])
+    rows.append(['h_2d (2D 流程)',
+                 str(info.get('h_2d_exp')),
+                 str(info.get('h_2d_solvent', '')),
+                 '-', '-'])
+    rows.append([])
+    rows.append(['所有 1H 实验'])
+    rows.append(['exp_no', 'solvent', 'n_peaks', 'has_integrals', 'field_mhz'])
+    for s in info.get('h_specs_all', []):
+        rows.append([
+            str(s.get('exp_no', '')),
+            str(s.get('solvent', '')),
+            str(s.get('n_peaks', 0)),
+            'Y' if s.get('has_integrals') else 'N',
+            f'{s.get("field_mhz", 0):.3f}' if s.get('field_mhz') else '',
+        ])
+    rows.append([])
+    rows.append(['2D 实验溶剂集合', str(info.get('2d_solvents', []))])
+    rows.append(['2D 主导溶剂 (多数表决)', str(info.get('target_2d_solvent', ''))])
+    rows.append(['一致性检查', str(info.get('consistency', ''))])
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)) or '.', exist_ok=True)
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        w = _csv.writer(f)
+        for r in rows:
+            w.writerow(r)
 
 
 # ---- scipy.signal.find_peaks 二次找峰 (可选增强) ----

@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 # 程序内部强制 UTF-8 编码 (替代 python -X utf8 命令行标志)
 # Windows 默认编码为 GBK/cp936, 不配置则中文输出可能乱码
@@ -40,7 +41,7 @@ from .drawing import (
     write_unmatched_summary_csv,
 )
 from .evidence import build_evidence, score_candidates
-from .io_bruker import read_bruker_folder
+from .io_bruker import read_bruker_folder, select_h_specs_by_process, write_h_spec_selection_csv
 from .io_processed import ProcessedReadError, read_processed_folder
 from .nmrsim_check import check_candidate_with_nmrsim
 from .report import write_report_html, write_report_json, write_report_markdown
@@ -171,15 +172,24 @@ def _filter_peaks_by_intensity(shifts, intensities, percentile=0.20):
     return sorted(s for i, s in paired if i >= thresh)
 
 
-def _build_problem_from_bruker(specs, keep_solvent: bool = False) -> ProblemPeaks:
+def _build_problem_from_bruker(
+    specs,
+    h_spec_1d=None,
+    keep_solvent: bool = False,
+) -> ProblemPeaks:
     """从读到的 BrukerSpectrum 列表构造 ProblemPeaks.
 
     选择规则：
-      - 第一个 1H 实验作为 1H 峰表
+      - h_spec_1d: 1D 流程专用的 1H 谱（可选）。若提供则优先使用；
+        通常由 select_h_specs_by_process() 按 1D/2D 分组选出。
+      - 兜底：第一个 1H 实验作为 1H 峰表（向后兼容）
       - 第一个 13C 实验（非 DEPT）作为 13C 峰表
       - 溶剂取第一个非空
     """
-    h_spec = next((s for s in specs if s.nucleus == '1H'), None)
+    if h_spec_1d is not None:
+        h_spec = h_spec_1d
+    else:
+        h_spec = next((s for s in specs if s.nucleus == '1H'), None)
     # 碳谱：优先非 DEPT
     c_spec = next((s for s in specs if s.nucleus == '13C' and 'DEPT' not in s.nucleus), None)
     if c_spec is None:
@@ -438,8 +448,64 @@ def main(argv=None):
     else:
         print(f"[1.5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
 
-    # 2. 构造问题
-    problem = _build_problem_from_bruker(specs, keep_solvent=args.keep_solvent)
+    # 2. 构造问题 (优先使用按 1D/2D 分组选出的 1H 谱，避免多溶剂场景下的标度误用)
+    # 产物 A: 1H 谱分组选择
+    meta_2d_solvent_consistency: Optional[dict] = None
+    meta_audita_consistency: Optional[dict] = None
+    if spectra_2d:
+        # 产物 F: 2D 谱溶剂一致性校验
+        try:
+            from .io_bruker_2d import validate_2d_solvent_consistency
+            meta_2d_solvent_consistency = validate_2d_solvent_consistency(
+                spectra_2d,
+            )
+            if not meta_2d_solvent_consistency['consistent']:
+                print(f'WARN: 产物 F 警告: '
+                      f'{meta_2d_solvent_consistency["warning"]}',
+                      file=sys.stderr)
+            else:
+                print(f"  [产物 F] 2D 溶剂一致性: "
+                      f"{meta_2d_solvent_consistency['unique_solvents']}",
+                      file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: 2D 溶剂一致性校验失败: {ex}",
+                  file=sys.stderr)
+
+    # 产物 E: audita.txt 冗余元数据校验
+    try:
+        from .io_bruker import validate_solvent_and_pulprog_consistency
+        meta_audita_consistency = validate_solvent_and_pulprog_consistency(
+            specs, folder,
+        )
+        if not args.quiet:
+            print(f"[产物 E] audita 冗余元数据校验: "
+                  f"{meta_audita_consistency['consistent']}/"
+                  f"{meta_audita_consistency['n_total']} 实验 PULPROG 一致",
+                  file=sys.stderr)
+    except Exception as ex:
+        print(f"WARN: audita 一致性校验失败: {ex}", file=sys.stderr)
+
+    h_spec_1d, h_spec_2d, h_spec_info = select_h_specs_by_process(
+        specs, spectra_2d=spectra_2d,
+    )
+    # 落盘 1H 谱选择报告
+    h_spec_csv = os.path.join(output_dir, '1h_source_selection.csv')
+    try:
+        write_h_spec_selection_csv(h_spec_info, h_spec_csv)
+        if not args.quiet:
+            print(f"[1.6] 1H 谱分组选择: 1D 流程 exp={h_spec_info.get('h_1d_exp')} "
+                  f"({h_spec_info.get('h_1d_solvent')}); "
+                  f"2D 流程 exp={h_spec_info.get('h_2d_exp')} "
+                  f"({h_spec_info.get('h_2d_solvent')}); "
+                  f"一致性={h_spec_info.get('consistency', '?')}",
+                  file=sys.stderr)
+    except Exception as ex:
+        print(f"WARN: 1H 谱分组报告落盘失败: {ex}", file=sys.stderr)
+        h_spec_csv = None
+
+    problem = _build_problem_from_bruker(
+        specs, h_spec_1d=h_spec_1d, keep_solvent=args.keep_solvent,
+    )
     print(f"[2/5] 观测峰: 13C={len(problem.carbon_shifts)} 1H={len(problem.proton_shifts)} "
           f"solvent={problem.solvent}", file=sys.stderr)
 
@@ -479,18 +545,30 @@ def main(argv=None):
         try:
             from .interpret_2d import interpret_2d_sequential, write_step_files
             from .io_bruker import parse_multiplets_from_peaklist
-            # 解析 1H 多重峰 (J 耦合). 优先读取 Multiplet 标签/Peak1D+mult,
-            # 未做手工多重峰分析时 fallback 到 infer_multiplets_from_peaks.
+            # 解析 1H 多重峰 (J 耦合). 优先用按 2D 溶剂选出的 h_spec_2d
+            # (与 2D 实验同源溶剂), 缺则取第一个 1H (向后兼容).
             multiplets = []
             h1_peaklist_path = None
             h1_field_mhz = 0.0
-            for spec in specs:
-                if spec.nucleus == '1H' and spec.peaklist_path:
-                    multiplets = parse_multiplets_from_peaklist(
-                        spec.peaklist_path, field_mhz=spec.field_mhz)
-                    h1_peaklist_path = spec.peaklist_path
-                    h1_field_mhz = spec.field_mhz
-                    break
+            target_h_spec = h_spec_2d if h_spec_2d is not None else None
+            if target_h_spec is None:
+                for spec in specs:
+                    if spec.nucleus == '1H' and spec.peaklist_path:
+                        target_h_spec = spec
+                        break
+            if target_h_spec is not None and target_h_spec.peaklist_path:
+                multiplets = parse_multiplets_from_peaklist(
+                    target_h_spec.peaklist_path, field_mhz=target_h_spec.field_mhz)
+                h1_peaklist_path = target_h_spec.peaklist_path
+                h1_field_mhz = target_h_spec.field_mhz
+            # 产物 D: 取与 2D 实验同溶剂的 1H peakrng 文件 (用于重叠区标记)
+            peakrng_path = None
+            if target_h_spec is not None:
+                peakrng_pdata1 = os.path.join(
+                    folder, target_h_spec.exp_no, 'pdata', '1', 'peakrng'
+                )
+                if os.path.isfile(peakrng_pdata1):
+                    peakrng_path = peakrng_pdata1
             interpretation_2d = interpret_2d_sequential(
                 spectra_2d=spectra_2d,
                 carbon_shifts_1d=problem.carbon_shifts,
@@ -502,6 +580,7 @@ def main(argv=None):
                 h1_field_mhz=h1_field_mhz,
                 solvent=problem.solvent or '',
                 quiet=args.quiet,
+                peakrng_path=peakrng_path,
             )
             # 中间结果写入独立 CSV (化学家复核用)
             step_files = write_step_files(interpretation_2d, output_dir, spectra_2d)
@@ -518,6 +597,113 @@ def main(argv=None):
         except Exception as ex:
             print(f"WARN: 2D 解读失败, 回退 1D 检索: {ex}", file=sys.stderr)
             interpretation_2d = None
+
+    # 2.85 产物 B/C: HMBC F1 投影补强 13C 峰表 + HSQC 单行切片精细化
+    # 产物 B: 从 HMBC 的 pdata/99 (全列投影) 或 pdata/999 (行子集投影) 提取 13C 峰
+    #         (求和增强, SNR 高于主谱 13C, 能检出主谱漏掉的弱 13C 峰)
+    # 产物 C: 从 HSQC 的 pdata/<pprocno>/used_from 提取单行 13C 切片的精细 1H 模式
+    #         (J 耦合校准, 多重峰归属增强)
+    meta_hmbc_proj = None
+    meta_hsqc_slices = None
+    derive_extra_carbon_shifts = []  # 供 derive 流程使用的额外 13C 峰
+    if spectra_2d:
+        print(f"[2.85] 产物 B/C: HMBC F1 投影 + HSQC 行切片 ...", file=sys.stderr)
+        try:
+            from .io_bruker_2d import (
+                read_hmbc_f1_projection,
+                merge_13c_with_hmbc_projection,
+                write_13c_merged_csv,
+                write_hsqc_row_slices_csv,
+            )
+
+            # === 产物 B: HMBC F1 投影 ===
+            if 'HMBC' in spectra_2d:
+                hmbc_spec = spectra_2d['HMBC']
+                hmbc_exp_dir = hmbc_spec.source_path
+                hmbc_proj_peaks = read_hmbc_f1_projection(hmbc_exp_dir)
+                if hmbc_proj_peaks:
+                    # 与主谱 13C 合并 (容差 0.1 ppm)
+                    merge_result = merge_13c_with_hmbc_projection(
+                        problem.carbon_shifts, hmbc_proj_peaks,
+                        merge_tol=0.1,
+                    )
+                    # 落盘 CSV (保留所有峰, 化学家可审查)
+                    hmbc_csv_path = os.path.join(
+                        output_dir, '13c_with_hmbc_projection.csv',
+                    )
+                    try:
+                        write_13c_merged_csv(merge_result, hmbc_csv_path)
+                    except Exception as ex:
+                        print(f"WARN: HMBC 合并 CSV 落盘失败: {ex}",
+                              file=sys.stderr)
+                    # 收集 HMBC 投影独有峰 (主谱未检出) → 供 derive 流程补强
+                    # 过滤: 按强度取 top N (N = main_count) 以避免噪声过载
+                    # (HMBC 投影谱存在 t1 噪声 / 旋转边峰, 未过滤的独有峰不可靠)
+                    main_n = len(problem.carbon_shifts)
+                    all_extra = sorted(
+                        [(p.shift, abs(p.intensity)) for p in hmbc_proj_peaks
+                         if p.snr is None or p.snr >= 3.0],
+                        key=lambda x: -x[1],
+                    )
+                    main_set = set(round(c, 3) for c in problem.carbon_shifts)
+                    derive_extra_carbon_shifts = []
+                    for shift, _ in all_extra:
+                        rs = round(shift, 3)
+                        if rs in main_set:
+                            continue
+                        derive_extra_carbon_shifts.append(shift)
+                        if len(derive_extra_carbon_shifts) >= main_n:
+                            break
+                    print(f"  -> 产物 B [HMBC F1 投影]: "
+                          f"投影 {len(hmbc_proj_peaks)} 峰, "
+                          f"主谱 {merge_result['main_count']}, "
+                          f"交集 {merge_result['intersection_count']}, "
+                          f"投影独有 {merge_result['proj_only_count']} "
+                          f"(补强到 derive 流程: top {len(derive_extra_carbon_shifts)} "
+                          f"by intensity, snr≥3)",
+                          file=sys.stderr)
+                    meta_hmbc_proj = {
+                        'exp': hmbc_spec.exp_no,
+                        'n_proj_peaks': len(hmbc_proj_peaks),
+                        'main_count': merge_result['main_count'],
+                        'proj_only_count': merge_result['proj_only_count'],
+                        'intersection_count': merge_result['intersection_count'],
+                        'extra_shifts_count': len(derive_extra_carbon_shifts),
+                        'extra_shifts': derive_extra_carbon_shifts,
+                        'csv': hmbc_csv_path,
+                    }
+                else:
+                    print(f"  -> 产物 B [HMBC F1 投影]: 无可用投影 "
+                          f"(检查 pdata/99 或 pdata/999 是否存在)",
+                          file=sys.stderr)
+                    meta_hmbc_proj = {'exp': hmbc_spec.exp_no,
+                                       'n_proj_peaks': 0,
+                                       'note': 'no projection data found'}
+
+            # === 产物 C: HSQC 单行切片 ===
+            if 'HSQC' in spectra_2d:
+                hsqc_spec = spectra_2d['HSQC']
+                hsqc_exp_dir = hsqc_spec.source_path
+                row_slices_dir = os.path.join(output_dir, 'hsqc_row_slices')
+                written = write_hsqc_row_slices_csv(hsqc_exp_dir, row_slices_dir)
+                if written:
+                    print(f"  -> 产物 C [HSQC 行切片]: {len(written)} 个切片 "
+                          f"-> {row_slices_dir}", file=sys.stderr)
+                    meta_hsqc_slices = {
+                        'exp': hsqc_spec.exp_no,
+                        'n_row_slices': len(written),
+                        'output_dir': row_slices_dir,
+                        'files': [os.path.basename(p) for p in written],
+                    }
+                else:
+                    print(f"  -> 产物 C [HSQC 行切片]: 无 pdata/<pprocno>/used_from "
+                          f"(HSQC 未生成行切片)", file=sys.stderr)
+                    meta_hsqc_slices = {'exp': hsqc_spec.exp_no,
+                                          'n_row_slices': 0,
+                                          'note': 'no row slice pdata found'}
+
+        except Exception as ex:
+            print(f"WARN: 产物 B/C 集成失败: {ex}", file=sys.stderr)
 
     # Part 3: --derive 模式 - 从谱图数据直接推导归属表 (不依赖候选检索/打分)
     if args.derive:
@@ -555,10 +741,28 @@ def main(argv=None):
         print(f"  COSY: {len(cosy_pairs)} 对, HMBC: {len(hmbc_pairs)} 对, "
               f"ROESY: {len(roesy_pairs)} 对", file=sys.stderr)
 
+        # 产物 B 补强: 把 HMBC 投影独有峰 (主谱未检出) 合并到 derive 流程的 13C 峰表
+        # 价值: HMBC F1 投影的 SNR 高于主谱 13C, 能检出主谱遗漏的弱 13C 峰
+        # 策略: 去重保留主谱优先级 (主谱峰先入 set, 投影峰仅补未在主谱中出现的)
+        derive_carbon_shifts_1d = list(problem.carbon_shifts)
+        if derive_extra_carbon_shifts:
+            existing_carbon = set(round(c, 3) for c in problem.carbon_shifts)
+            added = 0
+            for c in derive_extra_carbon_shifts:
+                rc = round(c, 3)
+                if rc not in existing_carbon:
+                    derive_carbon_shifts_1d.append(c)
+                    existing_carbon.add(rc)
+                    added += 1
+            if added > 0:
+                print(f"  产物 B [HMBC 投影补强]: derive 流程 +{added} 个额外 13C 峰 "
+                      f"({len(problem.carbon_shifts)} -> {len(derive_carbon_shifts_1d)})",
+                      file=sys.stderr)
+
         # 组装归属表
         derive_rows = assemble_assignment_table(
             ch_pairs=interpretation_2d.ch_pairs,
-            carbon_shifts_1d=problem.carbon_shifts,
+            carbon_shifts_1d=derive_carbon_shifts_1d,
             proton_shifts_1d=problem.proton_shifts,
             cosy_pairs=cosy_pairs,
             hmbc_pairs=hmbc_pairs,
@@ -585,6 +789,54 @@ def main(argv=None):
             val = getattr(args, key, None) or ''
             if val:
                 meta[key.replace('_', ' ').upper()] = val
+        # 产物 B/C 元信息 (HMBC 投影 + HSQC 行切片)
+        if meta_hmbc_proj is not None:
+            meta['HMBC_Projection_Exp'] = str(meta_hmbc_proj.get('exp', ''))
+            meta['HMBC_Projection_Count'] = str(
+                meta_hmbc_proj.get('n_proj_peaks', 0)
+            )
+            meta['HMBC_Projection_Main_Count'] = str(
+                meta_hmbc_proj.get('main_count', 0)
+            )
+            meta['HMBC_Projection_Only_Count'] = str(
+                meta_hmbc_proj.get('proj_only_count', 0)
+            )
+            meta['HMBC_Projection_Intersection_Count'] = str(
+                meta_hmbc_proj.get('intersection_count', 0)
+            )
+        if meta_hsqc_slices is not None:
+            meta['HSQC_Row_Slices_Exp'] = str(meta_hsqc_slices.get('exp', ''))
+            meta['HSQC_Row_Slices_Count'] = str(
+                meta_hsqc_slices.get('n_row_slices', 0)
+            )
+        # 产物 D: peakrng 重叠峰检测统计
+        if interpretation_2d is not None:
+            n_peakrng_overlap = sum(
+                1 for p in interpretation_2d.ch_pairs
+                if p.is_overlap_from_peakrng
+            )
+            if n_peakrng_overlap > 0:
+                meta['Peakrng_Overlap_CHPairs'] = str(n_peakrng_overlap)
+        # 产物 E: audita.txt 冗余元数据校验
+        if meta_audita_consistency is not None:
+            meta['Audita_Pulprog_Consistent'] = str(
+                meta_audita_consistency.get('consistent', 0)
+            )
+            meta['Audita_Pulprog_Total'] = str(
+                meta_audita_consistency.get('n_total', 0)
+            )
+            meta['Audita_Pulprog_Inconsistent'] = str(
+                meta_audita_consistency.get('inconsistent', 0)
+            )
+        # 产物 F: 2D 谱溶剂一致性校验
+        if meta_2d_solvent_consistency is not None:
+            unique_solvents = meta_2d_solvent_consistency.get(
+                'unique_solvents', []
+            )
+            meta['2D_Solvents'] = ','.join(unique_solvents) if unique_solvents else ''
+            meta['2D_Solvent_Consistent'] = str(
+                meta_2d_solvent_consistency.get('consistent', True)
+            )
         write_assignment_xlsx(derive_rows, xlsx_path)
         write_assignment_meta(meta_path, meta)
         print(f"  输出: {csv_path}", file=sys.stderr)

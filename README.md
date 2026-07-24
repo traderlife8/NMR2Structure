@@ -636,6 +636,11 @@ assembled = assemble_candidates(constraints, max_heavy_atoms=12, max_candidates=
 | `<sample>.md` | Markdown 报告，含未匹配峰专项章节 + pandas 候选表（InChIKey 去重）|
 | `<sample>.html` | HTML 报告（人类阅读，含流程 + 结构图 + DEPT 推断 + seaborn 统计可视化，所有图片 base64 内嵌）|
 | `<sample>_unmatched.csv` | 未匹配峰汇总（Excel 友好，UTF-8 BOM） |
+| `1h_source_selection.csv` | **产物 A**：1H 谱按 1D/2D 流程分组选择报告（各实验溶剂/SW/积分 + 选择依据） |
+| `13c_with_hmbc_projection.csv` | **产物 B**：HMBC F1 投影（pdata/99 或 pdata/999）提取的 ¹³C 峰 + 主谱 ¹³C 峰合并表 |
+| `hsqc_row_slices/hsqc_row_<PROCNO>.csv` | **产物 C**：HSQC 单行切片（来自 pdata/1000/1001），含 ¹³C ppm + 检出 ¹H 峰 |
+| `step1_hsqc_ch_pairs.csv` | HSQC C-H 对（含 `is_overlap_from_peakrng` 列，**产物 D**：peakrng 重叠区标记） |
+| `derive_归属表/meta.txt` | 含 **产物 E** `Audita_Pulprog_*` 和 **产物 F** `2D_Solvents` / `2D_Solvent_Consistent` 元信息 |
 
 > 注：所有 PNG 图片（topn / rank / overlay / heatmap / scatter / matrix / overview / real_spectrum）
 > 已 base64 内嵌到 HTML 中，输出目录不再保留独立 PNG 文件。
@@ -968,7 +973,7 @@ python -m nmr_elucidator \
 
 | 模块 | 职责 | 关键 API |
 |---|---|---|
-| `io_bruker.py` | 读 Bruker 原始谱（peaklist.xml / parm.txt / integrals.txt） | `read_bruker_folder`, `BrukerSpectrum`, `enhance_peaks_with_scipy` |
+| `io_bruker.py` | 读 Bruker 原始谱（peaklist.xml / parm.txt / integrals.txt / peakrng）+ 1H 谱按 1D/2D 分组选择 + audita.txt 元数据冗余校验 | `read_bruker_folder`, `BrukerSpectrum`, `enhance_peaks_with_scipy`, `select_h_specs_by_process`, `write_h_spec_selection_csv`, `_parse_audita_pulprog`, `validate_solvent_and_pulprog_consistency` |
 | `io_processed.py` | 读 Bruker 已处理谱（pdata/1/1r）+ 重采样到 ML 网格 | `read_processed_folder`, `resample_to_grid` |
 | `io_sdf.py` | 自定义 nmrshiftdb2 SDF 解析器 | `stream_nmrshiftdb2_sdf`, `NmrShiftDb2Entry` |
 | `constraints.py` | 硬约束（分子式、溶剂、重原子数） | `Constraints`, `formula_match` |
@@ -990,8 +995,8 @@ python -m nmr_elucidator \
 | `nmr_predict.py` | 13C 化学位移预测 + 候选验证（从 nmrshiftdb2 SDF 自建 HOSE 查找表） | `get_predictor`, `verify_candidate`, `HOSELookupTable`, `C13Predictor` |
 | `lucy_ng_hose.py` | lucy-ng 完整 HOSE 数据库集成（928K 化合物，~2.8 GB SQLite，MAE ~3.5 ppm） | `LucyNGHOSEProvider`, `predict_smiles`, `verify_candidate_with_lucy_db`, `get_lucy_ng_provider` |
 | `determination.py` | 结构推断置信度评估（多源证据融合 + 四级结论） | `assess_determination`, `compute_unified_score`, `DeterminationResult` |
-| `io_bruker_2d.py` | 2D Bruker 谱图读取与峰检测 (COSY/HSQC/HMBC/ROESY) | `read_bruker_2d_folder`, `read_bruker_2d_experiment`, `pick_peaks_2d`, `Spectrum2D`, `Peak2D` |
-| `interpret_2d.py` | 2D NMR 逐步解谱引擎 (化学家工作流: HSQC→COSY→HMBC→季碳推断+5.9 节重叠峰分解，每步产出独立 CSV + 等高线图供化学家复核) | `interpret_2d_sequential`, `write_step_files`, `CHPair`, `SpinSystem`, `HMBCConnection`, `OverlapRegion`, `Interpretation2D` |
+| `io_bruker_2d.py` | 2D Bruker 谱图读取与峰检测（HSQC/COSY/HMBC/ROESY）+ HMBC F1 投影补强 ¹³C + HSQC 单行切片精细化 + 2D 溶剂一致性校验 | `read_bruker_2d_folder`, `read_bruker_2d_experiment`, `pick_peaks_2d`, `Spectrum2D`, `Peak2D`, `read_hmbc_f1_projection`, `merge_13c_with_hmbc_projection`, `write_13c_merged_csv`, `read_hsqc_row_slice`, `write_hsqc_row_slices_csv`, `validate_2d_solvent_consistency` |
+| `interpret_2d.py` | 2D NMR 逐步解谱引擎（化学家工作流：HSQC→COSY→HMBC→季碳推断+5.9 节重叠峰分解）+ peakrng 重叠峰标记；每步产出独立 CSV + 等高线图供化学家复核 | `interpret_2d_sequential`, `write_step_files`, `CHPair`, `SpinSystem`, `HMBCConnection`, `OverlapRegion`, `Interpretation2D`, `PeakRange`, `_parse_peakrng`, `annotate_overlap_from_peakrng` |
 | `correlation_2d.py` | 2D NMR 关联提取、候选验证打分、全归属表生成 | `score_candidate_2d`, `build_full_assignment_table`, `extract_hsqc_pairs`, `Correlation2DScore`, `FullAssignmentTable` |
 | `retrieve_pubchem.py` | PubChem 扩展检索（分子式 + 子结构，错误静默降级） | `retrieve_pubchem_candidates`, `PubChemCandidate` |
 | `shift_ranges.py` | 13C 化学位移经验范围表 + 官能团推断 | `infer_functional_groups`, `assign_shift_ranges`, `SHIFT_RANGES` |
@@ -1000,6 +1005,90 @@ python -m nmr_elucidator \
 | `standard_assignment.py` | **已知化合物流程**：读取化学家 Excel 标准归属表 + 自动发现 + 行级联合匹配 + SMILES 结构判等（SMILES 仅复核用） | `read_standard_assignment_table`, `discover_known_compound`, `compare_program_to_standard`, `write_matched_xlsx`, `write_comparison_report`, `StandardAssignmentTable` |
 | `atom_labeler.py` | SMILES → RDKit mol → 化学家标号映射（仅在人工复核阶段用于结构验证，不参与推导） | `assign_chemist_labels`, `parse_smiles_to_mol`, `format_h_cell` |
 | `__main__.py` | CLI 入口（端到端主流程） | `main` |
+
+## 原始数据全利用：产物 A-F 中间产物
+
+为提升从谱图直接推导归属表的准确率，`--derive` 默认读取原始谱图的全部可用文件，而非仅 peaklist/parm 等核心文件。
+以下 6 个中间产物是推导流程的一部分（均在不依赖 SMILES/mol block 的前提下，仅依赖仪器原始数据）：
+
+### 产物 A：1H 谱按 1D/2D 流程分组选择
+
+**场景**：同一化合物常在不同溶剂下分别测 1D 和 2D（例如 clxh100 在 CDCl₃ 中测 13C/DEPT/1H exp 21-24，又在 Pyr-d5 中测 HSQC/HMBC/ROESY/1H exp 25-31）。
+若程序取首个 1H 谱统一使用，会让 1H 化学位移与 2D 谱 F2 轴的标度不一致，导致 HSQC 配对/HMBC 检索的化学位移不匹配。
+
+**实现**：`io_bruker.select_h_specs_by_process(specs, spectra_2d)` 按 SOLVENT 分组：
+- 1D 流程 → 用与 13C/DEPT 同溶剂的 1H（CDCl₃ 已积分，能给多重峰）
+- 2D 流程 → 用与 2D 同溶剂的 1H（Pyr-d5 高分辨率，作为 2D 谱的化学位移标度对齐基线）
+- 兜底：若某组缺失，沿用现有行为
+
+**产物**：`output/<sample>/1h_source_selection.csv`（各 1H 实验 + 1D/2D 选择依据）
+**价值**：解决 1H 谱溶剂不一致导致的 HSQC/HMBC 配对错位问题。
+
+### 产物 B：HMBC F1 投影补强 ¹³C 峰表
+
+**场景**：HMBC 的 pdata/99（positive projection of all 2048 columns）和 pdata/999（positive projection of rows 298-334）是 F1 维（¹³C）的求和增强投影。
+相比主谱 ¹³C（13C 谱通常 NS=23），HMBC 投影相当于"2048 行求和增强"，SNR 高约 √2048 ≈ 45 倍，能检出主谱漏掉的弱 ¹³C 峰。
+
+**实现**：`io_bruker_2d.read_hmbc_f1_projection(hmbc_exp_dir)`：
+- nmrglue 读 pdata/99 的 1r（遇到 13C 维元数据缺失 → ppm 轴异常）→ 自动 fallback 到从 `acqu2s`/`proc2s` 重建 13C ppm 轴
+- 应用 Bruker 校正公式 `TMS ppm = Bruker ppm - SIGF1/2`
+- `scipy.signal.find_peaks` 在投影上检峰
+- `merge_13c_with_hmbc_projection()` 与主谱 ¹³C 合并（0.1 ppm 容差）
+
+**产物**：`output/<sample>/13c_with_hmbc_projection.csv`（主谱 ∪ 投影峰 + 来源标记）
+**价值**：检测主谱 ¹³C 中未检出的弱 ¹³C 峰（如稀释样品中弱 Cq 信号）。
+
+### 产物 C：HSQC 单行切片精细化
+
+**场景**：HSQC 的 pdata/1000（row 51）和 pdata/1001（row 941）是化学家手动选定的特定 ¹³C 行的 1H 切片，提供该 C 上 H 的精细 J 耦合和多重峰模式，用于归属难点的多峰解析。
+
+**实现**：`io_bruker_2d.read_hsqc_row_slice(hsqc_exp_dir, pprocno)`：
+- 从 `used_from` 的 `##$PROCNO2=` 读取原始 2D 矩阵的行号
+- 通过原始 2D 矩阵的 F1 ppm 轴推算该行的 ¹³C ppm
+- nmrglue 读 1r + proc 重建 1H ppm 轴
+- find_peaks 检 H 峰 + 计算 SNR
+
+**产物**：`output/<sample>/hsqc_row_slices/hsqc_row_<PROCNO>.csv`
+**价值**：化学家手动选定的"重点关注"行（高 SNR），用于归属难点行精细化分析。
+
+### 产物 D：peakrng 重叠峰检测
+
+**场景**：`peakrng` 文件记录仪器积分时的 1H 峰区间（左右边界 + 强度范围）。同一区间内包含多个 1H 峰，提示仪器认为这些 H 在积分时是合并的（可能存在 1H 重叠或简并）。
+
+**实现**：`interpret_2d._parse_peakrng(peakrng_path)` + `annotate_overlap_from_peakrng(ch_pairs, peakrngs)`：
+- 解析 peakrng（每行：low_ppm high_ppm mi maxi region_id）
+- 对每个 CHPair 找其 h_ppm 落入的 peakrng 区间
+- 若同一区间包含 ≥2 个 CHPair → 标记 `is_overlap_from_peakrng=True`
+
+**产物**：`output/<sample>/step1_hsqc_ch_pairs.csv` 新增 `is_overlap_from_peakrng` 列；`meta.txt` 的 `Peakrng_Overlap_CHPairs` 字段
+**价值**：仪器积分边界提示重叠峰分布，化学家复核时可优先关注这些 CHPair。
+
+### 产物 E：audita.txt 元数据冗余校验
+
+**场景**：`audita.txt` 是 Bruker 谱仪审计日志，记录实验创建时的元数据（含 `created by <PULPROG>`）。
+当 `parm.txt`/`acqus` 损坏或 SOLVENT/PULPROG 缺失时，audita.txt 可作为冗余源。
+
+**实现**：`io_bruker._parse_audita_pulprog(audita_path)` + `validate_solvent_and_pulprog_consistency(specs, folder)`：
+- 从 audita.txt 提取 `created by <PULPROG>`
+- 与 spec.pulse_program 一致性比对
+- 不一致时输出 WARN（不自动覆盖，但供下游决策）
+
+**产物**：`meta.txt` 的 `Audita_Pulprog_Consistent` / `Audita_Pulprog_Total` / `Audita_Pulprog_Inconsistent` 字段
+**价值**：检测 parm.txt 元数据是否被人工修改/损坏，给出冗余元数据校验。
+
+### 产物 F：2D 谱溶剂一致性校验
+
+**场景**：同一化合物的 2D 实验应使用同一溶剂。若混合（如 HSQC 用 Pyr-d5，HMBC 用 DMSO），化学位移标度差异会导致 HMBC 配对错位。
+
+**实现**：`io_bruker_2d.validate_2d_solvent_consistency(spectra_2d)`：
+- 收集所有 2D 实验的 SOLVENT
+- 检查是否唯一
+- 不一致时输出警告（提示用户优先使用溶剂一致的 2D 实验）
+
+**产物**：`meta.txt` 的 `2D_Solvents` / `2D_Solvent_Consistent` 字段
+**价值**：检测 2D 实验溶剂混用风险，给出告警。
+
+---
 
 ## 未匹配峰处理（重点关注）
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
@@ -37,6 +38,9 @@ class CHPair:
     h_neighbors: List[float] = field(default_factory=list)  # 邻位 H 的 δH (ppm)
     # Part 2.B: 溶剂残余峰标记. 该 C-H 对若来自溶剂残余峰, 不进入归属表.
     is_solvent_residual: bool = False
+    # 产物 D: peakrng 重叠区标记. True 表示与至少一个其他 C-H 对共享 peakrng 区间
+    # (即多个 1H 在仪器积分时合并到同一区域, 提示存在 1H 重叠需分解)
+    is_overlap_from_peakrng: bool = False
 
 
 @dataclass
@@ -637,6 +641,133 @@ def _simple_find_peaks(arr, min_dist: int, height: float):
             elif arr[i] > arr[peaks[-1]]:
                 peaks[-1] = i
     return np.array(peaks, dtype=int)
+
+
+# ---- 产物 D: peakrng 重叠峰检测辅助函数 ----
+
+@dataclass
+class PeakRange:
+    """peakrng 文件中的单个峰区间 (F2 维, ppm).
+
+    Attributes:
+        low_ppm: 低场端 (高 ppm)
+        high_ppm: 高场端 (低 ppm)
+        intensity_min: 区间最低强度 (cm)
+        intensity_max: 区间最高强度 (cm)
+        region_id: 区间序号 (从 1 开始)
+    """
+    low_ppm: float
+    high_ppm: float
+    intensity_min: float = 0.0
+    intensity_max: float = 0.0
+    region_id: int = 0
+
+
+def _parse_peakrng(peakrng_path: str) -> List[PeakRange]:
+    """解析 Bruker peakrng 文件.
+
+    文件格式 (按列):
+      P    #regions in PPM
+      # ...
+      # low field   high field   mi   maxi
+      <low_ppm>  <high_ppm>  <mi>  <maxi>  # for region N
+
+    Args:
+        peakrng_path: peakrng 文件路径
+
+    Returns:
+        PeakRange 列表 (按 region_id 升序)
+    """
+    out: List[PeakRange] = []
+    if not peakrng_path or not os.path.isfile(peakrng_path):
+        return out
+    try:
+        with open(peakrng_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except OSError:
+        return out
+
+    # 提取每个 region 行 (数字 4 个一组, 后跟 # for region N)
+    region_re = re.compile(
+        r'^\s*([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s+([-+]?\d+\.?\d*)\s*#\s*for\s+region\s+(\d+)',
+        re.MULTILINE,
+    )
+    for m in region_re.finditer(content):
+        try:
+            low_ppm = float(m.group(1))
+            high_ppm = float(m.group(2))
+            mi = float(m.group(3))
+            maxi = float(m.group(4))
+            region_id = int(m.group(5))
+        except (ValueError, IndexError):
+            continue
+        out.append(PeakRange(
+            low_ppm=low_ppm,
+            high_ppm=high_ppm,
+            intensity_min=mi,
+            intensity_max=maxi,
+            region_id=region_id,
+        ))
+    out.sort(key=lambda r: r.region_id)
+    return out
+
+
+def _find_peakrng_for_h_ppm(
+    h_ppm: float,
+    peakrngs: List[PeakRange],
+    tol: float = 0.02,
+) -> Optional[PeakRange]:
+    """查找 h_ppm 落入的 peakrng 区间 (含 tol 容差).
+
+    Args:
+        h_ppm: 1H 化学位移
+        peakrngs: PeakRange 列表
+        tol: 边界容差 (ppm)
+
+    Returns:
+        PeakRange 或 None
+    """
+    for pr in peakrngs:
+        lo = min(pr.low_ppm, pr.high_ppm)
+        hi = max(pr.low_ppm, pr.high_ppm)
+        if (lo - tol) <= h_ppm <= (hi + tol):
+            return pr
+    return None
+
+
+def annotate_overlap_from_peakrng(
+    ch_pairs: List['CHPair'],
+    peakrngs: List[PeakRange],
+) -> List[Tuple[int, List[int]]]:
+    """对 ch_pairs 标 peakrng 重叠峰 (产物 D).
+
+    算法:
+      1. 为每个 CHPair 找其 h_ppm 落入的 peakrng 区间
+      2. 若同一 peakrng 区间包含 ≥2 个 CHPair → 标记这些 CHPair 为
+         is_overlap_from_peakrng = True (仪器积分时合并, 提示 1H 重叠)
+
+    Args:
+        ch_pairs: HSQC C-H 对列表 (in-place 标注 is_overlap_from_peakrng)
+        peakrngs: PeakRange 列表
+
+    Returns:
+        [(region_id, [idx_in_ch_pairs, ...]), ...] 每个重叠区包含的 CHPair 索引
+    """
+    if not peakrngs or not ch_pairs:
+        return []
+    by_region: Dict[int, List[int]] = {}
+    for i, p in enumerate(ch_pairs):
+        pr = _find_peakrng_for_h_ppm(p.h_ppm, peakrngs)
+        if pr is None:
+            continue
+        by_region.setdefault(pr.region_id, []).append(i)
+    overlap_groups: List[Tuple[int, List[int]]] = []
+    for region_id, idxs in by_region.items():
+        if len(idxs) >= 2:
+            for i in idxs:
+                ch_pairs[i].is_overlap_from_peakrng = True
+            overlap_groups.append((region_id, idxs))
+    return overlap_groups
 
 
 # ---- 步骤 1b (新): 对每个 CHPair 做 1H 多重峰精细化分析 ----
@@ -1284,6 +1415,7 @@ def interpret_2d_sequential(
     h1_field_mhz: float = 0.0,
     solvent: str = '',
     quiet: bool = False,
+    peakrng_path: Optional[str] = None,  # 产物 D: peakrng 文件路径
 ) -> Interpretation2D:
     """按化学家顺序逐步解读 2D NMR, 返回结构化中间结果.
 
@@ -1321,6 +1453,23 @@ def interpret_2d_sequential(
         spectra_2d, dept_summary, proton_integrals, multiplets, solvent=solvent,
         carbon_shifts_1d=carbon_shifts_1d, proton_shifts_1d=proton_shifts_1d)
     result.ch_pairs = ch_pairs
+
+    # 产物 D: peakrng 重叠区标记 (仪器积分合并的 1H 重叠)
+    # 算法: 同一 peakrng 区间内的多个 CHPair → is_overlap_from_peakrng=True
+    peakrngs = _parse_peakrng(peakrng_path) if peakrng_path else []
+    overlap_groups_from_peakrng: List[Tuple[int, List[int]]] = []
+    if peakrngs and ch_pairs:
+        overlap_groups_from_peakrng = annotate_overlap_from_peakrng(
+            ch_pairs, peakrngs,
+        )
+        if overlap_groups_from_peakrng and not quiet:
+            print(f'[2.85.D] peakrng 重叠峰: {len(overlap_groups_from_peakrng)} 个区间, '
+                  f'覆盖 {sum(len(g) for _, g in overlap_groups_from_peakrng)} 个 CHPair',
+                  file=sys.stderr)
+    result.notes.append(
+        f'peakrng_overlap_regions={len(overlap_groups_from_peakrng)} '
+        f'covered_chpairs={sum(len(g) for _, g in overlap_groups_from_peakrng)}'
+    )
 
     # 步骤 1b: 重叠峰分解 (对标 5.9 流程: ¹³C 切片 + 分峰检测)
     if 'HSQC' in spectra_2d:
@@ -1664,7 +1813,8 @@ def write_step_files(
         w = csv.writer(f)
         w.writerow(['编号', 'C_label', 'H_label', 'dH_ppm', 'dC_ppm', '1H积分', 'H个数',
                     '碳级数', 'J_couplings_Hz', 'h_neighbors_ppm',
-                    'is_solvent_residual'])  # Part 2.B
+                    'is_solvent_residual',
+                    'is_overlap_from_peakrng'])  # 产物 D
         for i, p in enumerate(result.ch_pairs, 1):
             h_int = f'{p.h_integral:.3f}' if p.h_integral is not None else ''
             n_h = str(round(p.h_integral)) if p.h_integral is not None else ''
@@ -1673,7 +1823,8 @@ def write_step_files(
             w.writerow([i, p.assigned_c_label, p.assigned_h_label,
                         f'{p.h_ppm:.4f}', f'{p.c_ppm:.4f}', h_int, n_h,
                         p.multiplicity, j_str, hn_str,
-                        'Y' if p.is_solvent_residual else ''])
+                        'Y' if p.is_solvent_residual else '',
+                        'Y' if p.is_overlap_from_peakrng else ''])
     written.append(path1)
 
     # 步骤 1 附加: 所有 C-H 对等高线图 (分 overlap/normal 两个子文件夹)
