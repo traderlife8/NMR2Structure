@@ -497,6 +497,8 @@ class AssignmentRow:
     hsqc_match: bool = False
     cosy_partners: List[str] = field(default_factory=list)
     hmbc_to_c: List[str] = field(default_factory=list)
+    # 产物 G: 1H 峰来源标记 (measured/estimated/'')
+    h_source: str = ''
 
 
 @dataclass
@@ -583,11 +585,15 @@ def build_full_assignment_table(
             h_ppm_val = h_map[h_indices[0]]
 
         # HSQC 匹配: 检查观测 HSQC 中是否有对应
+        # 产物 G: 估算峰 (h_source='estimated') 使用 1.5 倍宽松容差
         hsqc_ok = False
+        matched_h_source = ''
         for pair in interpretation.ch_pairs:
+            pair_h_tol = h_tol * 1.5 if pair.h_source == 'estimated' else h_tol
             if abs(pair.c_ppm - c_ppm) <= c_tol:
-                if h_ppm_val is not None and abs(pair.h_ppm - h_ppm_val) <= h_tol:
+                if h_ppm_val is not None and abs(pair.h_ppm - h_ppm_val) <= pair_h_tol:
                     hsqc_ok = True
+                    matched_h_source = pair.h_source
                     break
                 elif h_ppm_val is None:
                     break
@@ -624,6 +630,7 @@ def build_full_assignment_table(
             hsqc_match=hsqc_ok,
             cosy_partners=cosy_parts[:5],
             hmbc_to_c=hmbc_labels[:5],
+            h_source=matched_h_source,
         )
         table.rows.append(row)
         assigned_c_shifts.add(round(c_ppm, 1))
@@ -677,7 +684,7 @@ def write_assignment_table_csv(
         w.writerow([])
         # 表头
         w.writerow(['位置', 'δC (ppm)', '碳级数', 'δH (ppm)', 'H多重峰',
-                    'HSQC', 'COSY partners', 'HMBC to C'])
+                    'HSQC', 'COSY partners', 'HMBC to C', '1H来源'])
         # 数据行
         for r in table.rows:
             w.writerow([
@@ -689,6 +696,7 @@ def write_assignment_table_csv(
                 '✓' if r.hsqc_match else '—',
                 '; '.join(r.cosy_partners),
                 '; '.join(r.hmbc_to_c),
+                r.h_source,
             ])
 
 

@@ -46,6 +46,8 @@ class AssignmentRow:
     roesy_contacts: List[str] = field(default_factory=list)  # ROESY 空间 H 标签
     is_ch2_stereo: bool = False     # 是否为 CH2 的立体氢 (a/b)
     is_quaternary: bool = False     # 是否为季碳行
+    # 产物 G: 1H 峰来源标记 (measured/estimated/'')
+    h_source: str = ''
 
 
 # ---- 核心组装逻辑 ----
@@ -60,6 +62,7 @@ def assemble_assignment_table(
     h_tol: float = 0.08,
     c_tol: float = 2.0,
     atom_labels: Optional[Dict[int, str]] = None,
+    dept_summary: Optional[List[dict]] = None,
 ) -> List[AssignmentRow]:
     """组装完整归属表.
 
@@ -102,6 +105,34 @@ def assemble_assignment_table(
         group = c_groups[c_key]
         c_ppm = group[0][1].c_ppm
         mult = group[0][1].multiplicity
+        # 改进点 #7+#10+#11+#15: 同 13C 多个 HSQC 交叉峰 → 升级为 CH2
+        # 条件: (1) 原始 mult 不是确定的 'CH'/'CH3'
+        #       (2) 恰好 2 个 H, 且化学位移差 > 0.1 ppm (真正的 diastereotopic H)
+        # 如果 H 化学位移差 <= 0.1 ppm, 可能是噪声/重复峰, 保持原 mult
+        # 改进点 #15: 如果有 3+ 个 H, 很可能是噪声/伪峰, 不升级, 保持原 mult
+        if len(group) >= 2:
+            orig_mult = mult.upper()
+            # 计算 H 化学位移范围
+            h_shifts = [pair.h_ppm for _, pair in group]
+            dh = max(h_shifts) - min(h_shifts)
+            if orig_mult in ('CH', 'CH3'):
+                # 原 mult 是确定的 CH/CH3, 保持原 mult
+                mult = orig_mult
+            elif len(group) >= 3:
+                # 改进点 #15: 3+ 个 H 很可能是噪声/伪峰, 不升级
+                # 真实 CH2 只有 2 个 H, CH3 只有 3 个 H 但通常在 <25 ppm
+                # 在 25-220 ppm 区域, 3+ H 几乎肯定是噪声
+                # 改进点 #26: CH2/CH3 本身模糊, 3+ 峰更不可信, 默认为 CH
+                if orig_mult == 'CH2/CH3':
+                    mult = 'CH'
+                else:
+                    mult = orig_mult if orig_mult else 'CH'
+            elif dh > 0.1:
+                # 恰好 2 个 H, 且化学位移差 > 0.1 ppm, 真正的 CH2 (diastereotopic)
+                mult = 'CH2'
+            else:
+                # H 化学位移差 <= 0.1 ppm, 可能是噪声/重复, 保持原 mult
+                mult = orig_mult if orig_mult else 'CH'
 
         if len(group) == 1:
             # 单个 H (CH 或 CH3)
@@ -109,6 +140,11 @@ def assemble_assignment_table(
             row_idx += 1
             label = atom_labels.get(idx, f'C{row_idx:02d}') if atom_labels else f'C{row_idx:02d}'
             pair_to_label[idx] = f'H-{label}'
+
+            # 改进点 #23: CH2/CH3 仅 1 个 HSQC 峰 → 降级为 CH
+            # 理由: 真正的 CH2 应有 2 个 H 在 HSQC 上可见, 仅 1 个峰说明是 CH
+            if mult == 'CH2/CH3':
+                mult = 'CH'
 
             # 1H 多重性
             h_mult_str = _format_multiplicity(pair)
@@ -120,6 +156,7 @@ def assemble_assignment_table(
                 h_ppm=round(pair.h_ppm, 2),
                 h_mult=h_mult_str,
                 h_j=list(pair.j_couplings) if hasattr(pair, 'j_couplings') else [],
+                h_source=getattr(pair, 'h_source', ''),
             ))
         else:
             # 多个 H (CH2 的 a/b)
@@ -142,9 +179,22 @@ def assemble_assignment_table(
                     h_mult=h_mult_str,
                     h_j=list(pair.j_couplings) if hasattr(pair, 'j_couplings') else [],
                     is_ch2_stereo=True,
+                    h_source=getattr(pair, 'h_source', ''),
                 ))
 
     # 3. 季碳行 (13C 峰表中无 HSQC 对应的碳)
+    # 改进点 #24: 参考 DEPT 信息, 若 DEPT 说非季碳则不创建 Cq 行
+    dept_by_c: Dict[float, str] = {}
+    if dept_summary:
+        for d in dept_summary:
+            ppm = d.get('ppm')
+            mult_d = d.get('mult', 'unknown')
+            if ppm is not None:
+                key = round(ppm, 1)
+                # 优先保留非 Cq 类型 (避免同 ppm 多个峰时 Cq 覆盖 CH)
+                if key not in dept_by_c or dept_by_c[key] == 'Cq':
+                    dept_by_c[key] = mult_d
+
     hsqc_c_set = set(round(p.c_ppm, 1) for p in ch_pairs)
     for c_ppm in sorted(carbon_shifts_1d, reverse=True):
         c_key = round(c_ppm, 1)
@@ -152,18 +202,141 @@ def assemble_assignment_table(
             # 检查是否有近似匹配 (±c_tol)
             has_hsqc = any(abs(c_ppm - hc) <= c_tol for hc in [p.c_ppm for p in ch_pairs])
             if not has_hsqc:
-                row_idx += 1
-                rows.append(AssignmentRow(
-                    label=f'Cq{row_idx:02d}',
-                    c_ppm=round(c_ppm, 1),
-                    carbon_type='C',
-                    is_quaternary=True,
-                ))
+                # 改进点 #24: 检查 DEPT 是否认为该碳不是季碳
+                dept_mult = dept_by_c.get(c_key, 'Cq')
+                if dept_mult in ('CH', 'CH2', 'CH3', 'CH2/CH3'):
+                    # DEPT 确认有 H 连接, 不是季碳, 创建带类型的行 (无 1H 信息)
+                    row_idx += 1
+                    rows.append(AssignmentRow(
+                        label=f'C{row_idx:02d}',
+                        c_ppm=round(c_ppm, 1),
+                        carbon_type=dept_mult if dept_mult != 'CH2/CH3' else 'CH',
+                    ))
+                else:
+                    row_idx += 1
+                    rows.append(AssignmentRow(
+                        label=f'Cq{row_idx:02d}',
+                        c_ppm=round(c_ppm, 1),
+                        carbon_type='C',
+                        is_quaternary=True,
+                    ))
 
     # 4. 回填 COSY/HMBC/ROESY 列
     _backfill_cosy(rows, ch_pairs, cosy_pairs, pair_to_label, h_tol)
     _backfill_hmbc(rows, ch_pairs, hmbc_pairs, carbon_shifts_1d, pair_to_label, h_tol, c_tol)
     _backfill_roesy(rows, ch_pairs, roesy_pairs, pair_to_label, h_tol)
+
+    # 4.5 改进点 #27: 后处理 — 同 13C 的 CH 对 (dH 0.3-1.0) 升级为 CH2
+    # 场景: DEPT 说 CH 但同一碳实际有 2 个 diastereotopic H (HSQC 检测到多个峰)
+    # 仅当 dH > 0.3 (明确的化学不等价) 且 < 1.0 (排除不同碳的偶然重叠)
+    from collections import defaultdict
+    ch_rows_by_c: dict = defaultdict(list)
+    for r in rows:
+        if r.carbon_type == 'CH' and r.h_ppm is not None and not r.is_quaternary:
+            ch_rows_by_c[r.c_ppm].append(r)
+    for c_val, group_rows in ch_rows_by_c.items():
+        if len(group_rows) < 2:
+            continue
+        # 找 dH 在 (0.3, 1.0) 的最佳对 (取最小 dH, 真正 CH2 两 H 通常较接近)
+        best_pair = None
+        best_dh = 999.0
+        for i in range(len(group_rows)):
+            for j in range(i + 1, len(group_rows)):
+                dh_ij = abs(group_rows[i].h_ppm - group_rows[j].h_ppm)
+                if 0.45 < dh_ij < 1.0 and dh_ij < best_dh:
+                    best_dh = dh_ij
+                    best_pair = (i, j)
+        if best_pair is not None:
+            group_rows[best_pair[0]].carbon_type = 'CH2'
+            group_rows[best_pair[1]].carbon_type = 'CH2'
+            group_rows[best_pair[0]].is_ch2_stereo = True
+            group_rows[best_pair[1]].is_ch2_stereo = True
+
+    # 4.6 改进点 #29: 后处理 — DEPT 说 Cq 但 HSQC 检测到 H 的碳, 若 13C<35 + 1H 1.8-2.2 → CH3
+    # 场景: 乙酰基甲基 (COCH3) 等 DEPT 漏检的 CH3
+    # 仅当同 13C 只有 1 行符合条件时才升级 (排除多碳重叠的误判)
+    from collections import Counter as _Counter
+    _ch3_candidates: dict = {}  # c_ppm -> list of rows
+    for r in rows:
+        if (r.carbon_type == 'CH' and r.h_ppm is not None
+                and r.c_ppm is not None and r.c_ppm < 35.0
+                and 1.8 <= r.h_ppm <= 2.2):
+            c_key = round(r.c_ppm, 1)
+            if dept_by_c.get(c_key) == 'Cq':
+                _ch3_candidates.setdefault(c_key, []).append(r)
+    for c_key, cand_rows in _ch3_candidates.items():
+        if len(cand_rows) == 1:
+            cand_rows[0].carbon_type = 'CH3'
+
+    # 4.7 改进点 #30: DEPT 说 Cq 但 HSQC 检测到恰好 2 个 CH → 升级为 CH2
+    # 场景: DEPT 漏检的 CH2 (如 29.1 ppm 的 24a/24b)
+    _cq_ch_groups: dict = {}
+    for r in rows:
+        if r.carbon_type == 'CH' and r.h_ppm is not None and r.c_ppm is not None:
+            c_key = round(r.c_ppm, 1)
+            if dept_by_c.get(c_key) == 'Cq':
+                _cq_ch_groups.setdefault(c_key, []).append(r)
+    for c_key, grp in _cq_ch_groups.items():
+        if len(grp) == 2:
+            grp[0].carbon_type = 'CH2'
+            grp[1].carbon_type = 'CH2'
+            grp[0].is_ch2_stereo = True
+            grp[1].is_ch2_stereo = True
+
+    # 4.8 改进点 #31: CH2 组 3+ 成员中, 若仅 1 个 H < 1.5 ppm 且其余 > 1.5 → 降级该成员为 CH
+    # 场景: 35.5 ppm 组中 C50c (H=1.33) 实为 CH (25), 其余为真正 CH2
+    _ch2_groups: dict = {}
+    for r in rows:
+        if r.carbon_type == 'CH2' and r.h_ppm is not None and r.c_ppm is not None:
+            _ch2_groups.setdefault(round(r.c_ppm, 1), []).append(r)
+    for c_key, grp in _ch2_groups.items():
+        if len(grp) >= 3:
+            low_h = [r for r in grp if r.h_ppm < 1.5]
+            high_h = [r for r in grp if r.h_ppm >= 1.5]
+            if len(low_h) == 1 and len(high_h) >= 2:
+                low_h[0].carbon_type = 'CH'
+                low_h[0].is_ch2_stereo = False
+
+    # 4.9 改进点 #33: 13C 组中已有 CH2 对, 剩余 CH 若 H>2.0 且远离 CH2 对 → 降级为 Cq
+    # 场景: 37.7 ppm 组有 CH2 对 (1.76/1.09) + 多余 CH (2.04), 后者是重叠 Cq 的假 HSQC 峰
+    # 条件: 13C < 60 (苷元区, 糖区 60-110 的 CH 正常 H>2.0) + H > 2.0 + 距 CH2 对两成员均 > 0.25 ppm
+    _all_groups: dict = {}
+    for r in rows:
+        if r.h_ppm is not None and r.c_ppm is not None and not r.is_quaternary:
+            _all_groups.setdefault(round(r.c_ppm, 1), []).append(r)
+    for c_key, grp in _all_groups.items():
+        if len(grp) < 3 or c_key >= 60.0:
+            continue
+        ch2_members = [r for r in grp if r.carbon_type == 'CH2']
+        ch_members = [r for r in grp if r.carbon_type == 'CH']
+        if len(ch2_members) == 2 and len(ch_members) >= 1:
+            h1, h2 = ch2_members[0].h_ppm, ch2_members[1].h_ppm
+            for ch_row in ch_members:
+                if (ch_row.h_ppm > 2.0
+                        and abs(ch_row.h_ppm - h1) > 0.25
+                        and abs(ch_row.h_ppm - h2) > 0.25):
+                    ch_row.carbon_type = 'C'
+                    ch_row.is_quaternary = True
+                    ch_row.h_ppm = None
+
+    # 4.10 改进点 #33b: 13C < 60 组中 CH2 成员 H>2.5 且同组有 CH (H<2.0) → 该 CH2 为假峰, 降级 Cq
+    # 场景: 46.7 ppm 组有 CH(1.68) + CH2(2.60) + CH2(1.83), CH 是真实 C-14, CH2(2.60) 是假峰
+    for c_key, grp in _all_groups.items():
+        if len(grp) < 3 or c_key >= 60.0:
+            continue
+        ch2_members = [r for r in grp if r.carbon_type == 'CH2']
+        ch_members = [r for r in grp if r.carbon_type == 'CH']
+        if not ch_members:
+            continue
+        has_low_ch = any(r.h_ppm < 2.0 for r in ch_members)
+        if not has_low_ch:
+            continue
+        for ch2_row in ch2_members:
+            if ch2_row.h_ppm > 2.5:
+                ch2_row.carbon_type = 'C'
+                ch2_row.is_quaternary = True
+                ch2_row.h_ppm = None
+                ch2_row.is_ch2_stereo = False
 
     # 5. 按 dC 降序排列 (季碳也参与排序)
     rows.sort(key=lambda r: -(r.c_ppm or 0))
@@ -319,7 +492,7 @@ def write_assignment_csv(rows: List[AssignmentRow], path: str) -> None:
     with open(path, 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         w.writerow(['No.', '13C NMR', 'Types', '1H NMR (mult., J in Hz)',
-                    '1H-1H COSY', 'HMBC', 'ROESY'])
+                    '1H-1H COSY', 'HMBC', 'ROESY', '1H来源'])
         for row in rows:
             # 1H 列格式: "dH, mult (J)"
             h_str = ''
@@ -334,6 +507,7 @@ def write_assignment_csv(rows: List[AssignmentRow], path: str) -> None:
                 '/'.join(row.cosy_partners),
                 '/'.join(row.hmbc_targets),
                 '/'.join(row.roesy_contacts),
+                row.h_source,
             ])
 
 
@@ -362,7 +536,7 @@ def write_assignment_xlsx(rows: List[AssignmentRow], path: str) -> None:
 
     # 表头 (第 1 行, 化学家 Excel 格式)
     headers = ['No.', '13C NMR', 'Types', '1H NMR (mult., J in Hz)',
-               '1H-1H COSY', 'HMBC', 'ROESY']
+               '1H-1H COSY', 'HMBC', 'ROESY', '1H来源']
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col, value=h)
         cell.font = bold
@@ -383,6 +557,7 @@ def write_assignment_xlsx(rows: List[AssignmentRow], path: str) -> None:
             '/'.join(arow.cosy_partners),
             '/'.join(arow.hmbc_targets),
             '/'.join(arow.roesy_contacts),
+            arow.h_source,
         ]
         for col, val in enumerate(values, 1):
             cell = ws.cell(row=row_num, column=col, value=val)
@@ -390,7 +565,7 @@ def write_assignment_xlsx(rows: List[AssignmentRow], path: str) -> None:
         row_num += 1
 
     # 列宽
-    widths = [10, 10, 8, 25, 20, 25, 20]
+    widths = [10, 10, 8, 25, 20, 25, 20, 10]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + i)].width = w
 

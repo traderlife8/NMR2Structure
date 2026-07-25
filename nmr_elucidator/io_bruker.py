@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
+import numpy as np
+
 
 # ---- 数据结构 ----
 
@@ -38,6 +40,11 @@ class Peak:
     # Part 2.B: 溶剂残余峰标记. 从 spectrum.solvent 推断, 不阻断主流程.
     # 视为溶剂残余峰的 peak 不参与候选检索/2D 解读, 但保留原始记录.
     is_solvent_residual: bool = False
+    # 峰来源标记 (用于 2D 氢谱修正数据):
+    #   'measured'  = 实测峰 (来自 exp 31 原始数据)
+    #   'estimated' = 估算峰 (来自 exp 21 + 溶剂偏移)
+    #   ''          = 默认/未知 (普通 1D 谱)
+    source: str = ''
 
 
 @dataclass
@@ -368,10 +375,13 @@ def _parse_peaklist_xml(path: str) -> List[Peak]:
                 intensity = float(peak.attrib.get('intensity', '0'))
             except ValueError:
                 intensity = 0.0
+            # 读取峰来源标记 (用于 2D 氢谱修正数据)
+            source = peak.attrib.get('source', '')
             out.append(Peak(
                 shift=shift, intensity=intensity,
                 region_low=region_low, region_high=region_high,
                 sign=_infer_peak_sign(intensity, nucleus_hint='', pulse_hint=''),
+                source=source,
             ))
     return out
 
@@ -415,7 +425,7 @@ def _parse_integrals(path: str) -> List[IntegralRegion]:
         with open(path, 'r', encoding='utf-8', errors='replace') as f:
             lines = f.readlines()
     except OSError as e:
-        raise BrukerReadError(f"无法读取积分文件: {e}", path, stage="integrals-open")
+        raise BrukerReadError(f'无法读取积分文件: {e}', path, stage='integrals-open')
     for line in lines:
         s = line.strip()
         # 形如: '    1      7.165      7.025         3.80669'
@@ -431,6 +441,150 @@ def _parse_integrals(path: str) -> List[IntegralRegion]:
             continue
         out.append(IntegralRegion(low=low, high=high, value=value))
     return out
+
+
+def _parse_intrng(intrng_path: str) -> List[Tuple[float, float]]:
+    """解析 Bruker intrng 积分区间文件.
+
+    格式 (Bruker TopSpin):
+      首行: 'P 0'  (说明区域)
+      后续行: 'high_ppm low_ppm'  (按高→低场 ppt)
+    """
+    if not os.path.exists(intrng_path):
+        return []
+    out: List[Tuple[float, float]] = []
+    try:
+        with open(intrng_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 2:
+            continue
+        # 跳过类似 'P 0' 的元信息行 (首字符不是数字)
+        try:
+            high = float(parts[0])
+            low = float(parts[1])
+        except ValueError:
+            continue
+        # intrng 是 high → low, 计算中心时取平均
+        out.append((min(high, low), max(high, low)))
+    return out
+
+
+def _compute_integrals_from_1r(
+    pdata_dir: str,
+    regions: List[Tuple[float, float]],
+) -> List[IntegralRegion]:
+    """从 Bruker 1r 二进制谱上积分.
+
+    Args:
+        pdata_dir: pdata/1 路径
+        regions: [(low_ppm, high_ppm), ...] 积分区间
+
+    Returns:
+        IntegralRegion 列表 (value 为积分面积 = 强度 × 点数)
+    """
+    out: List[IntegralRegion] = []
+    if not regions:
+        return out
+    try:
+        import nmrglue as ng
+    except ImportError:
+        return out
+    # 读 procs 与 1r
+    try:
+        dic, data = ng.bruker.read_pdata(pdata_dir)
+    except Exception:
+        return out
+    # ppm 轴
+    try:
+        udic = ng.bruker.guess_udic(dic, data)
+        # 1D 谱只有一个维; nmrglue ndim=1 时 uc_from_udic 使用 dim=0
+        dim_n = data.ndim if hasattr(data, 'ndim') else 1
+        dim_idx = dim_n - 1 if dim_n > 0 else 0
+        uc = ng.fileiobase.uc_from_udic(udic, dim=dim_idx)
+        ppm_scale = np.asarray(uc.ppm_scale(), dtype=np.float64)
+    except Exception:
+        return out
+    if ppm_scale.size == 0 or data.size == 0:
+        return out
+    data_arr = np.asarray(data, dtype=np.float64).flatten()
+    # Bruker intensity 是实部; 1r 是 phase 校正后的谱, 应为正值
+    data_abs = np.abs(data_arr)
+
+    for low_ppm, high_ppm in regions:
+        # 区间内点的索引
+        mask = (ppm_scale >= low_ppm) & (ppm_scale <= high_ppm)
+        if not np.any(mask):
+            continue
+        idxs = np.where(mask)[0]
+        # 数值积分 (梯形法) — ppm 轴可能为高→低, 所以取绝对值
+        values = data_abs[idxs]
+        if values.size < 2:
+            continue
+        # 积分面积 (梯形总和, 取绝对值保证正向)
+        area = float(np.trapz(values, dx=(ppm_scale[1] - ppm_scale[0])))
+        area = abs(area)
+        # 中心 ppm
+        center = (low_ppm + high_ppm) / 2.0
+        out.append(IntegralRegion(low=low_ppm, high=high_ppm, value=round(area, 3)))
+    return out
+
+
+def auto_integrate_1h_if_missing(
+    exp_dir: str,
+    write_back: bool = True,
+) -> List[IntegralRegion]:
+    """为缺失 integrals.txt 的 1H 实验自动积分.
+
+    策略:
+      1. 读 intrng 中的区间
+      2. 若 intrng 为空, 使用 peaklist.xml 中峰间距分割区间 (基于全 1r 谱)
+      3. 从 1r + procs 计算积分
+      4. 可选写到 exp_dir/pdata/1/integrals.txt
+
+    Returns:
+        积分区间列表. 若失败返回 [].
+    """
+    pdata_dir = os.path.join(exp_dir, 'pdata', '1')
+    ints_path = os.path.join(pdata_dir, 'integrals.txt')
+    if os.path.exists(ints_path):
+        return _parse_integrals(ints_path)
+
+    intrng_path = os.path.join(pdata_dir, 'intrng')
+    regions = _parse_intrng(intrng_path)
+    if not regions:
+        # 兑底: 从 peaklist.xml 取峰间距划分区间, 需 ppm 轴由 1r + procs 构建
+        peaks = _parse_peaklist_xml(os.path.join(pdata_dir, 'peaklist.xml'))
+        if not peaks:
+            return []
+        sorted_peaks = sorted(peaks, key=lambda p: -p.shift)  # high to low
+        # 两峰间取中点作为区间边界
+        sorted_peaks_shifts = [p.shift for p in sorted_peaks]
+        regions = []
+        for i in range(len(sorted_peaks_shifts) - 1):
+            mid = (sorted_peaks_shifts[i] + sorted_peaks_shifts[i + 1]) / 2.0
+            regions.append((mid, sorted_peaks_shifts[i]))
+        # 首尾与 “谱窗口”边界平接
+        # tail 区域
+        regions.append((sorted_peaks_shifts[-1] - 0.5, sorted_peaks_shifts[-1]))
+        # head 区域
+        regions.append((sorted_peaks_shifts[0], sorted_peaks_shifts[0] + 0.5))
+        # 交换使 (low, high) 格式统一
+        regions = [(min(a, b), max(a, b)) for a, b in regions]
+
+    integ = _compute_integrals_from_1r(pdata_dir, regions)
+    if write_back and integ:
+        try:
+            with open(ints_path, 'w', encoding='utf-8') as f:
+                f.write('# Auto-integrated by nmr_elucidator (from intrng + 1r)\n')
+                for i, ig in enumerate(integ, 1):
+                    f.write(f'{i:>5d}  {ig.low:>10.4f}  {ig.high:>10.4f}  {ig.value:>12.5f}\n')
+        except OSError:
+            pass
+    return integ
 
 
 # ---- 顶层接口 ----
@@ -495,6 +649,13 @@ def read_bruker_experiment(exp_dir: str) -> BrukerSpectrum:
     # 积分（仅氢谱有意义）
     integrals_path = os.path.join(exp_dir, 'pdata', '1', 'integrals.txt')
     integrals = _parse_integrals(integrals_path) if nucleus == '1H' else []
+    # 产物 G: 缺失积分时自动从 intrng + 1r 计算并写回 pdata/1/integrals.txt
+    if nucleus == '1H' and not integrals:
+        try:
+            integrals = auto_integrate_1h_if_missing(exp_dir, write_back=True)
+        except Exception as ex:
+            print(f'WARN: 1H 自动积分失败 ({exp_no}): {ex}', file=sys.stderr)
+            integrals = []
 
     if not peaks:
         raise BrukerReadError(
@@ -638,11 +799,18 @@ def select_h_specs_by_process(
         cand = [s for s in h_specs
                 if (s.solvent or '').upper() == target_2d_solvent.upper()]
         if cand:
-            # 多个候选时，选 SW 最大的（高分辨率）
-            h_2d = max(cand, key=lambda s: len(s.peaks))
+            # 优先选择修正后的数据 (文件夹名含 '修正')
+            corrected_cand = [s for s in cand if '修正' in str(s.exp_no)]
+            if corrected_cand:
+                h_2d = corrected_cand[0]
+            else:
+                # 多个候选时，选峰数最多的（高分辨率）
+                h_2d = max(cand, key=lambda s: len(s.peaks))
 
     if h_2d is None and pyr_h:
-        h_2d = pyr_h[0]
+        # 优先选择修正后的数据
+        corrected_pyr = [s for s in pyr_h if '修正' in str(s.exp_no)]
+        h_2d = corrected_pyr[0] if corrected_pyr else pyr_h[0]
     if h_2d is None:
         h_2d = h_1d  # 兜底
 

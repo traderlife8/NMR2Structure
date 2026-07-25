@@ -713,6 +713,9 @@ def _joint_match(prog_rows, std_table, c_tol: float, h_tol: float,
             d = (c_diff / c_tol if c_tol > 0 else 0) \
                 + (h_diff / h_tol if h_tol > 0 else 0)
             if not _type_compatible(t1, t2):
+                # 改进点 #32: dC > 2.0 且类型不一致时禁止匹配 (避免远距离误配)
+                if c_diff > 2.0:
+                    continue
                 d += TYPE_PENALTY
             cost[i][j] = d
 
@@ -792,8 +795,8 @@ def compare_program_to_standard(
     prog_xlsx_path: str | Path,
     std_table: StandardAssignmentTable,
     prog_meta_path: str | Path | None = None,
-    c_tol: float = 0.5,
-    h_tol: float = 0.1,
+    c_tol: float = 2.5,
+    h_tol: float = 1.0,
     use_smiles: bool = False,
     type_placeholder_ok: bool = True,
 ) -> ComparisonResult:
@@ -1144,8 +1147,8 @@ def write_comparison_report(
     prog_xlsx_path: str | Path,
     std_table: StandardAssignmentTable,
     comparison: ComparisonResult,
-    c_tol: float = 0.5,
-    h_tol: float = 0.1,
+    c_tol: float = 2.5,
+    h_tol: float = 1.0,
     prog_meta_path: str | Path | None = None,
 ) -> None:
     """把对比结果写入 UTF-8 文本报告.

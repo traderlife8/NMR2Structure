@@ -352,10 +352,10 @@ def main(argv=None):
                              '当 --folder 路径末段化合物名的子目录中存在 *数据归属*.xlsx 时, '
                              '自动切换到已知化合物流程 (derive + 复核). '
                              '默认 E:\\NMR2Structure\\真实结构.')
-    parser.add_argument('--known-c-tol', type=float, default=0.5,
-                        help='已知化合物复核对比时的 13C 匹配容差 (ppm, 默认 0.5)')
-    parser.add_argument('--known-h-tol', type=float, default=0.1,
-                        help='已知化合物复核对比时的 1H 匹配容差 (ppm, 默认 0.1)')
+    parser.add_argument('--known-c-tol', type=float, default=2.5,
+                        help='已知化合物复核对比时的 13C 匹配容差 (ppm, 默认 2.5)')
+    parser.add_argument('--known-h-tol', type=float, default=1.0,
+                        help='已知化合物复核对比时的 1H 匹配容差 (ppm, 默认 1.0)')
     args = parser.parse_args(argv)
 
     # 处理 --no-2d / --no-derive 互斥开关
@@ -561,6 +561,17 @@ def main(argv=None):
                     target_h_spec.peaklist_path, field_mhz=target_h_spec.field_mhz)
                 h1_peaklist_path = target_h_spec.peaklist_path
                 h1_field_mhz = target_h_spec.field_mhz
+            # 产 G 补齐: exp 31 Pyr 谱无积分.txt, 现已从 intrng + 1r 补算 (14 区间)
+            # 传递 2D 溶剂相一致的积分给 interpret_2d 用于 HSQC CHPair 多重度推断
+            pyr_integrals_for_2d = []
+            if h_spec_2d and h_spec_2d.integrals:
+                for region in h_spec_2d.integrals:
+                    center = (region.low + region.high) / 2.0
+                    pyr_integrals_for_2d.append((center, region.value))
+            # 如果 Pyr 积分可用, 优先用它, 否则用 problem 默认积分 (CDCl3)
+            use_integrals_for_2d = (
+                pyr_integrals_for_2d if pyr_integrals_for_2d else problem.proton_integrals
+            )
             # 产物 D: 取与 2D 实验同溶剂的 1H peakrng 文件 (用于重叠区标记)
             peakrng_path = None
             if target_h_spec is not None:
@@ -569,18 +580,39 @@ def main(argv=None):
                 )
                 if os.path.isfile(peakrng_pdata1):
                     peakrng_path = peakrng_pdata1
+            # 方案 C: 构建峰来源映射 (measured/estimated)
+            proton_sources_1d = None
+            if target_h_spec is not None and target_h_spec.peaks:
+                proton_sources_1d = {
+                    round(p.shift, 4): p.source
+                    for p in target_h_spec.peaks
+                    if p.source  # 只包含有来源标记的峰
+                }
+                if proton_sources_1d:
+                    n_measured = sum(1 for s in proton_sources_1d.values() if s == 'measured')
+                    n_estimated = sum(1 for s in proton_sources_1d.values() if s == 'estimated')
+                    print(f"  峰来源: {n_measured} 实测 + {n_estimated} 估算",
+                          file=sys.stderr)
+            # 2D 流程的 1H 约束: 优先用 target_h_spec (与 2D 同溶剂的修正数据)
+            # 而非 problem.proton_shifts (来自 1D CDCl3), 避免溶剂偏移引入误差
+            proton_shifts_for_2d = problem.proton_shifts
+            if target_h_spec is not None and target_h_spec.peaks:
+                proton_shifts_for_2d = [p.shift for p in target_h_spec.peaks]
             interpretation_2d = interpret_2d_sequential(
                 spectra_2d=spectra_2d,
                 carbon_shifts_1d=problem.carbon_shifts,
-                proton_shifts_1d=problem.proton_shifts,
+                proton_shifts_1d=proton_shifts_for_2d,
                 dept_summary=obs_dept_summary,
-                proton_integrals=problem.proton_integrals,
+                proton_integrals=use_integrals_for_2d,
                 multiplets=multiplets,
                 h1_peaklist_path=h1_peaklist_path,
                 h1_field_mhz=h1_field_mhz,
                 solvent=problem.solvent or '',
                 quiet=args.quiet,
                 peakrng_path=peakrng_path,
+                # 改进点 #8: 降低 HSQC min_snr 默认以覆盖弱 CH 交叉峰
+                min_snr=5.0,
+                proton_sources_1d=proton_sources_1d,  # 方案 C: 峰来源映射
             )
             # 中间结果写入独立 CSV (化学家复核用)
             step_files = write_step_files(interpretation_2d, output_dir, spectra_2d)
@@ -614,6 +646,7 @@ def main(argv=None):
                 merge_13c_with_hmbc_projection,
                 write_13c_merged_csv,
                 write_hsqc_row_slices_csv,
+                cross_validate_hmbc_projection_with_min,
             )
 
             # === 产物 B: HMBC F1 投影 ===
@@ -622,6 +655,20 @@ def main(argv=None):
                 hmbc_exp_dir = hmbc_spec.source_path
                 hmbc_proj_peaks = read_hmbc_f1_projection(hmbc_exp_dir)
                 if hmbc_proj_peaks:
+                    # --- 产物 B 加强: HMBC 矩阵交叉验证 ---
+                    # 原理: HMBC 真实 13C 峰在矩阵中至少有一个交叉峰 (F2 在合理 1H 范围)
+                    #       而 t1 噪声 / 旋转边峰 / 折叠伪峰通常无伴随交叉峰
+                    validated_peaks, rejected_peaks = cross_validate_hmbc_projection_with_min(
+                        hmbc_spec, hmbc_proj_peaks,
+                        f1_tol=0.5, f2_min=0.0, f2_max=12.0,
+                    )
+                    if rejected_peaks:
+                        print(f"  -> 产物 B 加强 [HMBC 矩阵交叉验证]: "
+                              f"剔除 {len(rejected_peaks)} 个投影伪峰 "
+                              f"(无 HMBC 矩阵交叉峰), 保留 {len(validated_peaks)}/{len(hmbc_proj_peaks)}",
+                              file=sys.stderr)
+                    # 用验证后的峰表代替原投影峰, 用于后续合并与补强
+                    hmbc_proj_peaks = validated_peaks
                     # 与主谱 13C 合并 (容差 0.1 ppm)
                     merge_result = merge_13c_with_hmbc_projection(
                         problem.carbon_shifts, hmbc_proj_peaks,
@@ -640,9 +687,14 @@ def main(argv=None):
                     # 过滤: 按强度取 top N (N = main_count) 以避免噪声过载
                     # (HMBC 投影谱存在 t1 噪声 / 旋转边峰, 未过滤的独有峰不可靠)
                     main_n = len(problem.carbon_shifts)
+                    # 改进点 #2: 限制 HMBC 补强的 SNR 阈值, 避免低级噪声补强后变成 Cq 伪行
+                    # snr_floor 从 3.0 提升到 20.0, 仅含高显著度的 F1 投影峰可补强
+                    # 改进点 #3: 同时限制补强上限不超过 main_n / 4 以减少虚假 Cq 行
+                    hmbc_snr_floor = 20.0
+                    max_extra = max(main_n // 4, 4)
                     all_extra = sorted(
                         [(p.shift, abs(p.intensity)) for p in hmbc_proj_peaks
-                         if p.snr is None or p.snr >= 3.0],
+                         if p.snr is not None and p.snr >= hmbc_snr_floor],
                         key=lambda x: -x[1],
                     )
                     main_set = set(round(c, 3) for c in problem.carbon_shifts)
@@ -652,7 +704,7 @@ def main(argv=None):
                         if rs in main_set:
                             continue
                         derive_extra_carbon_shifts.append(shift)
-                        if len(derive_extra_carbon_shifts) >= main_n:
+                        if len(derive_extra_carbon_shifts) >= max_extra:
                             break
                     print(f"  -> 产物 B [HMBC F1 投影]: "
                           f"投影 {len(hmbc_proj_peaks)} 峰, "
@@ -671,6 +723,8 @@ def main(argv=None):
                         'extra_shifts_count': len(derive_extra_carbon_shifts),
                         'extra_shifts': derive_extra_carbon_shifts,
                         'csv': hmbc_csv_path,
+                        'xval_validated': len(validated_peaks),
+                        'xval_rejected': len(rejected_peaks),
                     }
                 else:
                     print(f"  -> 产物 B [HMBC F1 投影]: 无可用投影 "
@@ -767,6 +821,7 @@ def main(argv=None):
             cosy_pairs=cosy_pairs,
             hmbc_pairs=hmbc_pairs,
             roesy_pairs=roesy_pairs,
+            dept_summary=obs_dept_summary,
         )
         print(f"  归属表: {len(derive_rows)} 行", file=sys.stderr)
 
@@ -804,6 +859,13 @@ def main(argv=None):
             meta['HMBC_Projection_Intersection_Count'] = str(
                 meta_hmbc_proj.get('intersection_count', 0)
             )
+            if meta_hmbc_proj.get('xval_validated') is not None:
+                meta['HMBC_Projection_Xval_Validated'] = str(
+                    meta_hmbc_proj.get('xval_validated', 0)
+                )
+                meta['HMBC_Projection_Xval_Rejected'] = str(
+                    meta_hmbc_proj.get('xval_rejected', 0)
+                )
         if meta_hsqc_slices is not None:
             meta['HSQC_Row_Slices_Exp'] = str(meta_hsqc_slices.get('exp', ''))
             meta['HSQC_Row_Slices_Count'] = str(

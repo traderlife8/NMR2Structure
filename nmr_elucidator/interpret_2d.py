@@ -41,6 +41,11 @@ class CHPair:
     # 产物 D: peakrng 重叠区标记. True 表示与至少一个其他 C-H 对共享 peakrng 区间
     # (即多个 1H 在仪器积分时合并到同一区域, 提示存在 1H 重叠需分解)
     is_overlap_from_peakrng: bool = False
+    # 1H 峰来源标记 (用于 2D 氢谱修正数据):
+    #   'measured'  = 实测峰 (来自 exp 31 原始数据, 高置信度)
+    #   'estimated' = 估算峰 (来自 exp 21 + 溶剂偏移, 低置信度)
+    #   ''          = 默认/未知 (普通 1D 谱)
+    h_source: str = ''
 
 
 @dataclass
@@ -167,6 +172,7 @@ def _step1_hsqc_to_ch_pairs(
     proton_shifts_1d: Optional[List[float]] = None,
     c_1d_tol: float = 2.0,
     h_1d_tol: float = 0.15,
+    proton_sources_1d: Optional[Dict[float, str]] = None,
 ) -> List[CHPair]:
     """从 HSQC 谱提取 C-H 直接连接对, 结合 DEPT 和 1H 积分确定碳级数.
 
@@ -182,6 +188,9 @@ def _step1_hsqc_to_ch_pairs(
     Part 2.B: 若提供 solvent, HSQC 中位于溶剂残余 (h, c) 位置的交叉峰会被标记
     为 is_solvent_residual, 仍在列表中返回 (供人工复核), 但不阻塞下游处理.
 
+    方案 C (混合策略): 若提供 proton_sources_1d, 对估算峰 (estimated) 使用更宽松的
+    容差 (h_1d_tol * 1.5), 并在 CHPair.h_source 中标记来源.
+
     Args:
         proton_integrals: [(center_ppm, integral_value), ...] 1H 积分数据
         multiplets: [Multiplet, ...] 1H 多重峰分析结果 (J 耦合)
@@ -190,6 +199,7 @@ def _step1_hsqc_to_ch_pairs(
         proton_shifts_1d: 1D 1H 观测位移列表 (用于约束 HSQC F2)
         c_1d_tol: 13C 约束容差 (ppm)
         h_1d_tol: 1H 约束容差 (ppm)
+        proton_sources_1d: {ppm: source} 峰来源映射 ('measured'/'estimated')
     """
     from .correlation_2d import extract_hsqc_pairs
 
@@ -242,9 +252,17 @@ def _step1_hsqc_to_ch_pairs(
             return False
 
         for c_ppm_target in carbon_shifts_1d:
-            # Part 3 Phase 2: 跳过 DEPT 确认为季碳的 13C 峰
-            if round(c_ppm_target, 1) in _cq_set:
-                continue
+            # 改进点 #28: 对 DEPT 季碳, 仅烯碳区 (100-130 ppm) 允许通过 (用更高阈值)
+            # 其他区域的 Cq 仍跳过 (避免噪声峰破坏匹配)
+            _is_dept_cq = round(c_ppm_target, 1) in _cq_set
+            if _is_dept_cq:
+                if 100.0 <= c_ppm_target <= 130.0 or 29.0 <= c_ppm_target <= 31.0:
+                    # 改进点 #28+#29: 烯碳区 + 乙酰基甲基区 (29-31 ppm) 允许 Cq 通过
+                    _effective_threshold = 5.0 * sigma
+                else:
+                    continue  # 其他区域 Cq 仍跳过
+            else:
+                _effective_threshold = guided_threshold
             # 找 F1 轴上最接近 c_ppm_target 的索引
             f1_idx = int(_np.argmin(_np.abs(f1_scale - c_ppm_target)))
             # 检查实际 dC 偏差 (若偏差 > c_1d_tol, 跳过)
@@ -261,42 +279,47 @@ def _step1_hsqc_to_ch_pairs(
             # 在 trace 中找最强峰 (排除负峰)
             max_idx = int(_np.argmax(trace))
             max_val = float(trace[max_idx])
-            if max_val < guided_threshold:
+            if max_val < _effective_threshold:
                 continue  # 该 13C 无 HSQC 交叉峰 (季碳)
 
             h_ppm = float(f2_scale[max_idx])
 
             # 1H 约束: 若提供 proton_shifts_1d, 检查是否有匹配的 1H 峰
-            if proton_shifts_1d:
-                h_match = any(abs(h_ppm - h1d) <= h_1d_tol
-                              for h1d in proton_shifts_1d)
-                if not h_match:
-                    # 尝试在 trace 中找次强峰 (可能有匹配的)
-                    # 将最强峰位置置零, 再找
-                    trace_copy = trace.copy()
-                    # 排除最强峰附近 ±5 点
+            # 改进点 #9: 以助于 CH2 互变体发现, 同时尝试 2 个 top k H 位
+            # 冱可能覆盖 CH2 互变体与未知主 k峰。
+            h_ppm_candidates = []
+            trace_iter = trace.copy()
+            for try_k in range(3):
+                if try_k > 0:
+                    # 清除前一个 top 峰附近
                     exc_lo = max(0, max_idx - 5)
-                    exc_hi = min(len(trace_copy), max_idx + 6)
-                    trace_copy[exc_lo:exc_hi] = 0
-                    max_idx2 = int(_np.argmax(trace_copy))
-                    max_val2 = float(trace_copy[max_idx2])
-                    if max_val2 >= guided_threshold:
-                        h_ppm2 = float(f2_scale[max_idx2])
-                        h_match2 = any(abs(h_ppm2 - h1d) <= h_1d_tol
-                                       for h1d in proton_shifts_1d)
-                        if h_match2:
-                            h_ppm = h_ppm2
-                            max_val = max_val2
-                        else:
-                            continue
-                    else:
-                        continue
-
-            # 溶剂过滤 (1H + 13C 双重匹配)
-            if _is_solvent_hsqc_pair(h_ppm, actual_c):
+                    exc_hi = min(len(trace_iter), max_idx + 6)
+                    trace_iter[exc_lo:exc_hi] = 0
+                    max_idx = int(_np.argmax(trace_iter))
+                    max_val = float(trace_iter[max_idx])
+                    if max_val < _effective_threshold:
+                        break
+                h_ppm_iter = float(f2_scale[max_idx])
+                if proton_shifts_1d:
+                    h_match = any(abs(h_ppm_iter - h1d) <= h_1d_tol
+                                  for h1d in proton_shifts_1d)
+                    if h_match:
+                        h_ppm_candidates.append(h_ppm_iter)
+                else:
+                    h_ppm_candidates.append(h_ppm_iter)
+            if not h_ppm_candidates:
                 continue
-
-            hsqc_pairs_raw.append((h_ppm, actual_c))
+            # 去重后的 H ppm 集
+            unique_h = []
+            for hp in h_ppm_candidates:
+                if not any(abs(hp - u) < 0.05 for u in unique_h):
+                    unique_h.append(hp)
+            # 对每个 H 都生成一个 CHPair (允许 CH2 互变体被发现)
+            for h_ppm in unique_h:
+                # 溶剂过滤 (1H + 13C 双重匹配)
+                if _is_solvent_hsqc_pair(h_ppm, actual_c):
+                    continue
+                hsqc_pairs_raw.append((h_ppm, actual_c))
 
         # 补充: 也加入传统峰检测的结果 (SNR >= 20 的强峰)
         strong_pairs = extract_hsqc_pairs(hsqc_spectrum, min_snr=20.0)
@@ -350,7 +373,10 @@ def _step1_hsqc_to_ch_pairs(
     integrals_sorted = sorted(proton_integrals or [], key=lambda x: x[0])
 
     def _find_integral(h_ppm: float) -> Optional[float]:
-        """找到包含 h_ppm 的积分区间的值."""
+        """找到包含 h_ppm 的积分区间的值.
+
+        改进点 #5: 优先使用归一化后的 H 计数 (0-4) 以供 _integral_to_mult 识别。
+        """
         if not integrals_sorted:
             return None
         # 找最近的积分中心 (容差 0.5 ppm)
@@ -360,25 +386,54 @@ def _step1_hsqc_to_ch_pairs(
             dist = abs(h_ppm - center)
             if dist < best_dist:
                 best_dist = dist
-                best_val = val
+                # 优先使用归一化后的值, 否则用原值
+                best_val = normalized_integrals.get(round(center, 3), val)
         return best_val
 
     def _integral_to_mult(integral: Optional[float]) -> str:
-        """根据积分值推断碳级数."""
+        """根据积分值推断碳级数.
+
+        改进点 #5: 增加了「自动归一」——自动计积分 (intrng + 1r) 的原始值
+        不是归一 H数, 可能为 100~50000 范围. 使用须以最小值归一再 round.
+        """
         if integral is None:
             return 'unknown'
-        # 积分值四舍五入到整数 H 个数
         n_h = round(integral)
         if n_h <= 0:
             return 'unknown'
-        if n_h == 1:
-            return 'CH'
-        if n_h == 2:
-            return 'CH2'
-        if n_h == 3:
-            return 'CH3'
-        # 4+ H 可能是多个重叠峰, 不推断
+        if 1 <= n_h <= 3:
+            return {1: 'CH', 2: 'CH2', 3: 'CH3'}[n_h]
+        # 4+ H可能是多个重叠峰, 不推断
         return 'unknown'
+
+    # 改进点 #5: 积分谱区间自动归一化. 计算所有 integral value 的下分位点与最小值
+    def _normalize_integrals(integs: list) -> Dict[float, float]:
+        """将原始 integral values 归一为 H 计数 (0-4)."""
+        if not integs:
+            return {}
+        vs = sorted(v for _, v in integs if v is not None and v > 0)
+        if not vs:
+            return {}
+        # 25%分位数代替最小值 (最小值可能是噪声区间)
+        n = len(vs)
+        q25 = vs[max(0, int(n * 0.25))]
+        # 如果没有明确的小值, 用中位数
+        median = vs[n // 2]
+        baseline = q25 if q25 > 0 else median / 3.0
+        if baseline <= 0:
+            return {}
+        out: Dict[float, float] = {}
+        for c, v in integs:
+            if v is None or v <= 0:
+                continue
+            n_h_raw = v / baseline
+            out[round(c, 3)] = min(n_h_raw, 4.0)
+        return out
+
+    normalized_integrals = _normalize_integrals(proton_integrals or [])
+    if normalized_integrals:
+        print(f'  改进点 #5: 积分归一化 — {len(normalized_integrals)} 区间, baseline={min(normalized_integrals.values()):.2f}',
+              file=__import__('sys').stderr)
 
     # 构建 multiplet 查找: center_ppm -> j_couplings (容差 h_tol)
     mult_by_ppm: Dict[float, List[float]] = {}
@@ -409,17 +464,50 @@ def _step1_hsqc_to_ch_pairs(
 
         # Part 3 Phase 2: 逻辑修正 - 有 HSQC 交叉峰的碳不可能是季碳
         # DEPT 推断为 Cq 但实际有 HSQC 峰 → 说明 DEPT 推断有误, 覆盖为 CH
+        dept_confirmed_ch = False  # 改进点 #25: 标记 DEPT 确认的 CH
         if mult == 'Cq':
-            mult = 'CH'  # 最低限度: 有 H  attached
+            mult = 'CH'  # 最低限度: 有 H attached
+        elif mult == 'CH':
+            dept_confirmed_ch = True  # DEPT-90 确认的 CH, 不被积分覆盖
 
         # 查找 1H 积分
         h_integral = _find_integral(h_ppm)
 
-        # 如果 DEPT 未确定, 用积分推断
-        if mult in ('unknown', 'CH') and h_integral is not None:
+        # 改进点 #25: 仅当 DEPT 未确定时用积分推断; DEPT 确认的 CH 不被覆盖
+        if mult == 'unknown' and h_integral is not None:
             int_mult = _integral_to_mult(h_integral)
             if int_mult != 'unknown':
                 mult = int_mult
+        elif mult == 'CH' and not dept_confirmed_ch and h_integral is not None:
+            # Cq->CH 的情况, 允许积分进一步细化
+            int_mult = _integral_to_mult(h_integral)
+            if int_mult != 'unknown':
+                mult = int_mult
+
+        # 改进点 #6+#12: 基于化学位移+DEPT 决策的 CH3 检测
+        # 适应场景: Pyr 积分区间覆盖太宽，多重重叠区积分值不能单独指明 H 数。
+        # 但根据 NMR 经验:
+        #   0.5 - 1.4 ppm + DEPT 说 "CH" 或 "CH2/CH3" -> 极可能是 CH3 (類固醁、酷等 C-CH3)
+        #   1.4 - 2.2 ppm + DEPT 说 "CH2/CH3" -> 可能是 CH3 靠 C=O (CH3-CO-, CH3-Ar)
+        # 改进点 #12: 也检查 DEPT 说 CH2 但 1H 在 0.5-1.4 ppm 的情况 (DEPT 可能误判)
+        if mult in ('CH', 'CH2/CH3', 'unknown'):
+            if 0.5 <= h_ppm <= 1.4:
+                # 高场区在 Pyr/CDCl3 中几乎总是 CH3
+                mult = 'CH3'
+            elif 1.4 < h_ppm < 2.2 and mult == 'CH2/CH3':
+                # 1.4-2.2 ppm 以 CH3-CO/Ar 为主
+                mult = 'CH3'
+        elif mult == 'CH2' and 0.5 <= h_ppm <= 1.4:
+            # 改进点 #12: DEPT 说 CH2 但 1H 在典型 CH3 区 (0.5-1.4 ppm)
+            # 可能是 DEPT 误判 (CH3 的 J 调制与 CH2 相似)
+            # 仅当 13C 也在典型 CH3 范围 (< 25 ppm) 时才覆盖
+            if c_ppm < 25.0:
+                mult = 'CH3'
+
+        # 改进点 #22: 端基碳区 (95-110 ppm) 的 CH2/CH3 强制为 CH
+        # 化学常识: 糖端基碳 (anomeric C) 必为 CH, DEPT 有时因 J 调制异常给出 CH2/CH3
+        if mult == 'CH2/CH3' and 95.0 <= c_ppm <= 110.0:
+            mult = 'CH'
 
         # 查找该 H 的 J 耦合 (按 h_ppm 匹配 multiplet)
         j_vals = _find_j_couplings(round(h_ppm, 3))
@@ -432,6 +520,19 @@ def _step1_hsqc_to_ch_pairs(
                 is_sol_residual = True
                 n_solvent_filtered += 1
 
+        # 方案 C: 查找匹配的 1H 峰来源 (measured/estimated)
+        h_source = ''
+        if proton_sources_1d:
+            # 找最近的 1H 峰及其来源
+            best_source = ''
+            best_dist = h_1d_tol * 2  # 搜索范围
+            for h1d, src in proton_sources_1d.items():
+                dist = abs(h_ppm - h1d)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_source = src
+            h_source = best_source
+
         ch_pairs.append(CHPair(
             h_ppm=round(h_ppm, 3),
             c_ppm=round(c_ppm, 3),
@@ -439,6 +540,7 @@ def _step1_hsqc_to_ch_pairs(
             h_integral=round(h_integral, 3) if h_integral is not None else None,
             j_couplings=j_vals,
             is_solvent_residual=is_sol_residual,
+            h_source=h_source,
         ))
 
     # 按 13C 位移降序排列 (高场到低场, 与化学家习惯一致)
@@ -1415,7 +1517,9 @@ def interpret_2d_sequential(
     h1_field_mhz: float = 0.0,
     solvent: str = '',
     quiet: bool = False,
-    peakrng_path: Optional[str] = None,  # 产物 D: peakrng 文件路径
+    peakrng_path: Optional[str] = None,  # 产 G D: peakrng 文件路径
+    min_snr: float = 8.0,  # 改进点 #8: 可调 HSQC min_snr 默认 8.0
+    proton_sources_1d: Optional[Dict[float, str]] = None,  # 方案 C: 峰来源映射
 ) -> Interpretation2D:
     """按化学家顺序逐步解读 2D NMR, 返回结构化中间结果.
 
@@ -1451,7 +1555,10 @@ def interpret_2d_sequential(
     # 步骤 1: HSQC → C-H 对 (结合 DEPT + 1H 积分推断碳级数, 填充 J 耦合)
     ch_pairs = _step1_hsqc_to_ch_pairs(
         spectra_2d, dept_summary, proton_integrals, multiplets, solvent=solvent,
-        carbon_shifts_1d=carbon_shifts_1d, proton_shifts_1d=proton_shifts_1d)
+        carbon_shifts_1d=carbon_shifts_1d, proton_shifts_1d=proton_shifts_1d,
+        min_snr=min_snr,  # 改进点 #8: 传递自定义 SNR 阈值
+        proton_sources_1d=proton_sources_1d,  # 方案 C: 峰来源映射
+    )
     result.ch_pairs = ch_pairs
 
     # 产物 D: peakrng 重叠区标记 (仪器积分合并的 1H 重叠)
@@ -1483,8 +1590,10 @@ def interpret_2d_sequential(
                 for p in ch_pairs:
                     if (p.h_integral is not None
                             and p.h_integral >= 4.0
-                            and abs(p.h_ppm - region.h_ppm_center) <= 0.3):
-                        # 修正: 每个 C-H 对的实际 H 个数
+                            and abs(p.h_ppm - region.h_ppm_center) <= 0.3
+                            and not (0.5 <= p.h_ppm <= 1.4)):
+                        # 改进点 #6 fix: 避免 0.5-1.4 ppm 范围(查 CH3 区)
+                        # 受到 g_half 遗跡而被错误覆盖为 CH。
                         p.h_integral = round(h_per_peak, 2)
                         n_h = round(h_per_peak)
                         if n_h == 1:
@@ -1814,7 +1923,8 @@ def write_step_files(
         w.writerow(['编号', 'C_label', 'H_label', 'dH_ppm', 'dC_ppm', '1H积分', 'H个数',
                     '碳级数', 'J_couplings_Hz', 'h_neighbors_ppm',
                     'is_solvent_residual',
-                    'is_overlap_from_peakrng'])  # 产物 D
+                    'is_overlap_from_peakrng',  # 产物 D
+                    'h_source'])  # 产物 G: 峰来源 (measured/estimated)
         for i, p in enumerate(result.ch_pairs, 1):
             h_int = f'{p.h_integral:.3f}' if p.h_integral is not None else ''
             n_h = str(round(p.h_integral)) if p.h_integral is not None else ''
@@ -1824,7 +1934,8 @@ def write_step_files(
                         f'{p.h_ppm:.4f}', f'{p.c_ppm:.4f}', h_int, n_h,
                         p.multiplicity, j_str, hn_str,
                         'Y' if p.is_solvent_residual else '',
-                        'Y' if p.is_overlap_from_peakrng else ''])
+                        'Y' if p.is_overlap_from_peakrng else '',
+                        p.h_source])
     written.append(path1)
 
     # 步骤 1 附加: 所有 C-H 对等高线图 (分 overlap/normal 两个子文件夹)

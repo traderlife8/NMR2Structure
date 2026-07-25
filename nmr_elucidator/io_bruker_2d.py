@@ -700,6 +700,95 @@ def read_hmbc_f1_projection(
     return peaks
 
 
+def cross_validate_hmbc_projection_peaks(
+    hmbc_spec: 'Spectrum2D',
+    proj_peaks: List['ProjectionPeak'],
+    f1_tol: float = 0.5,
+    f2_min: float = 0.0,
+    f2_max: float = 12.0,
+    require_f2_in_aliphatic: bool = False,
+) -> List['ProjectionPeak']:
+    """用 HMBC 矩阵交叉验证投影峰 (产物 B 加强).
+
+    原理: HMBC F1 投影 (pdata/99 或 999) 对 13C 维做求和, 信噪比高, 但同时把
+    t1 噪声 / 旋转边峰 / 折叠谱伪峰也求和进来. 一个真实的 13C 峰在 HMBC 矩阵
+    (pdata/1/2rr 对应的 Spectrum2D.peaks) 中至少有一个交叉峰 (在 1H 维投影).
+    反之, 纯噪声 13C 维伪峰通常没有伴随交叉峰.
+
+    Args:
+        hmbc_spec: 同一 HMBC 实验读出的 Spectrum2D (含 peaks 列表, F1=13C, F2=1H)
+        proj_peaks: read_hmbc_f1_projection() 返回的投影峰列表
+        f1_tol: F1 (13C) 维匹配容差 ppm (默认 0.5)
+        f2_min / f2_max: 接受的 F2 (1H) 化学位移范围 (剔除溶剂 / 折叠伪峰)
+        require_f2_in_aliphatic: 若 True, 要求 F2 在脂肪区 (0.5~6.0 ppm) 至少有一峰
+
+    Returns:
+        通过交叉验证的子集 (顺序不变). 同时给通过的峰设置 source += '+xval'.
+    """
+    if hmbc_spec is None or not hmbc_spec.peaks:
+        return list(proj_peaks)
+    if not proj_peaks:
+        return []
+
+    # 收集 HMBC 矩阵里的 F1 ppm 索引 (用于快速邻域查询)
+    hmbc_f1_ppms = np.array([p.f1_ppm for p in hmbc_spec.peaks], dtype=np.float64)
+
+    out: List['ProjectionPeak'] = []
+    for proj in proj_peaks:
+        # 查 HMBC 矩阵中 F1 在 proj.shift ± f1_tol 区间内的所有交叉峰
+        mask = np.abs(hmbc_f1_ppms - proj.shift) <= f1_tol
+        if not np.any(mask):
+            continue
+        matching = [hmbc_spec.peaks[i] for i in np.where(mask)[0]]
+        # F2 维必须在合理 1H 范围内
+        f2_ok = [p for p in matching
+                 if f2_min <= p.f2_ppm <= f2_max]
+        if not f2_ok:
+            continue
+        if require_f2_in_aliphatic:
+            in_aliph = [p for p in f2_ok if 0.5 <= p.f2_ppm <= 6.0]
+            if not in_aliph:
+                continue
+        # 通过: 在 source 上加标记
+        if '+xval' not in proj.source:
+            proj.source = (proj.source or '') + '+xval'
+        out.append(proj)
+    return out
+
+
+def cross_validate_hmbc_projection_with_min(
+    hmbc_spec: 'Spectrum2D',
+    proj_peaks: List['ProjectionPeak'],
+    f1_tol: float = 0.5,
+    f2_min: float = 0.0,
+    f2_max: float = 12.0,
+) -> Tuple[List['ProjectionPeak'], List['ProjectionPeak']]:
+    """HMBC 矩阵交叉验证 - 返回 (validated, rejected) 两个列表.
+
+    行为同 cross_validate_hmbc_projection_peaks, 但同时返回被剔除的投影峰
+    (用于日志和统计分析).
+    """
+    if hmbc_spec is None or not hmbc_spec.peaks or not proj_peaks:
+        return list(proj_peaks), []
+    hmbc_f1_ppms = np.array([p.f1_ppm for p in hmbc_spec.peaks], dtype=np.float64)
+    validated: List['ProjectionPeak'] = []
+    rejected: List['ProjectionPeak'] = []
+    for proj in proj_peaks:
+        mask = np.abs(hmbc_f1_ppms - proj.shift) <= f1_tol
+        f2_ok_count = 0
+        if np.any(mask):
+            for i in np.where(mask)[0]:
+                if f2_min <= hmbc_spec.peaks[i].f2_ppm <= f2_max:
+                    f2_ok_count += 1
+        if f2_ok_count > 0:
+            if '+xval' not in proj.source:
+                proj.source = (proj.source or '') + '+xval'
+            validated.append(proj)
+        else:
+            rejected.append(proj)
+    return validated, rejected
+
+
 def read_hsqc_row_slice(
     hsqc_exp_dir: str,
     pprocno: str,

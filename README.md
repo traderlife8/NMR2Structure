@@ -1088,6 +1088,26 @@ python -m nmr_elucidator \
 **产物**：`meta.txt` 的 `2D_Solvents` / `2D_Solvent_Consistent` 字段
 **价值**：检测 2D 实验溶剂混用风险，给出告警。
 
+### 产物 G：2D 氢谱峰来源追踪 (方案 C 混合策略)
+
+**场景**：同一化合物的 1D 和 2D 实验可能使用不同溶剂（如 clxh100: 1D 用 CDCl₃ exp 21，2D 用 Pyr-d5 exp 31）。
+2D 谱的 F2 维（1H）化学位移反映 Pyr-d5 环境，与 CDCl₃ 有 ~0.004 ppm 偏移。
+若 2D 氢谱数据质量不佳（如 exp 31 的 MI=0 导致 329 个噪声峰），需用 1D 数据修正，但修正后的峰来源需追踪。
+
+**实现**：
+- `io_bruker.Peak.source` 字段：`'measured'`（实测峰）/ `'estimated'`（估算峰）/ `''`（默认）
+- `peaklist.xml` 的 `<Peak1D>` 元素新增 `source` 属性
+- `interpret_2d.CHPair.h_source` 字段：记录匹配的 1H 峰来源
+- `interpret_2d_sequential(proton_sources_1d=...)` 参数：传递峰来源映射
+
+**修正策略**（`util/create_corrected_31.py`）：
+- 实测峰（73 个）：来自 exp 31 原始数据，高置信度
+- 估算峰（37 个）：来自 exp 21 + 溶剂偏移（+0.004 ppm），低置信度
+- 积分/peakrng：继承 exp 21（同一样品，H 计数不变）
+
+**产物**：`31_修正的数据/pdata/1/peaklist.xml`（含 `source` 属性）；`step1_hsqc_ch_pairs.csv` 的 `h_source` 列
+**价值**：2D 分析时区分实测/估算峰，对估算峰降低匹配权重，提高归属可靠性。
+
 ---
 
 ## 未匹配峰处理（重点关注）
