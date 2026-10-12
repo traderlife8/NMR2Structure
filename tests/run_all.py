@@ -29,7 +29,7 @@ def _run(mod):
 
 def main():
     failed = 0
-    for mod in ['tests.test_io_bruker', 'tests.test_io_sdf', 'tests.test_retrieve', 'tests.test_score', 'tests.test_bridge_dept', 'tests.test_new_features', 'tests.test_io_bruker_2d', 'tests.test_correlation_2d']:
+    for mod in ['tests.test_io_bruker', 'tests.test_io_sdf', 'tests.test_retrieve', 'tests.test_score', 'tests.test_bridge_dept', 'tests.test_new_features', 'tests.test_io_bruker_2d', 'tests.test_correlation_2d', 'tests.test_algorithmic_assignment']:
         if not _run(mod):
             failed += 1
     print()
