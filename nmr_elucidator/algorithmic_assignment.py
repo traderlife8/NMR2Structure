@@ -861,3 +861,124 @@ def write_assignment_result_csv(
                     'Y' if ck.matched else 'N',
                     ck.note,
                 ])
+
+
+# ---- 真实数据观测级归属管线 (无结构, 纯观测信号匹配) ----
+
+@dataclass
+class ObservedCarbonRow:
+    """一条观测 13C 信号的归属行 (对应标准表 13C NMR / Types / 1H NMR 三列)."""
+
+    c_ppm: float
+    carbon_type: str = '?'                    # CH/CH2/CH3/Cq/CH2_or_CH3
+    h_ppms: List[float] = field(default_factory=list)  # HSQC 关联的 1H
+    dept_source: str = ''                     # 'dept90'/'dept135neg'/'dept135pos'/'none'
+    notes: str = ''
+
+
+def build_observed_assignment(
+    c13_shifts: Sequence[float],
+    dept90_shifts: Optional[Sequence[float]] = None,
+    dept135_shifts: Optional[Sequence[float]] = None,
+    dept135_signs: Optional[Sequence[str]] = None,
+    hsqc_pairs: Optional[Sequence[Tuple[float, float]]] = None,
+    c_tol: float = 0.6,
+    h_cluster_tol: float = 0.04,
+) -> List[ObservedCarbonRow]:
+    """观测级归属: 13C 主谱 + DEPT Types + HSQC (dH, dC) 匹配.
+
+    三列输出 (对标标准归属表):
+      - 13C NMR: c_ppm
+      - Types: DEPT 判定 (CH/CH2/CH3/C), Cq 用 'C'
+      - 1H NMR: HSQC 关联的 dH (经聚类去重)
+
+    匹配逻辑 (确定性, 规则 8):
+      1. DEPT-135 sign 主导: negative=CH2, positive 见分区规则
+      2. DEPT-90 命中 → CH
+      3. DEPT 双双未命中 → C (Cq)
+      4. HSQC dC ↔ 13C 主谱最近邻一对一匹配 (c_tol), 组内全部 dH 归入该碳
+    """
+    # DEPT Types: 复用 assign_carbon_multiplicity (双向一对一最近匹配)
+    from .bridge_nmr2struct import assign_carbon_multiplicity
+    mults = assign_carbon_multiplicity(
+        list(c13_shifts),
+        list(dept90_shifts) if dept90_shifts else None,
+        list(dept135_shifts) if dept135_shifts else None,
+        list(dept135_signs) if dept135_signs is not None else None,
+    )
+    # 13C 降序
+    rows: Dict[float, ObservedCarbonRow] = {}
+    for r in sorted(mults, key=lambda x: -x.shift):
+        ctype = r.multiplicity
+        if ctype == 'Cq':
+            ctype = 'C'
+        rows[r.shift] = ObservedCarbonRow(
+            c_ppm=r.shift, carbon_type=ctype,
+            dept_source={'CH': 'dept90', 'CH2': 'dept135neg',
+                         'CH3': 'dept135pos'}.get(r.multiplicity, 'none'),
+        )
+    c_sorted = sorted(rows.keys(), reverse=True)
+
+    # HSQC dC -> 13C 全局最优一对一 (匈牙利算法, 非贪心:
+    # 密集重叠区贪心会错配, 如 clxh100 31.9/32.3/31.3 竞争同一 HSQC 峰)
+    if hsqc_pairs:
+        from scipy.optimize import linear_sum_assignment
+        n_c, n_p = len(c_sorted), len(hsqc_pairs)
+        BIGC = 1e6
+        cost = np.full((n_c, n_p), BIGC)
+        for i, cm in enumerate(c_sorted):
+            for j, (h, c) in enumerate(hsqc_pairs):
+                d = abs(c - cm)
+                if d <= c_tol:
+                    cost[i, j] = d
+        r_idx, c_idx = linear_sum_assignment(cost)
+        used_h: Set[int] = set()
+        for r, j in zip(r_idx, c_idx):
+            if cost[r, j] < BIGC:
+                rows[c_sorted[r]].h_ppms.append(hsqc_pairs[j][0])
+                used_h.add(j)
+        # 第二轮: 同一 13C 可接收多个 dH (CH2/CH3 简并信号), 把未匹配的
+        # HSQC 峰分给 dC 距离最近的 13C
+        for j, (h, c) in enumerate(hsqc_pairs):
+            if j in used_h:
+                continue
+            best_i, best_d = -1, float('inf')
+            for i, cm in enumerate(c_sorted):
+                d = abs(c - cm)
+                if d < best_d and d <= c_tol:
+                    best_d, best_i = d, i
+            if best_i >= 0:
+                rows[c_sorted[best_i]].h_ppms.append(h)
+        # Types 修正: 有 HSQC 峰的碳必为质子化碳 (排除 DEPT 弱信号漏检
+        # 导致的 Cq 误判, 如 clxh100 44.8/31.9/29.1/28.7 ppm).
+        # 质子化但 sign 丢失时, 脂肪区 (10-60) 多为 CH2 (天然产物 CH2 丰富),
+        # 芳/烯区 (95-160) 为 CH; 这里按化学位移分区给最优猜测并标注不确定.
+        for row in rows.values():
+            if row.h_ppms and row.carbon_type == 'C':
+                if 10.0 <= row.c_ppm <= 60.0:
+                    row.carbon_type = 'CH2'
+                    row.notes = 'HSQC 命中但 DEPT 弱漏检, 脂肪区按 CH2 (不确定)'
+                elif 95.0 <= row.c_ppm <= 160.0:
+                    row.carbon_type = 'CH'
+                    row.notes = 'HSQC 命中但 DEPT 弱漏检, 芳/烯区按 CH'
+                else:
+                    row.carbon_type = 'CH_or_CH2'
+                    row.notes = 'HSQC 命中但 DEPT 弱漏检, 类型占位'
+            # DEPT-135 正峰 + DEPT-90 未命中 (CH2/CH3 占位): 脂肪区细分
+            # 依据天然产物统计: sp3 CH2 (20-60) 远多于 CH3; CH3 特征区
+            # (<20 或甲基碳 15-35 高度简并). 保守: 15-22 → CH3 优先,
+            # 其余保持 CH2/CH3 占位并在 notes 标注.
+            if row.carbon_type == 'CH2_or_CH3' and 15.0 <= row.c_ppm < 22.0:
+                row.carbon_type = 'CH3'
+                row.notes = 'DEPT135+ 脂肪低场区, 按 CH3 (不确定)'
+
+    # 1H 峰聚类去重 (同一信号多条 peaklist 峰)
+    for row in rows.values():
+        if not row.h_ppms:
+            continue
+        clustered: List[float] = []
+        for h in sorted(row.h_ppms, reverse=True):
+            if not clustered or abs(h - clustered[-1]) > h_cluster_tol:
+                clustered.append(h)
+        row.h_ppms = clustered
+    return [rows[c] for c in c_sorted]

@@ -160,70 +160,96 @@ def assign_carbon_multiplicity(
     if dept90_tol is None:
         dept90_tol = min(tol, 0.50)  # Part 3: 放宽到 0.5 ppm (不同实验间 ppm 校准差异)
 
-    # 准备各 DEPT 在主谱中的命中索引
+    # 准备各 DEPT 在主谱中的命中索引.
+    # 关键修复 (clxh100 debug): 单向"DEPT 峰找主谱窗口内第一个峰"在 DEPT 与
+    # 主谱存在系统性 ppm 偏差 + 密集重叠峰区 (糖基 73-79 ppm) 时会错配,
+    # 导致 DEPT-90 命中错误的 13C → CH/CH3 大面积误判.
+    # 改为: 双向贪心最近邻一对一匹配 (先按距离升序全局配对, 每个主谱峰
+    # 最多被一条 DEPT 峰占用; 距离超过 tol 的对不成立).
+    def _nearest_one_to_one(aux: List[float], tol_v: float) -> dict:
+        """aux 峰 -> main 索引 的最近邻一对一匹配. 返回 {main_idx: aux_idx}."""
+        if not aux:
+            return {}
+        pairs: list = []
+        for ai, a in enumerate(aux):
+            for mi, m in enumerate(main_sorted):
+                d = abs(a - m)
+                if d <= tol_v:
+                    pairs.append((d, ai, mi))
+        pairs.sort()
+        used_aux: set = set()
+        out: dict = {}
+        for d, ai, mi in pairs:
+            if ai in used_aux or mi in out:
+                continue
+            used_aux.add(ai)
+            out[mi] = ai
+        return out
+
     idx90_in_main: dict[int, None] = {}
     if dept90_shifts:
-        for p in dept90_shifts:
-            for i, m in enumerate(main_sorted):
-                if abs(p - m) <= dept90_tol:
-                    idx90_in_main[i] = None
-                    break
-    # DEPT-135 命中: 记录 主谱索引 -> sign
+        m90 = _nearest_one_to_one(dept90_shifts, dept90_tol)
+        for mi in m90:
+            idx90_in_main[mi] = None
+    # DEPT-135 命中: 记录 主谱索引 -> sign (同样一对一最近匹配)
     idx135_in_main: dict[int, str] = {}
     if dept135_shifts:
         signs = dept135_signs if dept135_signs is not None else ['unknown'] * len(dept135_shifts)
-        for p, s in zip(dept135_shifts, signs):
-            for i, m in enumerate(main_sorted):
-                if abs(p - m) <= tol:
-                    idx135_in_main[i] = s
-                    break
+        m135 = _nearest_one_to_one(dept135_shifts, tol)
+        for mi, ai in m135.items():
+            idx135_in_main[mi] = signs[ai]
 
     for i, p in enumerate(main_sorted):
         # DEPT-90 命中即确认为 CH (三级碳/芳 CH/烯 CH).
         # 仅当 DEPT-90 未命中时, 才用 DEPT-135 sign 区分 CH2 vs CH3.
         # 理由: 芳/烯 CH 在 DEPT-135 也是正峰, 与 CH3 不可区分;
         #       但 DEPT-90 仅显示 CH, 所以 DEPT-90 命中即排除 CH2/CH3.
+        d135_sign = idx135_in_main.get(i, 'unknown')
         if i in idx90_in_main:
             mult = DEPT_CH
             sign = 'positive'
+        elif d135_sign == 'negative':
+            mult = DEPT_CH2
+            sign = 'negative'
+        elif d135_sign == 'positive':
+            # DEPT-135 正峰. DEPT-90 未命中 → 候选 CH3 (脂肪区) 或
+            # 芳/烯 CH (DEPT-90 漏检, 如 121/105 ppm 烯碳). 用化学位移分区:
+            #   < 45 ppm 且不是芳/烯区 → CH3 (DEPT-90 漏检概率低)
+            #   芳/烯区 (95-160) → DEPT-90 漏检的 CH 概率高, 但也不能排除
+            #   CH3 (如 OCH3 ~55). 保守: <40 -> CH3, 95-160 -> CH (90 漏检),
+            #   其余 -> CH2/CH3 占位
+            if p < 40.0:
+                mult = DEPT_CH3
+            elif 95.0 <= p <= 160.0:
+                mult = DEPT_CH  # DEPT-90 漏检的烯/芳 CH (clxh100: 121/105 ppm)
+            else:
+                mult = DEPT_CH2_or_CH3
+            sign = 'positive'
         else:
-            d135_sign = idx135_in_main.get(i, 'unknown')
-            if d135_sign == 'negative':
-                mult = DEPT_CH2
-                sign = 'negative'
-            elif d135_sign == 'positive':
-                # DEPT-135 正峰, DEPT-90 无 = 排除 CH
-                # 化学位移兜底: < 35 -> CH3, 其它 -> CH2/CH3 占位
+            # sign 'unknown' 实际混合了三种本质不同的状态, 必须逐一区分:
+            #   A) DEPT-135 谱有数据 (dept135_shifts 不为 None) 且该碳未命中
+            #      → 物理上 DEPT-90 无 + DEPT-135 无信号 → 排除 CH/CH2/CH3 → Cq 季碳
+            #   B) DEPT-135 谱有数据, 该碳命中但 sign 缺失
+            #      → 有信号 ≠ 季碳, 但 sign 未知无法区分 CH2/CH3 → CH2_or_CH3 占位
+            #   C) DEPT-135 谱数据完全缺失 (调用方未提供)
+            #      → 无 DEPT 信息 → 化学位移兜底 (向后兼容旧 API)
+            # 之前实现把这三种状态混为一谈, 导致 80 ppm 等被错判 CH2.
+            if dept135_shifts is not None and i not in idx135_in_main:
+                mult = DEPT_CQ
+                sign = 'unknown'
+            elif i in idx135_in_main:
+                mult = DEPT_CH2_or_CH3
+                sign = 'unknown'
+            else:
                 if p < 35.0:
                     mult = DEPT_CH3
+                    sign = 'positive'
+                elif p < 95.0:
+                    mult = DEPT_CH2
+                    sign = 'negative'
                 else:
                     mult = DEPT_CH2_or_CH3
-                sign = 'positive'
-            else:
-                # sign 'unknown' 实际混合了三种本质不同的状态, 必须逐一区分:
-                #   A) DEPT-135 谱有数据 (dept135_shifts 不为 None) 且该碳未命中
-                #      → 物理上 DEPT-90 无 + DEPT-135 无信号 → 排除 CH/CH2/CH3 → Cq 季碳
-                #   B) DEPT-135 谱有数据, 该碳命中但 sign 缺失
-                #      → 有信号 ≠ 季碳, 但 sign 未知无法区分 CH2/CH3 → CH2_or_CH3 占位
-                #   C) DEPT-135 谱数据完全缺失 (调用方未提供)
-                #      → 无 DEPT 信息 → 化学位移兜底 (向后兼容旧 API)
-                # 之前实现把这三种状态混为一谈, 导致 80 ppm 等被错判 CH2.
-                if dept135_shifts is not None and i not in idx135_in_main:
-                    mult = DEPT_CQ
                     sign = 'unknown'
-                elif i in idx135_in_main:
-                    mult = DEPT_CH2_or_CH3
-                    sign = 'unknown'
-                else:
-                    if p < 35.0:
-                        mult = DEPT_CH3
-                        sign = 'positive'
-                    elif p < 95.0:
-                        mult = DEPT_CH2
-                        sign = 'negative'
-                    else:
-                        mult = DEPT_CH2_or_CH3
-                        sign = 'unknown'
         out.append(C13WithMultiplicity(shift=p, multiplicity=mult, source='main', sign=sign))
     return out
 
@@ -234,6 +260,7 @@ def convert_bruker_folder_to_nmr2struct(
     cnmr_out: str,
     intensity_percentile: float = 0.20,
     use_dept: bool = True,
+    specs: Optional[List[BrukerSpectrum]] = None,
 ) -> dict:
     """把 Bruker 原始谱图转成 NMR2Struct 期望的两个文本文件.
 
@@ -242,11 +269,13 @@ def convert_bruker_folder_to_nmr2struct(
     cnmr_out: CNMR 输出 .txt 路径
     intensity_percentile: 强度过滤百分位 (默认 0.20, 保留 top 20% 强度的峰)
     use_dept: 是否使用 DEPT 数据做碳类型推断 (写到返回 dict, 不影响 hnmr/cnmr)
+    specs: 可选, 预读的 BrukerSpectrum 列表 (mnova 数据源时传入, 跳过重读)
 
     返回元数据 dict: {n_1h, n_13c, exp_h, exp_c, solvent, field_mhz, dept_summary, ...}
     dept_summary: [{ppm, mult}, ...] 按化学位移降序, 供候选报告引用.
     """
-    specs = read_bruker_folder(bruker_folder)
+    if specs is None:
+        specs = read_bruker_folder(bruker_folder)
     h_spec = next((s for s in specs if s.nucleus == '1H'), None)
     # 碳谱分类
     c_spec = next((s for s in specs if s.nucleus == '13C' and 'DEPT' not in s.nucleus), None)

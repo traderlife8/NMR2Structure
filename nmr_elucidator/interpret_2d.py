@@ -212,7 +212,8 @@ def _step1_hsqc_to_ch_pairs(
     # 策略: 对每个 1D 13C 峰, 在 HSQC 的 F1 切片中找最强 1H 信号
     # 这比纯峰检测更可靠, 因为我们知道确切的 F1 位置
     hsqc_pairs_raw = []
-    if carbon_shifts_1d and hsqc_spectrum.data is not None:
+    # data.size > 0 才能做矩阵切片 (MNova 峰表导出源 data 为空, 走峰表回退)
+    if carbon_shifts_1d and hsqc_spectrum.data is not None and hsqc_spectrum.data.size > 0:
         import numpy as _np
         data = hsqc_spectrum.data
         f1_scale = hsqc_spectrum.f1_ppm_scale  # 13C ppm 轴
@@ -343,7 +344,7 @@ def _step1_hsqc_to_ch_pairs(
                     continue
                 hsqc_pairs_raw.append((h, c))
     else:
-        # 无 1D 数据时回退到传统峰检测
+        # 无 1D 数据 (或无矩阵, 如 MNova 峰表源) 时回退到传统峰检测
         hsqc_pairs_raw = extract_hsqc_pairs(hsqc_spectrum, min_snr=min_snr)
 
     if not hsqc_pairs_raw:
@@ -598,6 +599,10 @@ def _step1b_resolve_overlapping(
         if p.h_integral is not None and p.h_integral >= integral_threshold
     ]
     if not high_pairs:
+        return []
+
+    # 矩阵依赖: data 为空 (MNova 峰表源) 时无法做 13C 切片, 跳过重叠分解
+    if hsqc_spectrum.data is None or hsqc_spectrum.data.size == 0:
         return []
 
     # 按 δH 聚类 (间距 < h_cluster_tol 的归为同一重叠区)
@@ -1721,6 +1726,10 @@ def _draw_hsqc_contour_all_pairs(
     import numpy as np
 
     if not ch_pairs:
+        return []
+
+    # 矩阵依赖: data 为空 (MNova 峰表源) 时无法绘制等高线, 跳过
+    if hsqc_spectrum.data is None or hsqc_spectrum.data.size == 0:
         return []
 
     # 创建两个子目录: 重叠峰 / 非重叠峰

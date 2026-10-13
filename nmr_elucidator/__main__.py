@@ -253,8 +253,8 @@ def main(argv=None):
         prog='nmr_elucidator',
         description='基于 nmrshiftdb2 数据库 + nmrglue Bruker 解析的 NMR 反推结构工具',
     )
-    parser.add_argument('--folder', required=True,
-                        help='原始数据样本目录, e.g. NMR/clxh3')
+    parser.add_argument('--folder', required=False, default=None,
+                        help='原始数据样本目录, e.g. NMR/clxh3 (与 --mnova 二选一)')
     parser.add_argument('--db', default=_DEFAULT_DB_DIR,
                         help='数据库路径: 可传入总目录 (自动发现 nmrshiftdb2 + lucy-ng), '
                              '或单个数据库文件路径 (.sd/.db). '
@@ -346,6 +346,11 @@ def main(argv=None):
     parser.add_argument('--keep-solvent', action='store_true',
                         help='禁用溶剂残余峰过滤 (默认启用 -- 仪器记录的 CDCl3 7.26 '
                              '/ DMSO 2.50 等溶剂信号会被剔除, 避免污染检索)')
+    # mnova 数据源: 直接读 MestReNova 文档 (与 --folder 二选一)
+    parser.add_argument('--mnova', default=None,
+                        help='MestReNova .mnova 文件路径 (与 --folder 二选一). '
+                             '自动调用 MestReNova.exe 无界面导出 JSON 后走同一主流程; '
+                             '需本机装有 Mnova 15+ 与 Scripting license')
     # 已知化合物流程: 自动检测 + 复核对比
     parser.add_argument('--real-structure-dir', default=_DEFAULT_REAL_STRUCTURE_DIR,
                         help='已知化合物 (真实结构 + 数据归属表) 所在根目录. '
@@ -370,13 +375,31 @@ def main(argv=None):
         log = _get_logger('main')
         log.info(f'日志文件: {log_file}')
 
-    folder = os.path.abspath(args.folder)
-    if not os.path.isdir(folder):
-        print(f"ERROR: 原始数据目录不存在: {folder}", file=sys.stderr)
+    # mnova 数据源校验: --folder 与 --mnova 必须二选一
+    if not args.folder and not args.mnova:
+        print("ERROR: 必须提供 --folder (Bruker 目录) 或 --mnova (.mnova 文件) 之一",
+              file=sys.stderr)
+        return 2
+    if args.folder and args.mnova:
+        print("ERROR: --folder 与 --mnova 互斥, 只能提供一个", file=sys.stderr)
         return 2
 
-    # 推断化合物名 (优先 --compound-name, 否则取 folder 路径最后一段)
-    compound_name = args.compound_name or os.path.basename(folder.rstrip(r'\/'))
+    folder = os.path.abspath(args.folder) if args.folder else ''
+    mnova_path = os.path.abspath(args.mnova) if args.mnova else ''
+    if args.folder and not os.path.isdir(folder):
+        print(f"ERROR: 原始数据目录不存在: {folder}", file=sys.stderr)
+        return 2
+    if args.mnova and not os.path.isfile(mnova_path):
+        print(f"ERROR: .mnova 文件不存在: {mnova_path}", file=sys.stderr)
+        return 2
+
+    # 推断化合物名 (优先 --compound-name, 否则取 folder/mnova 路径最后一段去扩展名)
+    if args.compound_name:
+        compound_name = args.compound_name
+    elif args.mnova:
+        compound_name = os.path.splitext(os.path.basename(mnova_path))[0]
+    else:
+        compound_name = os.path.basename(folder.rstrip(r'\/'))
 
     # Part 3.5: 检测已知化合物 (在 E:\NMR2Structure\真实结构/<compound_name>/ 下查找 *数据归属*.xlsx)
     # 已知化合物流程: derive 不用 SMILES, 复核阶段才用 SMILES 做结构判等
@@ -416,14 +439,24 @@ def main(argv=None):
     os.makedirs(output_dir, exist_ok=True)
     out_prefix = os.path.join(output_dir, compound_name)
 
-    # 1. 读 Bruker
-    print(f"[1/5] 读取 Bruker 谱图: {folder}", file=sys.stderr)
-    specs = read_bruker_folder(folder)
+    # 1. 读谱图: Bruker 目录 或 mnova 文档 (自动无界面导出 JSON)
+    spectra_2d_from_mnova = {}
+    if args.mnova:
+        print(f"[1/5] 读取 MestReNova 文档: {mnova_path}", file=sys.stderr)
+        try:
+            from .io_mnova_json import read_mnova_file
+            specs, spectra_2d_from_mnova = read_mnova_file(mnova_path, quiet=args.quiet)
+        except Exception as ex:
+            print(f"ERROR: mnova 读取失败: {ex}", file=sys.stderr)
+            return 3
+    else:
+        print(f"[1/5] 读取 Bruker 谱图: {folder}", file=sys.stderr)
+        specs = read_bruker_folder(folder)
     if not specs:
-        print("ERROR: 未在原始数据目录中发现任何 1D 谱图 (peaklist.xml)", file=sys.stderr)
+        print("ERROR: 未发现任何 1D 谱图", file=sys.stderr)
         return 3
     for s in specs:
-        print(f"  - exp {s.exp_no}: {s.nucleus} ({s.pulse_program}) "
+        print(f"  - {s.nucleus} ({s.pulse_program or '-'}) "
               f"solvent={s.solvent or '?'} peaks={len(s.peaks)} integrals={len(s.integrals)}",
               file=sys.stderr)
 
@@ -432,19 +465,26 @@ def main(argv=None):
     interpretation_2d = None
     if args.use_2d:
         print(f"[1.5] 检测 2D NMR 实验 ...", file=sys.stderr)
-        try:
-            from .io_bruker_2d import read_bruker_2d_folder
-            spectra_2d = read_bruker_2d_folder(folder, quiet=args.quiet)
-            if spectra_2d:
-                print(f"  -> 检测到 2D 实验: {list(spectra_2d.keys())}", file=sys.stderr)
-                for etype, spec in spectra_2d.items():
-                    print(f"     {etype}: exp={spec.exp_no} peaks={len(spec.peaks)} "
-                          f"({spec.f1_nucleus}-{spec.f2_nucleus})", file=sys.stderr)
-            else:
-                print(f"  -> 未检测到 2D 数据, 回退到 1D 流程", file=sys.stderr)
-        except Exception as ex:
-            print(f"WARN: 2D 检测失败, 回退到 1D: {ex}", file=sys.stderr)
-            spectra_2d = {}
+        if spectra_2d_from_mnova:
+            # mnova 数据源: 2D 已随 JSON 导出, 直接使用
+            spectra_2d = spectra_2d_from_mnova
+            for etype, spec in spectra_2d.items():
+                print(f"     {etype}: peaks={len(spec.peaks)} "
+                      f"({spec.f1_nucleus}-{spec.f2_nucleus})", file=sys.stderr)
+        else:
+            try:
+                from .io_bruker_2d import read_bruker_2d_folder
+                spectra_2d = read_bruker_2d_folder(folder, quiet=args.quiet)
+                if spectra_2d:
+                    print(f"  -> 检测到 2D 实验: {list(spectra_2d.keys())}", file=sys.stderr)
+                    for etype, spec in spectra_2d.items():
+                        print(f"     {etype}: exp={spec.exp_no} peaks={len(spec.peaks)} "
+                              f"({spec.f1_nucleus}-{spec.f2_nucleus})", file=sys.stderr)
+                else:
+                    print(f"  -> 未检测到 2D 数据, 回退到 1D 流程", file=sys.stderr)
+            except Exception as ex:
+                print(f"WARN: 2D 检测失败, 回退到 1D: {ex}", file=sys.stderr)
+                spectra_2d = {}
     else:
         print(f"[1.5] 跳过 2D NMR 检测 (使用 --use-2d 启用)", file=sys.stderr)
 
@@ -471,19 +511,21 @@ def main(argv=None):
             print(f"WARN: 2D 溶剂一致性校验失败: {ex}",
                   file=sys.stderr)
 
-    # 产物 E: audita.txt 冗余元数据校验
-    try:
-        from .io_bruker import validate_solvent_and_pulprog_consistency
-        meta_audita_consistency = validate_solvent_and_pulprog_consistency(
-            specs, folder,
-        )
-        if not args.quiet:
-            print(f"[产物 E] audita 冗余元数据校验: "
-                  f"{meta_audita_consistency['consistent']}/"
-                  f"{meta_audita_consistency['n_total']} 实验 PULPROG 一致",
-                  file=sys.stderr)
-    except Exception as ex:
-        print(f"WARN: audita 一致性校验失败: {ex}", file=sys.stderr)
+    # 产物 E: audita.txt 冗余元数据校验 (仅 Bruker 数据源; mnova 无 audita.txt)
+    meta_audita_consistency = None
+    if args.folder:
+        try:
+            from .io_bruker import validate_solvent_and_pulprog_consistency
+            meta_audita_consistency = validate_solvent_and_pulprog_consistency(
+                specs, folder,
+            )
+            if not args.quiet:
+                print(f"[产物 E] audita 冗余元数据校验: "
+                      f"{meta_audita_consistency['consistent']}/"
+                      f"{meta_audita_consistency['n_total']} 实验 PULPROG 一致",
+                      file=sys.stderr)
+        except Exception as ex:
+            print(f"WARN: audita 一致性校验失败: {ex}", file=sys.stderr)
 
     h_spec_1d, h_spec_2d, h_spec_info = select_h_specs_by_process(
         specs, spectra_2d=spectra_2d,
@@ -517,7 +559,7 @@ def main(argv=None):
     _tmp_hnmr = out_prefix + '._hnmr_tmp.txt'
     _tmp_cnmr = out_prefix + '._cnmr_tmp.txt'
     bridge_info = convert_bruker_folder_to_nmr2struct(
-        folder, _tmp_hnmr, _tmp_cnmr, use_dept=True,
+        folder or '.', _tmp_hnmr, _tmp_cnmr, use_dept=True, specs=specs,
     )
     obs_dept_summary: list[dict] = bridge_info.get('dept_summary', [])
     dept_counts = bridge_info.get('dept_counts', {})

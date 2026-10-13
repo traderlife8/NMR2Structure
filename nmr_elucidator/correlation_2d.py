@@ -70,8 +70,9 @@ def extract_hsqc_pairs(
     """
     if spectrum.experiment_type != 'HSQC':
         return []
-    # 按 SNR 过滤
-    peaks = [p for p in spectrum.peaks if (p.snr or 0) >= min_snr]
+    # 按 SNR 过滤. snr=None 表示峰来自显式峰表 (如 MNova 导出, 无噪声估计), 放行.
+    peaks = [p for p in spectrum.peaks
+             if p.snr is None or p.snr >= min_snr]
     # 按强度降序取 top
     peaks.sort(key=lambda p: p.intensity, reverse=True)
     peaks = peaks[:max_peaks]
@@ -94,7 +95,9 @@ def extract_hmbc_pairs(
     """
     if spectrum.experiment_type != 'HMBC':
         return [], 0
-    peaks = [p for p in spectrum.peaks if (p.snr or 0) >= min_snr]
+    # snr=None 表示峰来自显式峰表 (如 MNova 导出), 放行.
+    peaks = [p for p in spectrum.peaks
+             if p.snr is None or p.snr >= min_snr]
     peaks.sort(key=lambda p: p.intensity, reverse=True)
     peaks = peaks[:max_peaks]
     pairs = [(p.f2_ppm, p.f1_ppm) for p in peaks]
@@ -133,8 +136,9 @@ def extract_cosy_pairs(
     if spectrum.experiment_type not in ('COSY', 'ROESY', 'NOESY', 'TOCSY'):
         return []
     pairs: Set[Tuple[float, float]] = set()
-    # 按 SNR 过滤
-    peaks = [p for p in spectrum.peaks if (p.snr or 0) >= min_snr]
+    # 按 SNR 过滤. snr=None 表示峰来自显式峰表 (如 MNova 导出), 放行.
+    peaks = [p for p in spectrum.peaks
+             if p.snr is None or p.snr >= min_snr]
     peaks.sort(key=lambda p: p.intensity, reverse=True)
     for p in peaks:
         # 去对角线
