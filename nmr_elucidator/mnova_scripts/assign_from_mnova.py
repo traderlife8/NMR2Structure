@@ -36,6 +36,8 @@ import pandas as pd
 _DEFAULT_COMPOUND = 'clxh119'   # 化合物名
 _DATA_DIR = r'X:\OCF投稿\2026-10-11新化合物'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
+# row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
+_ROW_MATCH_TOL = 0.015
 # mnova JSON 输出根 = _DATA_DIR/mnova_export (qs 从文档路径动态推导同一目录, 两端一致)
 _MNOVA_OUT_ROOT = os.path.join(_DATA_DIR, 'mnova_export')
 
@@ -87,7 +89,9 @@ def _export_mnova_json(compound: str) -> str:
     print(f'[mnova] 无界面导出 JSON: {os.path.basename(mnova_path)} ...')
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if proc.returncode != 0:
-        raise SystemExit(f'ERROR: MestReNova 导出失败 exit={proc.returncode}')
+        raise SystemExit(f'ERROR: MestReNova 导出失败 exit={proc.returncode}\n'
+                         f'stdout: {proc.stdout[-2000:] if proc.stdout else ""}\n'
+                         f'stderr: {proc.stderr[-2000:] if proc.stderr else ""}')
     if not os.path.isdir(out_dir) or not any(
             fn.endswith('.json') for fn in os.listdir(out_dir)):
         raise SystemExit(f'ERROR: 导出完成但未发现 JSON 产物: {out_dir}')
@@ -254,6 +258,345 @@ def hsqc_pairs(hsqc_doc: dict):
         out.append((float(c), float(h), inten))
     out.sort(key=lambda x: -x[2])
     return out
+
+
+# ---- 第二阶段: 矩阵复核 (模拟化学家看 HSQC 等高线图) ----
+# 参考: 氢谱积分 1D 信号的 nH 是硬约束; 若某 δH 附近只有一团等高线但 nH>=2,
+# 说明是斜向融合椭圆 → 在矩阵上做单/双 2D 高斯拟合拆分出多个 (δC, δH) 中心;
+# 逐行验证初步归属: 每行 (C, H) 必须落在某个交叉峰中心附近.
+
+# 复核容差 (ppm)
+REV_C_TOL = 0.75      # 交叉峰中心与归属 δC 的最大偏差
+REV_H_TOL = 0.04      # 交叉峰中心与归属 δH 的最大偏差
+REV_CLUSTER_SIG = 5.0  # 峰检测阈值: 噪声 MAD 的倍数
+REV_SPLIT_RESID = 0.35  # 双高斯判定: 单高斯残差 RMS / 峰高 > 此值 → 尝试拆分
+
+
+def load_hsqc_matrix(json_dir: str):
+    """读 HSQC JSON 的 2D 矩阵. 返回 (matrix, c_axis, h_axis) 或 None.
+
+    矩阵布局: 行 = F1 碳维 (firstXppm→lastXppm), 列 = F2 氢维 (firstYppm→lastYppm).
+    """
+    doc = pick_docs(json_dir, 2, 'HSQC')
+    if doc is None:
+        return None
+    m = doc.get('data2d')
+    if not m or not m[0]:
+        return None
+    if doc.get('firstXppm') is None or doc.get('firstYppm') is None:
+        return None
+    try:
+        import numpy as np
+        mat = np.array(m, dtype=float)
+        c_ax = np.linspace(float(doc['firstXppm']), float(doc['lastXppm']), mat.shape[0])
+        h_ax = np.linspace(float(doc['firstYppm']), float(doc['lastYppm']), mat.shape[1])
+        return mat, c_ax, h_ax
+    except (ValueError, TypeError) as e:
+        print(f'[复核][WARN] HSQC 矩阵加载失败: {e}')
+        return None
+
+
+def _cluster_blobs(mat, c_ax, h_ax):
+    """连通域分割: 阈值以上像素聚成峰团. 返回 [{rows, cols, peak}] 列表 (按峰高降序)."""
+    import numpy as np
+    from scipy import ndimage
+    noise = float(np.median(np.abs(mat - np.median(mat)))) * 1.4826  # MAD→σ
+    thr = noise * REV_CLUSTER_SIG
+    mask = mat > max(thr, mat.max() * 0.05)
+    lab, n = ndimage.label(mask)
+    blobs = []
+    for k in range(1, n + 1):
+        ys, xs = np.where(lab == k)
+        pk = mat[ys, xs].max()
+        if len(ys) < 4 or pk < thr * 2:
+            continue
+        blobs.append({'rows': ys, 'cols': xs, 'peak': float(pk)})
+    blobs.sort(key=lambda b: -b['peak'])
+    return blobs
+
+
+def _fit_gaussians(mat, c_ax, h_ax, blob, n_gauss):
+    """在峰团窗口内拟合 n 个 2D 高斯 (共享 σ). 返回 (centers, resid_ratio) 或 None."""
+    import numpy as np
+    from scipy.optimize import curve_fit
+    ys, xs = blob['rows'], blob['cols']
+    pad_c = max(3, int(0.06 / max(abs(c_ax[1] - c_ax[0]), 1e-9)))
+    pad_h = max(3, int(0.03 / max(abs(h_ax[1] - h_ax[0]), 1e-9)))
+    r0, r1 = max(ys.min() - pad_c, 0), min(ys.max() + pad_c + 1, mat.shape[0])
+    c0, c1 = max(xs.min() - pad_h, 0), min(xs.max() + pad_h + 1, mat.shape[1])
+    sub = np.clip(mat[r0:r1, c0:c1], 0, None)
+    if sub.size < n_gauss * 12 or sub.shape[0] == 0 or sub.shape[1] == 0:
+        return None
+    C, H = np.meshgrid(c_ax[r0:r1], h_ax[c0:c1], indexing='ij')
+    pk = float(sub.max())
+    dc = abs(c_ax[1] - c_ax[0])
+    dh = abs(h_ax[1] - h_ax[0])
+    # 初始中心: 极大点; 多高斯时第 2 个放在峰团对角另一端
+    imax = np.unravel_index(sub.argmax(), sub.shape)
+    centers0 = [(c_ax[r0:r1][imax[0]], h_ax[c0:c1][imax[1]])]
+    if n_gauss >= 2:
+        # 第 2 中心: 远离第 1 中心的次极大
+        tmp = sub.copy()
+        r_off = max(1, int(0.5 / dc))
+        c_off = max(1, int(0.02 / dh))
+        tmp[max(imax[0]-r_off,0):imax[0]+r_off+1, max(imax[1]-c_off,0):imax[1]+c_off+1] = 0
+        i2 = np.unravel_index(tmp.argmax(), tmp.shape)
+        centers0.append((c_ax[r0:r1][i2[0]], h_ax[c0:c1][i2[1]]))
+
+    def model(XH, *args):
+        C_, H_ = XH
+        out = np.full(C_.shape, args[-1])
+        for g in range(n_gauss):
+            a, c, h = args[g * 3:(g + 1) * 3]
+            out = out + a * np.exp(-((C_ - c) ** 2 / (2 * args[-3] ** 2) +
+                                     (H_ - h) ** 2 / (2 * args[-2] ** 2)))
+        return out.ravel()
+
+    p0, lo, hi_ = [], [], []
+    dc0 = min(1.5, max(0.2, (c_ax[r0:r1][-1] - c_ax[r0:r1][0]) / (4 * n_gauss)))
+    dh0 = min(0.05, max(0.004, (h_ax[c0:c1][-1] - h_ax[c0:c1][0]) / (4 * n_gauss)))
+    # 轴可能降序 (F1 从高 ppm 到低 ppm), 边界必须按 min/max 排序
+    c_lo, c_hi2 = min(c_ax[r0], c_ax[r1 - 1]), max(c_ax[r0], c_ax[r1 - 1])
+    h_lo, h_hi2 = min(h_ax[c0], h_ax[c1 - 1]), max(h_ax[c0], h_ax[c1 - 1])
+    for (c0g, h0g) in centers0:
+        p0 += [pk, c0g, h0g]
+        lo += [pk * 0.1, c_lo, h_lo]
+        hi_ += [pk * 3, c_hi2, h_hi2]
+    p0 += [dc0, dh0, 0.0]
+    lo += [dc0 * 0.2, dh0 * 0.2, -pk * 0.2]
+    hi_ += [abs(c_hi2 - c_lo) * 2, abs(h_hi2 - h_lo) * 2, pk * 0.2]
+    try:
+        p, _ = curve_fit(model, (C, H), sub.ravel(), p0=p0,
+                         bounds=(lo, hi_), maxfev=30000)
+    except (RuntimeError, ValueError):
+        return None
+    # 残差只在峰团主体上算 (背景 0 会稀释 RMS, 导致融合峰漏检)
+    fit = model((C, H), *p).reshape(sub.shape)
+    body = sub > pk * 0.15
+    resid = float(np.std((sub - fit)[body])) if body.any() else float(np.std(sub.ravel()))
+    centers = [(float(p[g * 3 + 1]), float(p[g * 3 + 2]), float(p[g * 3]))
+               for g in range(n_gauss)]
+    return centers, resid / pk if pk > 0 else 9.9
+
+
+def split_blobs(mat, c_ax, h_ax, want_splits: dict):
+    """峰团拆分: 对峰团做单高斯; 残差大且该区域期望 H 数>=2 时做双高斯.
+
+    want_splits: {(round(c,1), round(h,1)): n_h} — 1D 信号 nH 约束 (提示拆分).
+    返回 centers: [(c_ppm, h_ppm, amp)], 及 note 列表.
+    """
+    import numpy as np
+    blobs = _cluster_blobs(mat, c_ax, h_ax)
+    centers, notes = [], []
+    for b in blobs:
+        ys, xs = b['rows'], b['cols']
+        cc = float(np.median(c_ax[ys]))
+        hh = float(np.median(h_ax[xs]))
+        want = 0
+        for (kc, kh), nh in want_splits.items():
+            if abs(kc - cc) <= 0.35 and abs(kh - hh) <= 0.06:
+                want = max(want, nh)
+        r1 = _fit_gaussians(mat, c_ax, h_ax, b, 1)
+        if r1 is None:
+            # 无拟合回退: 极大点位置
+            i = np.argmax(mat[b['rows'], b['cols']])
+            centers.append((float(c_ax[b['rows'][i]]), float(h_ax[b['cols'][i]]), b['peak']))
+            continue
+        (cen1, rr1) = r1
+        do_split = want >= 2 and rr1 > REV_SPLIT_RESID
+        if not do_split:
+            # 即使无 1D 提示, 残差很大也尝试双高斯 (交叉验证)
+            do_split = rr1 > REV_SPLIT_RESID * 2.2
+        if do_split:
+            r2 = _fit_gaussians(mat, c_ax, h_ax, b, 2)
+            if r2 is not None:
+                (cen2, rr2) = r2
+                if rr2 < rr1 * 0.8 and abs(cen2[0][0] - cen2[1][0]) > 0.3 \
+                        and abs(cen2[0][1] - cen2[1][1]) > 0.008:
+                    centers += cen2
+                    notes.append(f'融合峰 ({cc:.2f},{hh:.2f}) 拆分为 '
+                                 f'{cen2[0][0]:.2f}/{cen2[0][1]:.2f} + {cen2[1][0]:.2f}/{cen2[1][1]:.2f}'
+                                 f' (残差 {rr1:.2f}→{rr2:.2f})')
+                    continue
+        centers.append((cen1[0][0], cen1[0][1], cen1[0][2]))
+    return centers, notes
+
+
+def fmt_1h_nmr(h_str, sig):
+    """拼 xlsx 1H-NMR 格式: '4.31, t (8.8)'; 无 1D 信号时仅 δ.
+    3 个及以上 J 值的复杂裂分 (如 ddt) 按惯例简写为 m."""
+    if not sig:
+        return h_str
+    mult = sig.get('mult') or 'm'
+    js = sig.get('J') or []
+    if len(js) >= 3:
+        return f"{h_str}, m"
+    if js:
+        return f"{h_str}, {mult} ({', '.join(js)})"
+    return f"{h_str}, {mult}"
+
+
+def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
+                      h1d_signals, json_dir: str) -> pd.DataFrame:
+    """第二阶段矩阵复核: 逐行验证初步归属, 融合峰拆分修正.
+
+    返回带 'review' 列的 out (复核结论: OK / 偏移 / 复核修正 / 未命中).
+    回填仅使用拆分中心 (融合峰拆出的第 2 中心), 且要求本行 δC 与中心 δC 匹配、
+    中心 δH 对齐到某 1D 信号 (有真实氢谱峰支撑), 避免激进改写.
+    """
+    loaded = load_hsqc_matrix(json_dir)
+    if loaded is None:
+        out['review'] = '无HSQC矩阵'
+        return out
+    mat, c_ax, h_ax = loaded
+    # 融合峰拆分 (1D nH 提示 + 残差/双高斯验证), 输出交叉峰中心集合
+    centers, split_flags, notes = split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals)
+    for nmsg in notes:
+        print(f'[复核] {nmsg}')
+    # 逐行核对: (δC, δH) 是否落在某交叉峰中心 ±(REV_C_TOL, REV_H_TOL) 内
+    center_used = [False] * len(centers)
+    rows_idx = []
+    for i, (_, r) in enumerate(out.iterrows()):
+        if pd.isna(r['assigned_1H']) or not str(r['assigned_1H']).strip():
+            continue
+        rows_idx.append((float(r['ppm']), float(str(r['assigned_1H'])), i))
+    rev = [''] * len(out)
+    for c_v, h_v, i in rows_idx:
+        hit, hit_k, best_d = None, None, 9e9
+        for k, (cc, hh, amp) in enumerate(centers):
+            d = abs(cc - c_v) / REV_C_TOL + abs(hh - h_v) / REV_H_TOL
+            if abs(cc - c_v) <= REV_C_TOL and abs(hh - h_v) <= REV_H_TOL and d < best_d:
+                hit, hit_k, best_d = (cc, hh), k, d
+        if hit is None:
+            # 回填 (仅拆分中心): δC 匹配 + 中心 δH 对齐到某 1D 信号 (有氢谱峰支撑)
+            cand = []
+            for k, (cc, hh, amp) in enumerate(centers):
+                if not (split_flags[k] and not center_used[k]
+                        and abs(cc - c_v) <= 0.35):
+                    continue
+                s1d = min(h1d_signals, key=lambda x: abs(x['ppm'] - hh),
+                          default=None)
+                if s1d and abs(s1d['ppm'] - hh) <= H_ALIGN_TOL:
+                    cand.append((abs(cc - c_v), abs(hh - h_v), k))
+            if cand:
+                cand.sort()
+                _, _, k = cand[0]
+                cc, hh, _ = centers[k]
+                center_used[k] = True
+                rev[i] = f'复核修正→({cc:.2f},{hh:.2f})'
+                h_aligned = f'{hh:.2f}'
+                s1d = min(h1d_signals, key=lambda x: abs(x['ppm'] - hh),
+                          default=None)
+                if s1d and abs(s1d['ppm'] - hh) <= H_ALIGN_TOL:
+                    h_aligned = f"{s1d['ppm']:.2f}"
+                out.at[i, 'assigned_1H'] = h_aligned
+                # 修正后的格式化 1H-NMR (δ, mult (J))
+                out.at[i, '1H-NMR'] = fmt_1h_nmr(h_aligned, s1d)
+                continue
+            rev[i] = f'未命中交叉峰 ({c_v:.2f})'
+            continue
+        center_used[hit_k] = True
+        if abs(hit[0] - c_v) <= 0.15 and abs(hit[1] - h_v) <= 0.02:
+            rev[i] = f"OK ({hit[0]:.2f},{hit[1]:.2f})"
+        else:
+            rev[i] = f"偏移→({hit[0]:.2f},{hit[1]:.2f})"
+    # review 为空的行 (Cq/未归属): 从 mnova 13C 谱峰表找本行 δC 附近碳峰补入 review
+    # Cq 独立碳峰命中 → "OK (C)"; 无 H 对应且 13C 也找不到 → "未命中交叉峰 (C)"
+    c13_peaks = _load_c13_peaks(json_dir)
+    for i, (_, r) in enumerate(out.iterrows()):
+        if rev[i] or pd.isna(r['ppm']):
+            continue
+        c_v = float(r['ppm'])
+        near = [(abs(p - c_v), p) for p in c13_peaks if abs(p - c_v) <= 0.5]
+        if near:
+            near.sort()
+            rev[i] = f'OK ({near[0][1]:.2f})'
+        else:
+            rev[i] = f'未命中交叉峰 ({c_v:.2f})'
+    out['review'] = rev
+    return out
+
+
+def _load_c13_peaks(json_dir: str):
+    """读 13C 1D 谱 JSON 峰表 (GSD), 返回 δC 列表 (强度降序去重)."""
+    peaks = []
+    for fn in sorted(os.listdir(json_dir)):
+        if not fn.endswith('.json') or fn.startswith('_'):
+            continue
+        try:
+            with open(os.path.join(json_dir, fn), encoding='utf-8') as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if doc.get('dim') != 1 or doc.get('nucleus') != '13C':
+            continue
+        for pk in doc.get('peaks', []):
+            c = pk.get('ppm1')
+            if c is not None and -5 <= float(c) <= 240:
+                peaks.append(float(c))
+    # 去重 (0.01 内合并), 按值排序
+    peaks.sort()
+    out = []
+    for p in peaks:
+        if not out or abs(p - out[-1]) > 0.01:
+            out.append(p)
+    return out
+
+
+def split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals):
+    """带 1D nH 提示的峰团拆分 (模拟化学家看融合椭圆).
+
+    两遍处理: 第一遍所有团做单高斯并收集 σ_C 全局中位数;
+    第二遍对 (1D nH>=2 提示) 且 (残差偏高 或 σ_C 显著宽于中位) 的团做双高斯拆分.
+    """
+    import numpy as np
+    blobs = _cluster_blobs(mat, c_ax, h_ax)
+    infos = []
+    for b in blobs:
+        ys, xs = b['rows'], b['cols']
+        # 轴可能降序, 区间端点取 min/max
+        h_lo, h_hi_ = min(h_ax[xs.min()], h_ax[xs.max()]), max(h_ax[xs.min()], h_ax[xs.max()])
+        want = 0
+        for s in h1d_signals:
+            if s.get('nH', 0) >= 2 and h_lo - 0.01 <= s['ppm'] <= h_hi_ + 0.01:
+                want = max(want, s['nH'])
+        r1 = _fit_gaussians(mat, c_ax, h_ax, b, 1)
+        infos.append({'blob': b, 'want': want, 'r1': r1,
+                      'cc': float(np.median(c_ax[ys])), 'hh': float(np.median(h_ax[xs]))})
+    # 全局残差中位数 (拟合正常团) — 残差显著高于中位的融合团更可疑
+    sig_c = [inf['r1'][1] for inf in infos if inf['r1'] is not None]
+    med_resid = float(np.median(sig_c)) if sig_c else 0.1
+    centers, split_flags, notes = [], [], []
+    for inf in infos:
+        b, want, r1 = inf['blob'], inf['want'], inf['r1']
+        if r1 is None:
+            ys, xs = b['rows'], b['cols']
+            i = int(np.argmax(mat[ys, xs]))
+            centers.append((float(c_ax[ys[i]]), float(h_ax[xs[i]]), b['peak']))
+            split_flags.append(False)
+            continue
+        cen1, rr1 = r1
+        # 拆分条件: 1D nH>=2 提示 (该 δH 区域确实有多个 H) → 总是尝试双高斯,
+        # 接受标准: 残差显著下降 且 两中心间距合理 (ΔC 0.3~3.5, ΔH > 0.008)
+        do_split = want >= 2
+        if not do_split:
+            do_split = rr1 > REV_SPLIT_RESID * 2.2  # 残差极大: 无提示也拆 (交叉验证)
+        if do_split:
+            r2 = _fit_gaussians(mat, c_ax, h_ax, b, 2)
+            if r2 is not None:
+                cen2, rr2 = r2
+                dc2 = abs(cen2[0][0] - cen2[1][0])
+                if rr2 < rr1 * 0.85 and 0.3 <= dc2 <= 3.5 \
+                        and abs(cen2[0][1] - cen2[1][1]) > 0.008:
+                    centers += cen2
+                    split_flags += [True, True]
+                    notes.append(f'融合峰 ({inf["cc"]:.2f},{inf["hh"]:.2f}) 拆分为 '
+                                 f'({cen2[0][0]:.2f},{cen2[0][1]:.2f}) + ({cen2[1][0]:.2f},{cen2[1][1]:.2f})'
+                                 f' [ΔC={dc2:.2f}, 残差 {rr1:.3f}→{rr2:.3f}, 1D nH={want}]')
+                    continue
+        centers.append((cen1[0][0], cen1[0][1], cen1[0][2]))
+        split_flags.append(False)
+    return centers, split_flags, notes
 
 
 # ---- 核心归属 ----
@@ -505,19 +848,6 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             return f"{s['ppm']:.2f}", s
         return f'{h:.2f}', None
 
-    def fmt_1h_nmr(h_str, sig):
-        """拼 xlsx 1H-NMR 格式: '4.31, t (8.8)'; 无 1D 信号时仅 δ.
-        3 个及以上 J 值的复杂裂分 (如 ddt) 按惯例简写为 m."""
-        if not sig:
-            return h_str
-        mult = sig.get('mult') or 'm'
-        js = sig.get('J') or []
-        if len(js) >= 3:
-            return f"{h_str}, m"
-        if js:
-            return f"{h_str}, {mult} ({', '.join(js)})"
-        return f"{h_str}, {mult}"
-
     results = []
     for slot in slots:
         hs_sorted = sorted(slot['hs'], reverse=True)
@@ -538,7 +868,7 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 nmr_str = ''
             results.append({
                 'ppm': float(row['ppm']), 'Types': slot['type'],
-                '1H-NMR': nmr_str,
+                '1H-NMR-v1': nmr_str,  # 第一步初匹配结果 (复核修正前)
                 'assigned_1H': row_outputs[k],
                 'all_assigned_H': '; '.join(h_strs) if k == 0 else '',
                 'aligned_1D': ('; '.join(f'{h_strs[i]}{"✓" if flags[i] else "✗"}'
@@ -548,6 +878,16 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 '_cont': bool(row.get('_cont', False)),
             })
     out = pd.DataFrame(results)
+    # 第二阶段: HSQC 矩阵复核 (逐行验证交叉峰 + 融合峰拆分)
+    # review 内部对修正行生成格式化 1H-NMR; 未修正行复制 v1
+    out = review_assignment(out, df, h1d_signals, json_dir)
+    v1 = out['1H-NMR-v1'] if '1H-NMR-v1' in out.columns else None
+    if '1H-NMR' not in out.columns:
+        out['1H-NMR'] = out['1H-NMR-v1']
+    else:
+        m_missing = out['1H-NMR'].isna() | (out['1H-NMR'].astype(str).str.strip() == '')
+        out.loc[m_missing, '1H-NMR'] = out.loc[m_missing, '1H-NMR-v1']
+    # 列序: 1H-NMR-v1, 1H-NMR, review, judge (judge 稍后回写), 其余跟后
     # 排序: ppm 从大到小; 同 ppm 按 assigned_1H 从大到小 (Cq/空值排最后)
     # ascending=False: ppm 与 δH 均降序
     out['_h_sort'] = out['assigned_1H'].map(
@@ -718,13 +1058,49 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 label = '差异'
                 nh_p, nh_t = _first_num(rp['1H-NMR']), _first_num(rt['1H-NMR']) if rt is not None else None
                 if nh_p is not None and nh_t is not None:
-                    label += f' (ΔδH={nh_p - nh_t:+.2f})'
+                    diff = nh_p - nh_t
+                    if abs(diff) < 0.002:
+                        # Δ≈0: 只输出 '一致' 二字
+                        label = '一致'
+                    elif abs(diff) < _ROW_MATCH_TOL:
+                        # 容差内: 保留差异值但改判一致
+                        label = f'一致 (ΔδH={diff:+.2f})'
+                    else:
+                        label += f' (ΔδH={diff:+.2f})'
             row_match_map[(round(float(rp['ppm']), 2), str(rp['Types']).strip(),
                            _norm(rp['1H-NMR']))] = label
     out['row_match'] = out.apply(
         lambda r: row_match_map.get(
             (round(float(r['ppm']), 2), str(r['Types']).strip(), _norm(r['1H-NMR'])), ''),
         axis=1)
+
+    # ---- C_match 列: ppm (xlsx 碳峰) vs review 中的碳数值, 规则仿 row_match ----
+    # review 碳数值来源: "OK (C,H)" / "偏移→(C,H)" / "复核修正→(C,H)" / "13C峰 C"
+    def _first_c(v):
+        """取 review 字符串中碳数值; 跳过 '13C峰' 前缀里的 13."""
+        s = re.sub(r'13C峰\s*', '', str(v))
+        m = re.search(r'-?\d+\.?\d*', s)
+        return float(m.group()) if m else None
+
+    c_match = []
+    for _, r in out.iterrows():
+        if pd.isna(r['ppm']) or not str(r['ppm']).strip():
+            c_match.append('')
+            continue
+        c_v = float(r['ppm'])
+        cr = _first_c(r.get('review'))
+        if cr is None:
+            c_match.append('')
+            continue
+        diff = cr - c_v
+        if abs(diff) < 0.002:
+            # Δ≈0: 只输出 '一致' 二字
+            c_match.append('一致')
+        elif abs(diff) < _ROW_MATCH_TOL:
+            c_match.append(f'一致 (ΔδC={diff:+.2f})')
+        else:
+            c_match.append(f'差异 (ΔδC={diff:+.2f})')
+    out['C_match'] = c_match
 
     # 重新排序后落盘; ppm/δH 均降序
     out['_h_sort'] = out['assigned_1H'].map(
@@ -733,7 +1109,7 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
 
     # 氢谱数值统一四舍五入保留 2 位小数
     out['ppm'] = out['ppm'].map(lambda x: round(float(x), 2))
-    for col in ('assigned_1H', 'all_assigned_H', 'aligned_1D'):
+    for col in ('1H-NMR-v1', 'assigned_1H', 'all_assigned_H', 'aligned_1D'):
         if col in out.columns:
             out[col] = out[col].map(_round_h_in_str)
 
@@ -761,6 +1137,15 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             out = out[col_order]
     else:
         out = out.drop(columns=[c for c in ('1H-NMR_real', 'row_match') if c in out.columns])
+    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR, review, judge, 其余跟后 ----
+    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR']
+    rest = [c for c in out.columns if c not in front]
+    ordered = [c for c in front if c in out.columns]
+    for c in rest:
+        if c in ('review', 'judge', 'C_match', 'row_match'):
+            ordered.append(c)
+    ordered += [c for c in rest if c not in ordered]
+    out = out[ordered]
     # ---- 最终输出格式: 补全/续行 (CH2 第 2 行) 置空 ppm/Types, 仅保留 1H-NMR (参考 xlsx sheet1 续行格式) ----
     if '_cont' in out.columns:
         m_cont = out['_cont'].fillna(False).astype(bool)

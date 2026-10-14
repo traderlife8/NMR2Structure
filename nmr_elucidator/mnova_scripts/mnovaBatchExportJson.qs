@@ -98,13 +98,35 @@ function mnovaBatchExportJson() {
             }
         }
 
-        // 1D 导出全实数矩阵; 2D 数据量大, 仅导峰表
+        // 1D 导出全实数矩阵; 2D 导出完整实数矩阵 (复核模块需在矩阵上找局部极大值, 如融合椭圆拆分)
         if (spec3.dimCount === 1) {
             realArr3 = [];
             for (p = 0; p < spec3.count(1); p++) {
                 realArr3.push(spec3.real(p));
             }
             obj3.data = realArr3;
+        } else if (spec3.dimCount === 2) {
+            // 行=F1 (碳维, count(1)), 列=F2 (氢维, count(2)); real(i,j) 第 i 行第 j 列
+            var nF13, nF23, i3, rowArr3;
+            nF13 = spec3.count(1);
+            nF23 = spec3.count(2);
+            try {
+                obj3.firstYppm = spec3.unitsToUnits("pt", "ppm", 0, 2);
+                obj3.lastYppm = spec3.unitsToUnits("pt", "ppm", nF13 - 1, 2);
+            } catch (e2d) {
+                obj3.firstYppm = null;
+                obj3.lastYppm = null;
+            }
+            obj3.pointCount2 = nF23;
+            var mat3 = [];
+            for (i3 = 0; i3 < nF13; i3++) {
+                rowArr3 = [];
+                for (p = 0; p < nF23; p++) {
+                    rowArr3.push(spec3.real(i3, p));
+                }
+                mat3.push(rowArr3);
+            }
+            obj3.data2d = mat3;
         }
 
         objKey = base3 + "__page" + pageNo + "__item" + itemNo + "__" + expName(spec3);
