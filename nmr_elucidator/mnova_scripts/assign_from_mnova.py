@@ -168,8 +168,71 @@ def parse_1h_report(txt_path: str):
         if jm:
             js = [x.strip() for x in jm.group(1).split(',') if x.strip()]
         center = (ppm1 + ppm2) / 2 if ppm2 is not None else ppm1
-        out.append({'ppm': round(center, 3), 'mult': mult, 'nH': nH, 'J': js})
+        # 区间原样文本 (如 '1.64-1.88') 与排序键 (区间取大端, 单值取自身)
+        if ppm2 is not None:
+            hi, lo = max(ppm1, ppm2), min(ppm1, ppm2)
+            ppm_raw = f'{hi:.2f}-{lo:.2f}'
+            sort_key = hi
+        else:
+            ppm_raw = f'{ppm1:.2f}'
+            sort_key = ppm1
+        out.append({'ppm': round(center, 3), 'mult': mult, 'nH': nH, 'J': js,
+                    'ppm_raw': ppm_raw, 'sort_key': sort_key})
     return out
+
+
+def export_1h_nmr(txt_path: str, out_dir: str = '', compound: str = '') -> pd.DataFrame:
+    """氢谱积分.txt → 积分表 DataFrame (δH, δH_ppm, type, J, nH; 按 δH 降序).
+
+    δH = 数值列 (区间取中点, 四舍五入 2 位小数); δH_ppm = txt 原文 (区间保留 'a-b');
+    J 列为 '(a, b)' 文本. 不单独落盘, 由归属表写入 <compound>_归属表.xlsx 的
+    '<compound>_1H_NMR' sheet (若该文件已含此 sheet 则直接读取复用).
+    返回 DataFrame (J 还原为 list).
+    """
+    xlsx_path = os.path.join(out_dir or os.path.dirname(txt_path),
+                             f'{compound}_归属表.xlsx' if compound else '归属表.xlsx')
+    sheet_name = f'{compound}_1H_NMR' if compound else '1H_NMR'
+    if os.path.isfile(xlsx_path):
+        try:
+            xl = pd.ExcelFile(xlsx_path)
+            if sheet_name in xl.sheet_names:
+                df = pd.read_excel(xl, sheet_name=sheet_name, dtype={'J': str})
+                # 复用: 还原内部格式 (J 列字符串 → list)
+                df['J'] = df['J'].fillna('').map(
+                    lambda s: [x.strip() for x in str(s).strip('()').split(',') if x.strip()])
+                df['nH'] = df['nH'].astype(float)
+                return df
+        except (OSError, ValueError) as e:
+            print(f'[积分表][WARN] 复用 {xlsx_path} 失败 ({e}), 重新解析 txt')
+    sigs = parse_1h_report(txt_path)
+    rows = [{'δH': round(s['ppm'], 2), 'δH_ppm': s['ppm_raw'], 'type': s['mult'],
+             'J': f"({', '.join(s['J'])})" if s['J'] else '',
+             'nH': int(s['nH']), '_k': s['sort_key']} for s in sigs]
+    df = pd.DataFrame(rows).sort_values('_k', ascending=False).drop(columns='_k').reset_index(drop=True)
+    return df.assign(J=df['J'].map(
+        lambda s: [x.strip() for x in str(s).strip('()').split(',') if x.strip()]))
+
+
+def _write_excel_formatted(df: pd.DataFrame, path: str,
+                           float2dp=(), text_cols=()):
+    """写 xlsx: float2dp 列固定 2 位小数显示, text_cols 列强制文本格式."""
+    with pd.ExcelWriter(path, engine='openpyxl') as xw:
+        df.to_excel(xw, index=False)
+        ws = xw.book.worksheets[0]
+        from openpyxl.styles import Alignment
+        for col_name in float2dp:
+            if col_name in df.columns:
+                ci = df.columns.get_loc(col_name) + 1
+                for row in ws.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '0.00'
+        for col_name in text_cols:
+            if col_name in df.columns:
+                ci = df.columns.get_loc(col_name) + 1
+                for row in ws.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '@'
+                        cell.alignment = Alignment(horizontal='left')
 
 
 # ---- 数据加载 ----
@@ -490,8 +553,10 @@ def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
                 if s1d and abs(s1d['ppm'] - hh) <= H_ALIGN_TOL:
                     h_aligned = f"{s1d['ppm']:.2f}"
                 out.at[i, 'assigned_1H'] = h_aligned
-                # 修正后的格式化 1H-NMR (δ, mult (J))
+                # 修正后的格式化 1H-NMR (δ, mult (J)) 及 nH
                 out.at[i, '1H-NMR'] = fmt_1h_nmr(h_aligned, s1d)
+                if s1d and s1d.get('nH') is not None:
+                    out.at[i, 'nH'] = int(s1d['nH'])
                 continue
             rev[i] = f'未命中交叉峰 ({c_v:.2f})'
             continue
@@ -603,7 +668,13 @@ def split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals):
 
 def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> pd.DataFrame:
     df = load_xlsx(xlsx_path)
-    h1d_signals = parse_1h_report(h_report_path)
+    # 化合物名: xlsx 文件名去 "数据归属.xlsx" (与归属表输出同名前缀)
+    base = re.sub(r'数据归属\.xlsx$', '', os.path.basename(xlsx_path)) or 'compound'
+    # 两步归属共用积分表: txt → <base>_1H_NMR.csv (已存在则复用) → 内部信号 list
+    # (δH 列已是数值: 区间存中点)
+    sig_df = export_1h_nmr(h_report_path, out_dir, compound=base)
+    h1d_signals = [{'ppm': float(r['δH']), 'mult': r['type'], 'nH': float(r['nH']),
+                    'J': r['J']} for _, r in sig_df.iterrows()]
     hsqc = pick_docs(json_dir, 2, 'HSQC')
     if hsqc is None:
         raise SystemExit('ERROR: 未找到 HSQC JSON')
@@ -864,11 +935,15 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             # 1H-NMR 列: xlsx 报告格式 (δ, mult (J)); 每行取对应的那个 H
             if k < len(h_strs) and h_strs[k]:
                 nmr_str = fmt_1h_nmr(h_strs[k], sigs[k])
+                # nH: 对应 1D 信号积分括号里的 H 数 (无对齐信号时留空)
+                nh_val = int(sigs[k]['nH']) if sigs[k] and sigs[k].get('nH') is not None else ''
             else:
                 nmr_str = ''
+                nh_val = ''
             results.append({
                 'ppm': float(row['ppm']), 'Types': slot['type'],
                 '1H-NMR-v1': nmr_str,  # 第一步初匹配结果 (复核修正前)
+                'nH': nh_val,  # 归属 1D 信号的积分 H 数
                 'assigned_1H': row_outputs[k],
                 'all_assigned_H': '; '.join(h_strs) if k == 0 else '',
                 'aligned_1D': ('; '.join(f'{h_strs[i]}{"✓" if flags[i] else "✗"}'
@@ -894,11 +969,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
         lambda x: float(x) if not pd.isna(x) and str(x).strip() else -9e9)
     out = out.sort_values(['ppm', '_h_sort'], ascending=False).drop(columns='_h_sort').reset_index(drop=True)
     os.makedirs(out_dir, exist_ok=True)
-    # 输出文件名带化合物名前缀 (取 xlsx 文件名去 "数据归属.xlsx"), 防止同目录多化合物覆盖
-    base = os.path.basename(xlsx_path)
-    base = re.sub(r'数据归属\.xlsx$', '', base) or 'compound'
-    out_csv = os.path.join(out_dir, f'{base}_归属表.csv')
-    out.to_csv(out_csv, index=False, encoding='utf-8-sig')
+    # 输出文件名带化合物名前缀 (base 已在函数开头从 xlsx 文件名推导)
+    out_xlsx = os.path.join(out_dir, f'{base}_归属表.xlsx')
 
     # ---- 对比判分 (有 1H-NMR 已知列时) ----
     truth = load_xlsx(xlsx_path)
@@ -1137,8 +1209,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             out = out[col_order]
     else:
         out = out.drop(columns=[c for c in ('1H-NMR_real', 'row_match') if c in out.columns])
-    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR, review, judge, 其余跟后 ----
-    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR']
+    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR, nH, review, judge, 其余跟后 ----
+    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR', 'nH']
     rest = [c for c in out.columns if c not in front]
     ordered = [c for c in front if c in out.columns]
     for c in rest:
@@ -1153,11 +1225,51 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
         out['Types'] = out['Types'].astype(object)
         out.loc[m_cont, ['ppm', 'Types']] = ''
         out = out.drop(columns='_cont')
-    out.to_csv(out_csv, index=False, encoding='utf-8-sig')
-    cmp_csv = os.path.join(out_dir, f'{base}_归属表_对比.csv')
-    cmp_df.to_csv(cmp_csv, index=False, encoding='utf-8-sig')
+    # ppm (碳) 列固定 2 位小数显示; 判定列文本格式 (防 '-' 开头误转公式)
+    text_cols = [c for c in ('1H-NMR-v1', '1H-NMR_real', '1H-NMR', 'review',
+                             'judge', 'C_match', 'row_match', 'assigned_1H',
+                             'all_assigned_H', 'aligned_1D', 'note', 'Types') if c in out.columns]
+    # 双 sheet: 归属表 + 1H_NMR 积分表 (sheet 名沿用文件名前缀)
+    # J 列落盘还原为 '(a, b)' 文本 (内存中是 list)
+    sig_out = sig_df.copy()
+    if 'J' in sig_out.columns:
+        sig_out['J'] = sig_out['J'].map(
+            lambda js: f"({', '.join(js)})" if isinstance(js, list) and js else
+                       (str(js) if not isinstance(js, list) else ''))
+    with pd.ExcelWriter(out_xlsx, engine='openpyxl') as xw:
+        out.to_excel(xw, sheet_name=f'{base}_归属表', index=False)
+        sig_out.to_excel(xw, sheet_name=f'{base}_1H_NMR', index=False)
+        ws = xw.book.worksheets[1]
+        from openpyxl.styles import Alignment
+        for col_name in ('δH',):
+            if col_name in sig_df.columns:
+                ci = list(sig_df.columns).index(col_name) + 1
+                for row in ws.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '0.00'
+        for col_name in ('J', 'type', 'δH_ppm'):
+            if col_name in sig_df.columns:
+                ci = list(sig_df.columns).index(col_name) + 1
+                for row in ws.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '@'
+                        cell.alignment = Alignment(horizontal='left')
+        # 归属表 sheet 的格式
+        ws0 = xw.book.worksheets[0]
+        if 'ppm' in out.columns:
+            ci = list(out.columns).index('ppm') + 1
+            for row in ws0.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                for cell in row:
+                    cell.number_format = '0.00'
+        for col_name in text_cols:
+            if col_name in out.columns:
+                ci = list(out.columns).index(col_name) + 1
+                for row in ws0.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '@'
+                        cell.alignment = Alignment(horizontal='left')
     print(f'[判分] {len(cmp_df)} 碳槽: OK={n_ok} 非OK={n_bad}')
-    print(f'输出: {out_csv}\n对比: {cmp_csv}')
+    print(f'输出: {out_xlsx}')
     return cmp_df
 
 
