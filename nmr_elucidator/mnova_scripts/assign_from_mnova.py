@@ -33,8 +33,8 @@ import sys
 import pandas as pd
 
 # ---- 默认输入配置 (直接运行即用; 换化合物时手工修改这三行) ----
-_DEFAULT_COMPOUND = 'clxh119'   # 化合物名
-_DATA_DIR = r'X:\OCF投稿\2026-10-11新化合物'
+_DEFAULT_COMPOUND = 'clxh121'   # 化合物名
+_DATA_DIR = r'Y:\LXH数据处理\新化合物处理\程序解析'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
 # row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
 _ROW_MATCH_TOL = 0.015
@@ -119,7 +119,10 @@ def _typical_h(c_ppm: float, typ: str) -> float:
 
 
 def _round_h_in_str(s):
-    """把 '4.645, m; 3.88, d (11.2)' 类字符串中的氢谱数值四舍五入到 2 位小数."""
+    """把 '4.645, m; 3.88, d (11.2)' 类字符串中的 δH (每项开头的数值) 四舍五入到 2 位小数.
+
+    括号内的 J 值 (如 'dd (9.9, 7.7)') 是 txt 原文, 不改小数位数.
+    """
     if pd.isna(s) or not str(s).strip():
         return s
 
@@ -128,8 +131,13 @@ def _round_h_in_str(s):
             return f'{round(float(m.group(1)), 2):.2f}'
         except ValueError:
             return m.group(0)
-    # 仅替换 δH 位置的数字 (分号/逗号/分号分隔项的开头数字); J 值已是 txt 原文不动
-    return re.sub(r'(?<![\w.])(\d+\.\d+)', _sub, str(s))
+    # 逐项处理: 按 '; ' 拆分, 仅替换每项开头 (δH 位置) 的数字, 括号内不动
+    parts = str(s).split('; ')
+    fixed = []
+    for part in parts:
+        # δH 是项内第一个数值 (可带区间 '-'); 只替换第一个匹配
+        fixed.append(re.sub(r'^(\d+\.\d+)(-\d+\.?\d*)?', _sub, part, count=1))
+    return '; '.join(fixed)
 
 
 # ---- 积分.txt 解析 ----
@@ -211,6 +219,144 @@ def export_1h_nmr(txt_path: str, out_dir: str = '', compound: str = '') -> pd.Da
     df = pd.DataFrame(rows).sort_values('_k', ascending=False).drop(columns='_k').reset_index(drop=True)
     return df.assign(J=df['J'].map(
         lambda s: [x.strip() for x in str(s).strip('()').split(',') if x.strip()]))
+
+
+def _pick_2d(json_dir: str, etype: str):
+    """按 experimentType 精确取 2D JSON (COSY/HMBC), 无则 None."""
+    return pick_docs(json_dir, 2, etype)
+
+
+def _cosy_partners(json_dir: str, h_v: float):
+    """COSY: δH 的邻位 H 列表 [(h2, I)] 强度降序 (仅 I>=1.0 强峰)."""
+    cosy = _pick_2d(json_dir, 'COSY')
+    if cosy is None:
+        return []
+    agg: dict = {}
+    for pk in cosy.get('peaks', []):
+        a, b = pk.get('ppm1'), pk.get('ppm2')
+        if a is None or b is None:
+            continue
+        if abs(a - h_v) <= 0.03 and abs(b - h_v) > 0.05:
+            key = round(float(b), 2)
+            agg[key] = max(agg.get(key, 0.0), float(pk.get('intensity', 0) or 0))
+    strong = [(b, i) for b, i in agg.items() if i >= 1.0]
+    strong.sort(key=lambda x: -x[1])
+    return strong
+
+
+def _hmbc_carbons(json_dir: str, h_v: float):
+    """HMBC: δH 的 2-3 键碳列表 [(δC, I)] 强度降序."""
+    hmbc = _pick_2d(json_dir, 'HMBC')
+    if hmbc is None:
+        return []
+    cands = []
+    for pk in hmbc.get('peaks', []):
+        a, b = pk.get('ppm1'), pk.get('ppm2')
+        if a is None or b is None:
+            continue
+        if abs(b - h_v) <= 0.04:
+            cands.append((float(a), abs(float(pk.get('intensity', 0) or 0))))
+    cands.sort(key=lambda x: -x[1])
+    return cands
+
+
+def third_pass_cosy_hmbc(out: pd.DataFrame, sig_df: pd.DataFrame,
+                         h1d_signals, json_dir: str) -> pd.DataFrame:
+    """第三步: COSY/HMBC 复核全部 H 归属 + 推断无 HSQC 交叉峰的信号.
+
+    全表复核规则 (对每个已归属行):
+    - COSY 交叉峰 = 2-3 键 H-H 耦合 → 相邻碳上的 H;
+    - HMBC 交叉峰 = 2-3 键 C-H → 活泼氢 (OH/NH, 无 HSQC 峰) 也可见, 常为弱峰;
+    复核项:
+    1. HSQC (第二阶段已做): C-H 直接键连;
+    2. COSY 一致性: 本 H 的 COSY 邻位 H 应归属到相邻碳 (δC 差 <= 3.5 ppm 内的碳槽);
+       本 H 邻位列表为空且多重峰非 s/m → 标 'COSY 无邻位?';
+    3. HMBC 一致性: 本 H 的 HMBC 碳应包含本碳 (2J 本身常不出现) 及邻碳 (3J);
+       HMBC 碳列表含本碳 (±0.5) → 'HMBC含本碳'; 含邻位 H 的碳 → 'HMBC含邻碳'.
+    未归属信号 (无 HSQC 交叉峰) 沿用推断: COSY 邻位传播 / HMBC 碳列表 / 活泼氢判据.
+    返回待附加 sheet 的 DataFrame (每行 = 1 个 H 信号/未归属信号).
+    """
+    rows = []
+    # ---- 部分 A: 全部已归属行的 COSY/HMBC 复核 ----
+    for _, r in out.iterrows():
+        if pd.isna(r.get('assigned_1H')) or not str(r['assigned_1H']).strip():
+            continue
+        try:
+            c_v, h_v = float(r['ppm']), float(str(r['assigned_1H']))
+        except ValueError:
+            continue
+        entry = {'ppm': c_v, 'Types': r['Types'], 'assigned_1H': str(r['assigned_1H']),
+                 'COSY邻位': '', 'HMBC碳': '', '复核结论': ''}
+        # COSY 一致性
+        partners = _cosy_partners(json_dir, h_v)
+        mult = str(r.get('1H-NMR', '')).split(',')[-1].strip() if pd.notna(r.get('1H-NMR')) else ''
+        if partners:
+            adj_txt = []
+            for b, i in partners[:3]:
+                c_of_b = None
+                m_row = out[(out['assigned_1H'].notna())
+                            & (out['assigned_1H'].astype(str).str.strip() != '')]
+                for _, rr in m_row.iterrows():
+                    try:
+                        if abs(float(str(rr['assigned_1H'])) - b) <= 0.02:
+                            c_of_b = float(rr['ppm'])
+                            break
+                    except ValueError:
+                        continue
+                # 邻位碳应与本碳相邻 (δC 差 <= 3.5 为合理邻位范围)
+                adjacent_ok = c_of_b is not None and abs(c_of_b - c_v) <= 3.5
+                adj_txt.append(f'{b:.2f}' + (f'(C{c_of_b:.2f})' if c_of_b else '')
+                               + ('✓' if adjacent_ok else '?'))
+            entry['COSY邻位'] = '; '.join(adj_txt)
+        elif mult and mult not in ('s', 'm'):
+            entry['复核结论'] = 'COSY 无邻位? '
+        # HMBC 一致性
+        hmbc_cs = _hmbc_carbons(json_dir, h_v)
+        if hmbc_cs:
+            entry['HMBC碳'] = '; '.join(f'{c:.2f}(I={i:.2f})' for c, i in hmbc_cs[:6])
+            has_own = any(abs(c - c_v) <= 0.5 for c, i in hmbc_cs)
+            entry['复核结论'] += ('HMBC含本碳' if has_own else 'HMBC不含本碳(常见, 2J未必出现)')
+        else:
+            entry['复核结论'] += 'HMBC无相关'
+        rows.append(entry)
+    # ---- 部分 B: 未归属 (无 HSQC 交叉峰) 信号的推断 ----
+    used_h = [float(str(r['assigned_1H'])) for _, r in out.iterrows()
+              if pd.notna(r.get('assigned_1H')) and str(r['assigned_1H']).strip()]
+    for _, s in sig_df.iterrows():
+        h_v = float(s['δH'])
+        if any(abs(h_v - u) <= 0.025 for u in used_h):
+            continue
+        entry = {'ppm': '', 'Types': '(无HSQC峰)', 'assigned_1H': s['δH_ppm'],
+                 'COSY邻位': '', 'HMBC碳': '', '复核结论': ''}
+        partners = _cosy_partners(json_dir, h_v)
+        if partners:
+            adj_txt = []
+            for b, i in partners[:3]:
+                c_of_b = None
+                m_row = out[(out['assigned_1H'].notna())
+                            & (out['assigned_1H'].astype(str).str.strip() != '')]
+                for _, rr in m_row.iterrows():
+                    try:
+                        if abs(float(str(rr['assigned_1H'])) - b) <= 0.02:
+                            c_of_b = float(rr['ppm'])
+                            break
+                    except ValueError:
+                        continue
+                adj_txt.append(f'{b:.2f}' + (f'(C{c_of_b:.2f})' if c_of_b else ''))
+            entry['COSY邻位'] = '; '.join(adj_txt)
+        hmbc_cs = _hmbc_carbons(json_dir, h_v)
+        if hmbc_cs:
+            entry['HMBC碳'] = '; '.join(f'{c:.2f}(I={i:.2f})' for c, i in hmbc_cs[:6])
+        if not partners and (not hmbc_cs or all(i < 0.3 for c, i in hmbc_cs)):
+            entry['复核结论'] = '疑似活泼氢/交换氢 (无 HSQC 峰, COSY 无邻位, HMBC 弱)'
+        elif partners and hmbc_cs:
+            entry['复核结论'] = 'COSY 邻位传播: 该 H 位于邻位 H 所在碳的相邻碳上; 结合 HMBC 碳列表人工确认'
+        elif hmbc_cs:
+            entry['复核结论'] = '仅 HMBC 相关 (2-3 键), 参考 HMBC 碳列表推断'
+        else:
+            entry['复核结论'] = 'COSY/HMBC 均无相关 (无法推断, 人工判定)'
+        rows.append(entry)
+    return pd.DataFrame(rows)
 
 
 def _write_excel_formatted(df: pd.DataFrame, path: str,
@@ -500,7 +646,7 @@ def fmt_1h_nmr(h_str, sig):
 
 
 def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
-                      h1d_signals, json_dir: str) -> pd.DataFrame:
+                      h1d_signals, json_dir: str, sig_df=None) -> pd.DataFrame:
     """第二阶段矩阵复核: 逐行验证初步归属, 融合峰拆分修正.
 
     返回带 'review' 列的 out (复核结论: OK / 偏移 / 复核修正 / 未命中).
@@ -553,10 +699,17 @@ def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
                 if s1d and abs(s1d['ppm'] - hh) <= H_ALIGN_TOL:
                     h_aligned = f"{s1d['ppm']:.2f}"
                 out.at[i, 'assigned_1H'] = h_aligned
-                # 修正后的格式化 1H-NMR (δ, mult (J)) 及 nH
-                out.at[i, '1H-NMR'] = fmt_1h_nmr(h_aligned, s1d)
+                # 第二步修正后的格式化 1H-NMR (δ, mult (J)) 及 nH / δH_ppm
+                out.at[i, '1H-NMR-v2'] = fmt_1h_nmr(h_aligned, s1d)
                 if s1d and s1d.get('nH') is not None:
                     out.at[i, 'nH'] = int(s1d['nH'])
+                if s1d is not None and 'δH_ppm' in out.columns:
+                    m_sig = sig_df[pd.to_numeric(sig_df['δH'], errors='coerce')
+                                   .sub(float(h_aligned)).abs().le(0.011)] \
+                        if isinstance(sig_df, pd.DataFrame) and 'δH' in sig_df.columns \
+                        else pd.DataFrame()
+                    if not m_sig.empty:
+                        out.at[i, 'δH_ppm'] = str(m_sig.iloc[0]['δH_ppm'])
                 continue
             rev[i] = f'未命中交叉峰 ({c_v:.2f})'
             continue
@@ -935,34 +1088,41 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             # 1H-NMR 列: xlsx 报告格式 (δ, mult (J)); 每行取对应的那个 H
             if k < len(h_strs) and h_strs[k]:
                 nmr_str = fmt_1h_nmr(h_strs[k], sigs[k])
-                # nH: 对应 1D 信号积分括号里的 H 数 (无对齐信号时留空)
+                # nH: 对应 1D 信号积分括号里的 H 数; δH_ppm: 该信号 txt 原文
                 nh_val = int(sigs[k]['nH']) if sigs[k] and sigs[k].get('nH') is not None else ''
+                dh_ppm = ''
+                if sigs[k] is not None:
+                    m_sig = sig_df[pd.to_numeric(sig_df['δH'], errors='coerce')
+                                   .sub(float(h_strs[k])).abs().le(0.011)] \
+                        if 'δH' in sig_df.columns else pd.DataFrame()
+                    if not m_sig.empty:
+                        dh_ppm = str(m_sig.iloc[0]['δH_ppm'])
             else:
                 nmr_str = ''
                 nh_val = ''
+                dh_ppm = ''
             results.append({
                 'ppm': float(row['ppm']), 'Types': slot['type'],
                 '1H-NMR-v1': nmr_str,  # 第一步初匹配结果 (复核修正前)
                 'nH': nh_val,  # 归属 1D 信号的积分 H 数
+                'δH_ppm': dh_ppm,  # 归属 1D 信号在积分表中的 δH 原文 (区间保留)
                 'assigned_1H': row_outputs[k],
                 'all_assigned_H': '; '.join(h_strs) if k == 0 else '',
                 'aligned_1D': ('; '.join(f'{h_strs[i]}{"✓" if flags[i] else "✗"}'
                                          for i in range(len(h_strs)))) if k == 0 else '',
-                'note': (f"槽需 {slot['n_h']}H, HSQC 命中 {len(slot['hs'])}"
-                         if k == 0 else ''),
                 '_cont': bool(row.get('_cont', False)),
             })
     out = pd.DataFrame(results)
     # 第二阶段: HSQC 矩阵复核 (逐行验证交叉峰 + 融合峰拆分)
-    # review 内部对修正行生成格式化 1H-NMR; 未修正行复制 v1
-    out = review_assignment(out, df, h1d_signals, json_dir)
-    v1 = out['1H-NMR-v1'] if '1H-NMR-v1' in out.columns else None
-    if '1H-NMR' not in out.columns:
-        out['1H-NMR'] = out['1H-NMR-v1']
+    # review 内部对修正行生成 1H-NMR-v2 及更新 δH_ppm/nH; 未修正行 v2 = v1
+    out = review_assignment(out, df, h1d_signals, json_dir, sig_df=sig_df)
+    if '1H-NMR-v2' not in out.columns:
+        out['1H-NMR-v2'] = out['1H-NMR-v1']
     else:
-        m_missing = out['1H-NMR'].isna() | (out['1H-NMR'].astype(str).str.strip() == '')
-        out.loc[m_missing, '1H-NMR'] = out.loc[m_missing, '1H-NMR-v1']
-    # 列序: 1H-NMR-v1, 1H-NMR, review, judge (judge 稍后回写), 其余跟后
+        m_missing = out['1H-NMR-v2'].isna() | (out['1H-NMR-v2'].astype(str).str.strip() == '')
+        out.loc[m_missing, '1H-NMR-v2'] = out.loc[m_missing, '1H-NMR-v1']
+    # 第三步 (COSY/HMBC 全表复核) 不改写 H — v3 = v2; 复核证据在第三 sheet
+    out['1H-NMR-v3'] = out['1H-NMR-v2']
     # 排序: ppm 从大到小; 同 ppm 按 assigned_1H 从大到小 (Cq/空值排最后)
     # ascending=False: ppm 与 δH 均降序
     out['_h_sort'] = out['assigned_1H'].map(
@@ -1090,8 +1250,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
     truth_rows = truth[['ppm', 'Types', '1H-NMR']].dropna(subset=['ppm']).copy()
     truth_rows['_k'] = truth_rows['1H-NMR'].map(_h_key)
     truth_rows = truth_rows.sort_values(['ppm', '_k']).reset_index(drop=True)
-    prog_rows = out[['ppm', 'Types', '1H-NMR']].copy()
-    prog_rows['_k'] = prog_rows['1H-NMR'].map(_h_key)
+    prog_rows = out[['ppm', 'Types', '1H-NMR-v3']].copy()
+    prog_rows['_k'] = prog_rows['1H-NMR-v3'].map(_h_key)
     prog_rows = prog_rows.sort_values(['ppm', '_k']).reset_index(drop=True)
 
     def _norm(v):
@@ -1112,8 +1272,9 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
         rt = truth_rows.iloc[i] if i < len(truth_rows) else None
         rp = prog_rows.iloc[i] if i < len(prog_rows) else None
         ok_row = True
-        for col in ('ppm', 'Types', '1H-NMR'):
-            vt = _norm(rt[col]) if rt is not None else '<缺失>'
+        for col in ('ppm', 'Types', '1H-NMR-v3'):
+            vt = _norm(rt[col] if col != '1H-NMR-v3' else rt['1H-NMR']) \
+                if rt is not None else '<缺失>'
             vp = _norm(rp[col]) if rp is not None else '<缺失>'
             if col == 'ppm':
                 try:
@@ -1124,11 +1285,11 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             if vt != vp:
                 ok_row = False
         if rp is not None:
-            # 定位回 out 原行: 按 ppm+Types+1H-NMR 三元组; 差异时附上 δH 差值
+            # 定位回 out 原行: 按 ppm+Types+1H-NMR-v3 三元组; 差异时附上 δH 差值
             label = '一致'
             if not ok_row:
                 label = '差异'
-                nh_p, nh_t = _first_num(rp['1H-NMR']), _first_num(rt['1H-NMR']) if rt is not None else None
+                nh_p, nh_t = _first_num(rp['1H-NMR-v3']), _first_num(rt['1H-NMR']) if rt is not None else None
                 if nh_p is not None and nh_t is not None:
                     diff = nh_p - nh_t
                     if abs(diff) < 0.002:
@@ -1140,10 +1301,10 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                     else:
                         label += f' (ΔδH={diff:+.2f})'
             row_match_map[(round(float(rp['ppm']), 2), str(rp['Types']).strip(),
-                           _norm(rp['1H-NMR']))] = label
+                           _norm(rp['1H-NMR-v3']))] = label
     out['row_match'] = out.apply(
         lambda r: row_match_map.get(
-            (round(float(r['ppm']), 2), str(r['Types']).strip(), _norm(r['1H-NMR'])), ''),
+            (round(float(r['ppm']), 2), str(r['Types']).strip(), _norm(r['1H-NMR-v3'])), ''),
         axis=1)
 
     # ---- C_match 列: ppm (xlsx 碳峰) vs review 中的碳数值, 规则仿 row_match ----
@@ -1181,11 +1342,12 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
 
     # 氢谱数值统一四舍五入保留 2 位小数
     out['ppm'] = out['ppm'].map(lambda x: round(float(x), 2))
-    for col in ('1H-NMR-v1', 'assigned_1H', 'all_assigned_H', 'aligned_1D'):
+    for col in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3', 'assigned_1H',
+                'all_assigned_H', 'aligned_1D'):
         if col in out.columns:
             out[col] = out[col].map(_round_h_in_str)
 
-    # xlsx 有 1H-NMR truth 时: 插入 1H-NMR_real (xlsx 按 out 相同规则排序后行对齐复制) 于 1H-NMR 列后
+    # xlsx 有 1H-NMR truth 时: 插入 1H-NMR_real (xlsx 按 out 相同规则排序后行对齐复制) 于 1H-NMR-v3 列后
     has_truth = truth['1H-NMR'].notna().any()
     if has_truth:
         # 与 out 落盘排序同一规则: ppm 降序, 同 ppm 按 1H-NMR 中的 δH 降序
@@ -1204,13 +1366,14 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 lambda v: '' if pd.isna(v) else str(v)).values
             col_order = list(out.columns)
             col_order.remove('1H-NMR_real')
-            idx = col_order.index('1H-NMR') + 1
+            idx = col_order.index('1H-NMR-v3') + 1
             col_order.insert(idx, '1H-NMR_real')
             out = out[col_order]
     else:
         out = out.drop(columns=[c for c in ('1H-NMR_real', 'row_match') if c in out.columns])
-    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR, nH, review, judge, 其余跟后 ----
-    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR', 'nH']
+    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR-v2, 1H-NMR-v3, δH_ppm, nH, review, judge ----
+    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR-v2', '1H-NMR-v3',
+             'δH_ppm', 'nH']
     rest = [c for c in out.columns if c not in front]
     ordered = [c for c in front if c in out.columns]
     for c in rest:
@@ -1226,9 +1389,9 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
         out.loc[m_cont, ['ppm', 'Types']] = ''
         out = out.drop(columns='_cont')
     # ppm (碳) 列固定 2 位小数显示; 判定列文本格式 (防 '-' 开头误转公式)
-    text_cols = [c for c in ('1H-NMR-v1', '1H-NMR_real', '1H-NMR', 'review',
-                             'judge', 'C_match', 'row_match', 'assigned_1H',
-                             'all_assigned_H', 'aligned_1D', 'note', 'Types') if c in out.columns]
+    text_cols = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3', '1H-NMR_real',
+                             'review', 'judge', 'C_match', 'row_match', 'assigned_1H',
+                             'all_assigned_H', 'aligned_1D', 'Types') if c in out.columns]
     # 双 sheet: 归属表 + 1H_NMR 积分表 (sheet 名沿用文件名前缀)
     # J 列落盘还原为 '(a, b)' 文本 (内存中是 list)
     sig_out = sig_df.copy()
@@ -1268,6 +1431,42 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                     for cell in row:
                         cell.number_format = '@'
                         cell.alignment = Alignment(horizontal='left')
+        # 红色标示: 三步结果列中, 每一步与上一步不同的行 (该三列单元格整行红字)
+        from openpyxl.styles import Font
+        red = Font(color='FF0000')
+        col_v = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3') if c in out.columns]
+        for idx_row in range(len(out)):
+            changed = False
+            for k in range(1, len(col_v)):
+                prev = out.iloc[idx_row][col_v[k - 1]]
+                curr = out.iloc[idx_row][col_v[k]]
+                ps = '' if pd.isna(prev) else str(prev).strip()
+                cs = '' if pd.isna(curr) else str(curr).strip()
+                if ps != cs:
+                    changed = True
+                    break
+            if changed:
+                for cname in col_v:
+                    ci = list(out.columns).index(cname) + 1
+                    ws0.cell(row=idx_row + 2, column=ci).font = red
+        # 第三 sheet: 第三步 COSY/HMBC 推断 (无 HSQC 交叉峰的信号; 全部已归属时跳过)
+        third_df = third_pass_cosy_hmbc(out, sig_df, h1d_signals, json_dir)
+        if not third_df.empty:
+            third_df.to_excel(xw, sheet_name=f'{base}_第三步_无HSQC信号', index=False)
+            ws2 = xw.book.worksheets[2]
+            if 'δH' in third_df.columns:
+                ci = list(third_df.columns).index('δH') + 1
+                for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '0.00'
+            for col_name in ('δH_ppm', 'type', 'J', 'COSY邻位', 'HMBC碳', '推断结论'):
+                if col_name in third_df.columns:
+                    ci = list(third_df.columns).index(col_name) + 1
+                    for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                        for cell in row:
+                            cell.number_format = '@'
+                            cell.alignment = Alignment(horizontal='left')
+            print(f'[第三步] {len(third_df)} 个无 HSQC 交叉峰信号 → sheet {base}_第三步_无HSQC信号')
     print(f'[判分] {len(cmp_df)} 碳槽: OK={n_ok} 非OK={n_bad}')
     print(f'输出: {out_xlsx}')
     return cmp_df
