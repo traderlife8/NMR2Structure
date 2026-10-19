@@ -7,21 +7,40 @@
      - CH: 1   CH2: 2   CH3: 1 (3H 等价, 若 HSQC 实际分离出 >1 个 δH 则多输出)
      - 理论 CHn 输出 n 个不同 δH; HSQC 交叉峰不足 n 个时按实际数输出
   3. HSQC 候选: |ΔC| <= tol; 强度 <= 1.0 的 GSD 弱峰剔除
-  4. 全局一对一匹配: (|ΔC|, -强度) 升序贪心; 1D 信号占用互斥;
-     CH3 额外加成: 与 1D CH3 信号 (nH=3) 的匹配距离罚减
-  5. 匹配后: HSQC δH 对齐到最近的 1D 1H 信号 (±tol) 报告;
-     CH2 若 HSQC 只给出 1 个 δH 但 1D 信号 nH>=2, 用 HMBC/COSY 核对补充第 2 个 H
-     (fallback: 同碳 HSQC 峰簇内次强峰)
+  4. 全局一对一匹配: 密集簇 (2.5 ppm 内 >=3 槽 >=3 峰) 匈牙利全局最优,
+     代价 = |ΔC| + 0.5*|ΔH对齐| (CH3 与 1D nH=3 信号距离罚减); 其余贪心兜底;
+     第二遍复用扫描 (ΔC<=1.0 邻槽重叠融合 H) + 第三遍融合信号借用 (1D nH 余量)
+     + CH2 补第 2 个 H (1D nH>=2 未占用信号)
+  5. 1H-NMR-v1: HSQC δH 对齐到最近 1D 1H 信号 (±tol), 格式 'δ, mult (J)';
+     同步填 nH (1D 积分 H 数) 与 δH_ppm (积分表原文)
+  6. 1H-NMR-v2 = v1; [--ref 参考xlsx] 参考化合物补 H:
+     a. 参考表拆分/补全 (δH 单元格换行 + 续行向下填充), No. 归一键对齐
+        (全角′→半角, 去 Api-/Rha- 前缀, 与 1.sort_position.py 排序规则一致);
+     b. 共同归属行统计 C/H 整体偏差 (中位数);
+     c. 待补行 (v2 空且 Types 有 H) 按序配参考行: 参考 δH + ΔH整体 在
+        (_REF_H_TOL + |ΔH整体|) 容差内找最近未占用 1D 信号, 填 v2/nH/δH_ppm;
+        补不到留空待人工; 同时追加 No.参考/δc参考/δH参考 三个参考列
+  7. HSQC 矩阵复核 (review): 逐行验证 (δC, δH) 落在交叉峰中心 ±tol;
+     融合峰双高斯拆分 (1D nH 提示 + 残差验证), 拆分中心可回填修正行;
+     修正结果写新列 1H-NMR-v2.5 (未修正行 v2.5 = v2), 修正行 nH/δH_ppm 同步更新;
+     其余行 nH/δH_ppm 缺失时按自身 v2.5 的 δH 回查积分表补齐 → v2.5 为最终归属基准
+  8. [--step3] 第三步 COSY/HMBC 全表复核 (默认关闭): 不改写 H (v3 = v2.5),
+     复核证据独立输出到第三 sheet (COSY 邻位一致性 / HMBC 碳列表 / 无 HSQC 信号推断)
+  9. 输出: <base>_归属表.xlsx 三 sheet (补全版 + 置空版 + 1H_NMR 积分表);
+     有 1H-NMR truth 时附 1H-NMR_real 行对齐列 + row_match/C_match 判定列,
+     每步结果变化的行红字标示
 
 用法:
   直接运行 (默认处理脚本顶部 _DEFAULT_COMPOUND 指定的化合物):
     python assign_from_mnova.py
   换化合物: 手工修改顶部 _DEFAULT_COMPOUND; 或命令行传入化合物名:
     python assign_from_mnova.py clxh101
+  可选开关: --step3 (开启第三步 COSY/HMBC 复核, 默认关闭)
+            --ref <参考xlsx> (类似已知化合物 H 归属表, 按 No. 对齐补齐未归属 H)
   输入约定 (相对 _DATA_DIR / mnova 导出目录):
     <_DATA_DIR>/<化合物名>数据归属.xlsx
     <_DATA_DIR>/<化合物名>氢谱积分.txt
-    ~/mnova_export/<化合物名>/   (mnovaBatchExportJson 导出的 JSON)
+    <_DATA_DIR>/mnova_export/<化合物名>/   (mnovaBatchExportJson 导出的 JSON)
 """
 from __future__ import annotations
 
@@ -32,14 +51,24 @@ import sys
 
 import pandas as pd
 
-# ---- 默认输入配置 (直接运行即用; 换化合物时手工修改这三行) ----
-_DEFAULT_COMPOUND = 'clxh121'   # 化合物名
-_DATA_DIR = r'Y:\LXH数据处理\新化合物处理\程序解析'
+# ---- 默认输入配置 (直接运行即用; 换化合物时手工修改 _DEFAULT_COMPOUND 一行,
+#      其余路径/开关均随化合物名联动; 命令行参数可覆盖) ----
+_DEFAULT_COMPOUND = 'clxh123'   # 化合物名
+_DATA_DIR = rf'Y:\LXH数据处理\新化合物处理\程序解析\{_DEFAULT_COMPOUND}解析'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
 # row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
 _ROW_MATCH_TOL = 0.015
 # mnova JSON 输出根 = _DATA_DIR/mnova_export (qs 从文档路径动态推导同一目录, 两端一致)
 _MNOVA_OUT_ROOT = os.path.join(_DATA_DIR, 'mnova_export')
+# 参考化合物 H 补归属: 参考 δH 与自身 1D 信号匹配容差 (类似化合物 δH 允许偏移)
+_REF_H_TOL = 0.3
+# 可选开关默认值 (命令行 --step3 / --ref 可覆盖):
+# 第三步 COSY/HMBC 复核, 默认关闭
+_DEFAULT_DO_STEP3 = False
+# 参考化合物 H 归属表 (None = 不使用): 默认 <_DATA_DIR>/<化合物名>_H参考.xlsx,
+# 修改 _DEFAULT_COMPOUND 即自动切换到该化合物的参考表
+_DEFAULT_REF = lambda: (lambda p: p if os.path.isfile(p) else '')(
+    os.path.join(_DATA_DIR, f'{_DEFAULT_COMPOUND}_H参考.xlsx'))
 
 
 def _deploy_qs(qs_source: str, qs_deployed: str) -> None:
@@ -63,13 +92,15 @@ def _deploy_qs(qs_source: str, qs_deployed: str) -> None:
         raise SystemExit(f'ERROR: 导出脚本部署失败 (需管理员权限): {e}')
 
 
-def _export_mnova_json(compound: str) -> str:
-    """调用 MestReNova.exe 无界面导出 .mnova → JSON 目录 (_DATA_DIR/mnova_export/<compound>). 返回 JSON 目录.
+def _export_mnova_json(compound: str, data_dir: str = '') -> str:
+    """调用 MestReNova.exe 无界面导出 .mnova → JSON 目录 (<data_dir>/mnova_export/<compound>). 返回 JSON 目录.
 
     qs 脚本由本文件同目录的 mnovaBatchExportJson.qs 部署 (每次运行校验), 输出根由 qs 从
-    文档路径动态推导为 <.mnova 所在目录>/mnova_export, 即 _DATA_DIR/mnova_export.
+    文档路径动态推导为 <.mnova 所在目录>/mnova_export. data_dir 缺省用顶部 _DATA_DIR
+    (命令行传化合物名时随化合物名联动).
     """
-    mnova_path = os.path.join(_DATA_DIR, f'{compound}.mnova')
+    data_dir = data_dir or _DATA_DIR
+    mnova_path = os.path.join(data_dir, f'{compound}.mnova')
     if not os.path.isfile(mnova_path):
         raise SystemExit(f'ERROR: .mnova 文件不存在: {mnova_path}')
     if not os.path.isfile(_MNOVA_EXE):
@@ -80,7 +111,7 @@ def _export_mnova_json(compound: str) -> str:
         raise SystemExit(f'ERROR: 导出脚本缺失: {qs_source}')
     _deploy_qs(qs_source, qs_deployed)
     # 每次导出全新, 避免旧数据混入
-    out_dir = os.path.join(_MNOVA_OUT_ROOT, compound)
+    out_dir = os.path.join(data_dir, 'mnova_export', compound)
     import shutil
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -386,7 +417,8 @@ def _write_excel_formatted(df: pd.DataFrame, path: str,
 def load_xlsx(path: str) -> pd.DataFrame:
     """读取归属 xlsx: 必需列 ppm / Types(兼容 '类型'); 1H-NMR 可选 (无则不做行级比较).
 
-    CH2 行补全两种化学家写法, 保证每个 CH2 在返回结果中恰好占 2 行 (每行=1 个 H, 由程序归属):
+    其它所有列原样保留 (输出归属表时一并带回). CH2 行补全两种化学家写法, 保证每个
+    CH2 在返回结果中恰好占 2 行 (每行=1 个 H, 由程序归属); 补全行其它列继承原行:
     1. 续行写法 (clxh98 sheet1): 第 2 个 H 写在下一行, ppm/Types 留空 → 向下填充归并;
     2. 单行写法 (clxh119): 只有 1 行 → 自动复制该行并在其下增加相同一行 (1H-NMR 留空).
     """
@@ -400,13 +432,16 @@ def load_xlsx(path: str) -> pd.DataFrame:
     df = df.rename(columns={type_col: 'Types'})
     if '1H-NMR' not in df.columns:
         df['1H-NMR'] = None
-    df = df[['ppm', 'Types', '1H-NMR']].copy()
-    # ---- 续行归并: ppm 留空但 1H-NMR 有值 → 是上一行的第 2 个 H, 填充 ppm/Types ----
+    df = df.copy()
+    # ---- 续行归并: ppm 留空但 1H-NMR 有值 → 是上一行的第 2 个 H ----
+    # ppm/Types 向下填充; 其它列 (No. 等) 跟随原行一起填充补全
     cont = df['ppm'].isna() & df['1H-NMR'].notna() & df['1H-NMR'].astype(str).str.strip().ne('')
     if cont.any():
-        df.loc[cont, 'ppm'] = df['ppm'].ffill()[cont]
-        df.loc[cont, 'Types'] = df['Types'].ffill()[cont]
-    df['_cont'] = cont  # 续行标记: 最终 CSV 输出时置空 ppm/Types (仅保留 1H-NMR)
+        for c in df.columns:
+            if c == '_cont':
+                continue
+            df.loc[cont, c] = df[c].ffill()[cont]
+    df['_cont'] = cont  # 补全/续行标记: 归属表"置空版" sheet 输出时置空 ppm/Types
     df = df.dropna(subset=['ppm']).reset_index(drop=True)
     # ---- CH2 单行补全: 同 (ppm, CH2) 只出现 1 次时, 紧跟原行插入相同一行 (1H-NMR 留空, 由程序补) ----
     ch2_count: dict = {}
@@ -416,13 +451,14 @@ def load_xlsx(path: str) -> pd.DataFrame:
             ch2_count[key] = ch2_count.get(key, 0) + 1
     rows = []
     for _, r in df.iterrows():
-        rows.append({'ppm': r['ppm'], 'Types': r['Types'], '1H-NMR': r['1H-NMR'],
-                     '_cont': bool(r['_cont'])})
+        rows.append(dict(r))  # 原行 (含全部其它列)
         if str(r['Types']).strip() == 'CH2':
             key = round(float(r['ppm']), 2)
             if ch2_count[key] == 1:
-                rows.append({'ppm': r['ppm'], 'Types': r['Types'], '1H-NMR': None,
-                             '_cont': True})  # 补全行: 输出时与续行同样置空 ppm/Types
+                dup = dict(r)
+                dup['1H-NMR'] = None
+                dup['_cont'] = True  # 补全行: "置空版" sheet 输出时置空 ppm/Types
+                rows.append(dup)
     df = pd.DataFrame(rows)
     df = df.dropna(subset=['ppm']).dropna(subset=['Types']).reset_index(drop=True)
     return df
@@ -431,6 +467,66 @@ def load_xlsx(path: str) -> pd.DataFrame:
 def load_json(path: str) -> dict:
     with open(path, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def _norm_no_key(v) -> str:
+    """No. 键归一: 去 Api-/Rha- 前缀, 全角′→半角, 取末尾 数字+'* (与 1.sort_position.py 排序规则一致)."""
+    s = str(v).strip().replace('\u2032', "'").replace('\uff07', "'")
+    s = re.sub(r'^(Api|Rha)-', '', s)
+    m = re.search(r"(\d+'*)$", s)
+    return m.group(1) if m else s
+
+
+def load_ref_h(path: str) -> pd.DataFrame:
+    """读取参考化合物 H 归属表 (列 No. / δ c / δH; 兼容 '类型' 无此列).
+
+    参考表存在两种多行写法, 均拆分/补全为每行一个 H:
+    1. δH 单元格内换行 (\\n) → 拆成多行;
+    2. No./δc 留空的续行 → 向下填充归并 (仅 δH 以数值开头才算续行, 排除 '3-Api' 文字行).
+    返回列: No. (原值) / no_key (归一键) / dC / dH (δH 字符串).
+    """
+    df = pd.read_excel(path, header=0)
+    df.columns = [str(c).strip() for c in df.columns]
+    c_no = next((c for c in df.columns if c in ('No.', 'No', 'no.', 'no')), None)
+    c_c = next((c for c in df.columns if c in ('δ c', 'δc', 'ppm')), None)
+    c_h = next((c for c in df.columns if c in ('δH', '1H-NMR')), None)
+    if c_no is None or c_c is None or c_h is None:
+        raise SystemExit(f'ERROR: 参考 xlsx 缺少 No./δ c/δH 列: {path}')
+    df = df.rename(columns={c_no: 'No.', c_c: 'dC', c_h: 'dH'}).copy()
+    # 脏数据清理: 数值与多重度/J 值中间的多余空格直接去掉 ('1. 76 m' → '1.76 m',
+    # '2.29q(7. 2)' → '2.29q(7.2)'), 避免 δH 解析截断成 1.0 导致排序/匹配错乱
+    df['dH'] = df['dH'].map(
+        lambda v: '' if pd.isna(v) else
+        re.sub(r'(\d)\.\s+(\d)', r'\1.\2',          # 小数点后空格: '1. 76' → '1.76'
+               re.sub(r'([a-z]\()\s+', r'\1',      # 括号内开头空格: 'q( 7.2)' → 'q(7.2)'
+                      re.sub(r'\s+(?=[\d.]+\))', '',  # 括号内结尾空格: '(7. 2 )' → '(7. 2)'→再由上一条处理
+                             str(v).replace('\r\n', '\n').strip()))).strip())
+    # 续行归并: No./δc 留空且 δH 以化学位移数值开头 → 上一行的第 2 个 H
+    _is_shift = df['dH'].str.match(r'^\d+\.\d+')
+    cont = df['No.'].isna() & df['dC'].isna() & df['dH'].ne('') & _is_shift
+    df['_cont'] = cont
+    if cont.any():
+        for c in ('No.', 'dC'):
+            df.loc[cont, c] = df[c].ffill()[cont]
+    # 单元格内换行拆分: 每个子行一行, No./dC 仅首行保留
+    rows = []
+    for _, r in df.iterrows():
+        parts = [p.strip() for p in str(r['dH']).split('\n') if p.strip()]
+        if len(parts) <= 1:
+            row = dict(r)
+            row['dH'] = parts[0] if parts else ''
+            rows.append(row)
+            continue
+        for i, p in enumerate(parts):
+            row = dict(r)
+            row['dH'] = p
+            if i > 0:
+                row['_cont'] = True
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    out = out.dropna(subset=['dC']).reset_index(drop=True)
+    out['no_key'] = out['No.'].map(_norm_no_key)
+    return out[['No.', 'no_key', 'dC', 'dH']].rename(columns={'No.': 'No.参考', 'dC': 'δc参考', 'dH': 'δH参考'})
 
 
 def pick_docs(json_dir: str, dim: int, name_filter='', exclude=''):
@@ -650,6 +746,7 @@ def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
     """第二阶段矩阵复核: 逐行验证初步归属, 融合峰拆分修正.
 
     返回带 'review' 列的 out (复核结论: OK / 偏移 / 复核修正 / 未命中).
+    修正结果写入新列 '1H-NMR-v2.5' (以 1H-NMR-v2 为基准, 参考 H 补归属之后执行);
     回填仅使用拆分中心 (融合峰拆出的第 2 中心), 且要求本行 δC 与中心 δC 匹配、
     中心 δH 对齐到某 1D 信号 (有真实氢谱峰支撑), 避免激进改写.
     """
@@ -700,7 +797,7 @@ def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
                     h_aligned = f"{s1d['ppm']:.2f}"
                 out.at[i, 'assigned_1H'] = h_aligned
                 # 第二步修正后的格式化 1H-NMR (δ, mult (J)) 及 nH / δH_ppm
-                out.at[i, '1H-NMR-v2'] = fmt_1h_nmr(h_aligned, s1d)
+                out.at[i, '1H-NMR-v2.5'] = fmt_1h_nmr(h_aligned, s1d)
                 if s1d and s1d.get('nH') is not None:
                     out.at[i, 'nH'] = int(s1d['nH'])
                 if s1d is not None and 'δH_ppm' in out.columns:
@@ -819,7 +916,132 @@ def split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals):
 
 # ---- 核心归属 ----
 
-def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> pd.DataFrame:
+def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
+                            h1d_signals, ref_path: str) -> pd.DataFrame:
+    """参考已知化合物归属表, 补齐未知化合物 Types 有 H 但 1H-NMR-v2 为空的行.
+
+    流程 (参考 1.sort_position.py 的 No. 排序规则对齐同位置):
+    1. 参考表 load_ref_h 拆分/补全为每行一个 H;
+    2. No. 归一键 (_norm_no_key, 去 Api-/Rha- 前缀) 行对齐: 同 No. 的目标行与参考行
+       各按 δH 降序逐行配对 (CH2 两行 ↔ 参考两行);
+    3. 偏差校准: 先用两化合物**共同归属行** (δc参考 非空且有数值 δH 的行) 分别统计
+       C / H 整体偏差 (中位数), 匹配容差 = _REF_H_TOL + |ΔH整体| (C 偏差仅打印提示,
+       δH 匹配不受 C 偏差影响, 避免参考碳整体漂移放大 H 容差);
+    4. 目标行 v2 为空且 Types 有 H 时, 用参考 δH 在自身 1D 积分表 (叠加容差内) 找
+       最近的未占用信号, 填 1H-NMR-v2 / δH_ppm / nH / assigned_1H;
+    4. 无论是否补到 H, 该组行都追加 No.参考 / δc参考 / δH参考 三个参考列
+       (补不到参考的行留空), 列插在 Types 之后.
+    返回追加列后的 out (行数不变).
+    """
+    ref = load_ref_h(ref_path)
+    out = out.copy()
+    # 参考列先建为 object 空列 (避免 FutureWarning / 后续混合 dtype 写入报错)
+    for col in ('No.参考', 'δc参考', 'δH参考'):
+        out[col] = ''
+        out[col] = out[col].astype(object)
+    out['_no_key'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
+    # 每个 no_key 一组: 目标行索引列表 (保持现有顺序) / 参考行列表 (δH 降序)
+    # 排序规则与主流程第二步一致: δH 数值降序, 同组稳定排序保持原行序
+    ref_groups: dict = {}
+    for _, r in ref.iterrows():
+        ref_groups.setdefault(r['no_key'], []).append(r)
+    for k in ref_groups:
+        # 参考行按 δH 数值降序; 无数值 (如 '一' 季碳) 排最后
+        ref_groups[k].sort(key=lambda r: -(_ref_h_val(r['δH参考']) or -9e9))
+    # 1D 信号占用标记 (避免同一信号填到多行)
+    used_sig: set = set()
+    # ---- 第一遍: 分组配对, 写参考列 ----
+    pairs: list = []  # [(cand_idx, ref_rows)] 按组
+    for key, g in out.groupby('_no_key', sort=False):
+        g = g.reset_index()
+        ridx = list(g['index'])
+        m_fill = g['1H-NMR-v2'].isna() | (g['1H-NMR-v2'].astype(str).str.strip().isin(['', 'nan']))
+        m_has_h = g['Types'].astype(str).str.strip().isin(['CH', 'CH2', 'CH3'])
+        cand_idx = [ridx[i] for i in range(len(ridx)) if m_fill.iloc[i] and m_has_h.iloc[i]]
+        ref_rows = ref_groups.get(key, [])
+        n_ref = len(ref_rows)
+        # 配对: 候选行 (待补 H) 优先按序配参考行, 保证参考列与补到的 H 一致;
+        # 剩余参考行再按序分给已归属行; 参考行不足的行留空
+        pair: dict = {}  # ridx -> 参考行
+        for j, oi in enumerate(cand_idx):
+            if j < n_ref:
+                pair[oi] = ref_rows[j]
+        others = [oi for oi in ridx if oi not in pair]
+        for j, oi in enumerate(others):
+            if len(cand_idx) + j < n_ref:
+                pair[oi] = ref_rows[len(cand_idx) + j]
+        # 写参考列
+        for oi, rr in pair.items():
+            out.at[oi, 'No.参考'] = rr['No.参考']
+            out.at[oi, 'δc参考'] = rr['δc参考']
+            out.at[oi, 'δH参考'] = rr['δH参考']
+        pairs.append((cand_idx, ref_rows))
+    # ---- 偏差校准: 共同归属行的 C/H 整体偏差 (中位数), 叠加到信号匹配容差 ----
+    # 共同行 = 参考列已配对 且 参考行 δH 为数值 且 目标行自身 v2 已归属 (有 δH)
+    import statistics
+    d_cs, d_hs = [], []
+    for oi in out.index:
+        rv = _ref_h_val(out.at[oi, 'δH参考'])
+        if rv is None or str(out.at[oi, 'δc参考']).strip() in ('', 'nan'):
+            continue
+        pv = _ref_h_val(out.at[oi, '1H-NMR-v2'])
+        if pv is None:
+            continue
+        d_hs.append(pv - rv)
+        try:
+            d_cs.append(float(out.at[oi, 'ppm']) - float(out.at[oi, 'δc参考']))
+        except (TypeError, ValueError):
+            pass
+    d_h_med = statistics.median(d_hs) if d_hs else 0.0
+    d_c_med = statistics.median(d_cs) if d_cs else 0.0
+    h_tol_eff = _REF_H_TOL + abs(d_h_med)  # H 整体偏差叠加到匹配容差
+    print(f'[参考补H] 整体偏差: ΔC中位={d_c_med:+.2f} (n={len(d_cs)}), '
+          f'ΔH中位={d_h_med:+.2f} (n={len(d_hs)}); H 匹配容差={h_tol_eff:.2f}')
+    # ---- 第二遍: 逐候选行补 H (参考 δH + H 整体偏差 对齐自身 1D 信号) ----
+    for cand_idx, ref_rows in pairs:
+        n_ref = len(ref_rows)
+        for j, oi in enumerate(cand_idx):
+            if j >= n_ref:
+                break  # 参考行不足, 无法定位该 H, 留空待人工
+            ref_h = _ref_h_val(ref_rows[j]['δH参考'])
+            if ref_h is None:
+                continue
+            # 自身 1D 积分表找 (参考 δH + H 整体偏差) ±叠加容差 内最近的未占用信号
+            target_h = ref_h + d_h_med
+            s_best, d_best = None, 9e9
+            for s in h1d_signals:
+                if id(s) in used_sig:
+                    continue
+                d = abs(s['ppm'] - target_h)
+                if d <= h_tol_eff and d < d_best:
+                    s_best, d_best = s, d
+            if s_best is None:
+                continue
+            used_sig.add(id(s_best))
+            h_str = f"{s_best['ppm']:.2f}"
+            out.at[oi, '1H-NMR-v2'] = fmt_1h_nmr(h_str, s_best)
+            out.at[oi, 'assigned_1H'] = h_str
+            if s_best.get('nH') is not None:
+                out.at[oi, 'nH'] = int(s_best['nH'])
+            if 'δH_ppm' in out.columns and 'δH' in sig_df.columns:
+                m_sig = sig_df[pd.to_numeric(sig_df['δH'], errors='coerce')
+                               .sub(s_best['ppm']).abs().le(0.011)]
+                if not m_sig.empty:
+                    out.at[oi, 'δH_ppm'] = str(m_sig.iloc[0]['δH_ppm'])
+    return out.drop(columns='_no_key')
+
+
+def _ref_h_val(s):
+    """参考 δH 字符串 → 首个数值 (无数值返回 None).
+
+    兼容小数点后带空格的写法 ('1. 76 m' → 1.76, '7. 2' → 7.2), 否则会被
+    截断成 1.0 导致组内降序排序错乱."""
+    m = re.search(r'-?\d+\.?\d*', str(s))
+    return float(m.group()) if m else None
+
+
+def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
+           do_step3: bool = False, ref_path: str = '') -> pd.DataFrame:
     df = load_xlsx(xlsx_path)
     # 化合物名: xlsx 文件名去 "数据归属.xlsx" (与归属表输出同名前缀)
     base = re.sub(r'数据归属\.xlsx$', '', os.path.basename(xlsx_path)) or 'compound'
@@ -1101,8 +1323,12 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 nmr_str = ''
                 nh_val = ''
                 dh_ppm = ''
+            # 原 xlsx 其它列原样保留 (除程序生成的列)
+            other_cols = {c: row[c] for c in df.columns
+                          if c not in ('ppm', 'Types', '1H-NMR', '_cont')}
             results.append({
                 'ppm': float(row['ppm']), 'Types': slot['type'],
+                **other_cols,  # 输入 xlsx 的其它列 (原样)
                 '1H-NMR-v1': nmr_str,  # 第一步初匹配结果 (复核修正前)
                 'nH': nh_val,  # 归属 1D 信号的积分 H 数
                 'δH_ppm': dh_ppm,  # 归属 1D 信号在积分表中的 δH 原文 (区间保留)
@@ -1113,16 +1339,53 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 '_cont': bool(row.get('_cont', False)),
             })
     out = pd.DataFrame(results)
-    # 第二阶段: HSQC 矩阵复核 (逐行验证交叉峰 + 融合峰拆分)
-    # review 内部对修正行生成 1H-NMR-v2 及更新 δH_ppm/nH; 未修正行 v2 = v1
-    out = review_assignment(out, df, h1d_signals, json_dir, sig_df=sig_df)
+    # 第一阶段 v2: 初匹配结果先落到 1H-NMR-v2 (此时 v2 = v1)
     if '1H-NMR-v2' not in out.columns:
         out['1H-NMR-v2'] = out['1H-NMR-v1']
     else:
         m_missing = out['1H-NMR-v2'].isna() | (out['1H-NMR-v2'].astype(str).str.strip() == '')
         out.loc[m_missing, '1H-NMR-v2'] = out.loc[m_missing, '1H-NMR-v1']
-    # 第三步 (COSY/HMBC 全表复核) 不改写 H — v3 = v2; 复核证据在第三 sheet
-    out['1H-NMR-v3'] = out['1H-NMR-v2']
+    # 参考化合物补 H (在 review 之前): 提供参考归属表时, 对有 H 未归属的行,
+    # 先算 C/H 整体偏差并叠加匹配容差, 再用自身 1D 信号补齐
+    # (按 No. 对齐参考表, 同时追加 No.参考/δc参考/δH参考 三个参考列)
+    if ref_path and os.path.isfile(ref_path):
+        out = fill_missing_h_from_ref(out, sig_df, h1d_signals, ref_path)
+    elif ref_path:
+        print(f'[参考补H] WARN: 参考表不存在, 跳过: {ref_path}')
+    # 第二阶段: HSQC 矩阵复核 (在参考补 H 之后): 逐行验证 + 融合峰拆分修正,
+    # 修正结果写新列 1H-NMR-v2.5; 未修正行 v2.5 = v2; δH_ppm/nH 随 v2.5 修正更新
+    out = review_assignment(out, df, h1d_signals, json_dir, sig_df=sig_df)
+    if '1H-NMR-v2.5' not in out.columns:
+        out['1H-NMR-v2.5'] = out['1H-NMR-v2']
+    else:
+        m_missing = out['1H-NMR-v2.5'].isna() | (out['1H-NMR-v2.5'].astype(str).str.strip() == '')
+        out.loc[m_missing, '1H-NMR-v2.5'] = out.loc[m_missing, '1H-NMR-v2']
+    # 最终归属基准列 = 1H-NMR-v2.5 (δH_ppm/nH 等参考-v2 补齐的列同步以 v2.5 为准:
+    # v2.5 变化但 nH/δH_ppm 为空的行, 按自身 v2.5 的 δH 回查积分表补齐)
+    def _final_fill(i):
+        v = out.at[i, '1H-NMR-v2.5']
+        hv = _ref_h_val(v)
+        if hv is None:
+            return
+        if pd.isna(out.at[i, 'nH']) or str(out.at[i, 'nH']).strip() == '':
+            s = min(h1d_signals, key=lambda x: abs(x['ppm'] - hv), default=None)
+            if s and abs(s['ppm'] - hv) <= H_ALIGN_TOL and s.get('nH') is not None:
+                out.at[i, 'nH'] = int(s['nH'])
+        if 'δH_ppm' in out.columns and (pd.isna(out.at[i, 'δH_ppm'])
+                                        or str(out.at[i, 'δH_ppm']).strip() == ''):
+            if isinstance(sig_df, pd.DataFrame) and 'δH' in sig_df.columns:
+                m_sig = sig_df[pd.to_numeric(sig_df['δH'], errors='coerce')
+                               .sub(hv).abs().le(0.011)]
+                if not m_sig.empty:
+                    out.at[i, 'δH_ppm'] = str(m_sig.iloc[0]['δH_ppm'])
+    for i in out.index:
+        _final_fill(i)
+    # 第三步 (COSY/HMBC 全表复核) 不改写 H — v3 = v2.5; 复核证据在第三 sheet
+    # 开关 do_step3 默认关闭: 不执行第三步, 最终归属以 1H-NMR-v2.5 为准;
+    # 原依赖 v3 的列 (row_match / 1H-NMR_real 对齐基准等) 改用基准列.
+    if do_step3:
+        out['1H-NMR-v3'] = out['1H-NMR-v2.5']
+    _ver = '1H-NMR-v3' if do_step3 else '1H-NMR-v2.5'  # 后续判分/对齐基准列
     # 排序: ppm 从大到小; 同 ppm 按 assigned_1H 从大到小 (Cq/空值排最后)
     # ascending=False: ppm 与 δH 均降序
     out['_h_sort'] = out['assigned_1H'].map(
@@ -1250,8 +1513,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
     truth_rows = truth[['ppm', 'Types', '1H-NMR']].dropna(subset=['ppm']).copy()
     truth_rows['_k'] = truth_rows['1H-NMR'].map(_h_key)
     truth_rows = truth_rows.sort_values(['ppm', '_k']).reset_index(drop=True)
-    prog_rows = out[['ppm', 'Types', '1H-NMR-v3']].copy()
-    prog_rows['_k'] = prog_rows['1H-NMR-v3'].map(_h_key)
+    prog_rows = out[['ppm', 'Types', _ver]].copy()
+    prog_rows['_k'] = prog_rows[_ver].map(_h_key)
     prog_rows = prog_rows.sort_values(['ppm', '_k']).reset_index(drop=True)
 
     def _norm(v):
@@ -1272,8 +1535,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
         rt = truth_rows.iloc[i] if i < len(truth_rows) else None
         rp = prog_rows.iloc[i] if i < len(prog_rows) else None
         ok_row = True
-        for col in ('ppm', 'Types', '1H-NMR-v3'):
-            vt = _norm(rt[col] if col != '1H-NMR-v3' else rt['1H-NMR']) \
+        for col in ('ppm', 'Types', _ver):
+            vt = _norm(rt[col] if col != _ver else rt['1H-NMR']) \
                 if rt is not None else '<缺失>'
             vp = _norm(rp[col]) if rp is not None else '<缺失>'
             if col == 'ppm':
@@ -1285,11 +1548,11 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             if vt != vp:
                 ok_row = False
         if rp is not None:
-            # 定位回 out 原行: 按 ppm+Types+1H-NMR-v3 三元组; 差异时附上 δH 差值
+            # 定位回 out 原行: 按 ppm+Types+基准列 三元组; 差异时附上 δH 差值
             label = '一致'
             if not ok_row:
                 label = '差异'
-                nh_p, nh_t = _first_num(rp['1H-NMR-v3']), _first_num(rt['1H-NMR']) if rt is not None else None
+                nh_p, nh_t = _first_num(rp[_ver]), _first_num(rt['1H-NMR']) if rt is not None else None
                 if nh_p is not None and nh_t is not None:
                     diff = nh_p - nh_t
                     if abs(diff) < 0.002:
@@ -1301,10 +1564,10 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                     else:
                         label += f' (ΔδH={diff:+.2f})'
             row_match_map[(round(float(rp['ppm']), 2), str(rp['Types']).strip(),
-                           _norm(rp['1H-NMR-v3']))] = label
+                           _norm(rp[_ver]))] = label
     out['row_match'] = out.apply(
         lambda r: row_match_map.get(
-            (round(float(r['ppm']), 2), str(r['Types']).strip(), _norm(r['1H-NMR-v3'])), ''),
+            (round(float(r['ppm']), 2), str(r['Types']).strip(), _norm(r[_ver])), ''),
         axis=1)
 
     # ---- C_match 列: ppm (xlsx 碳峰) vs review 中的碳数值, 规则仿 row_match ----
@@ -1342,12 +1605,12 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
 
     # 氢谱数值统一四舍五入保留 2 位小数
     out['ppm'] = out['ppm'].map(lambda x: round(float(x), 2))
-    for col in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3', 'assigned_1H',
-                'all_assigned_H', 'aligned_1D'):
+    for col in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v3',
+                'all_assigned_H'):
         if col in out.columns:
             out[col] = out[col].map(_round_h_in_str)
 
-    # xlsx 有 1H-NMR truth 时: 插入 1H-NMR_real (xlsx 按 out 相同规则排序后行对齐复制) 于 1H-NMR-v3 列后
+    # xlsx 有 1H-NMR truth 时: 插入 1H-NMR_real (xlsx 按 out 相同规则排序后行对齐复制) 于基准列 (_ver) 后
     has_truth = truth['1H-NMR'].notna().any()
     if has_truth:
         # 与 out 落盘排序同一规则: ppm 降序, 同 ppm 按 1H-NMR 中的 δH 降序
@@ -1366,13 +1629,15 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                 lambda v: '' if pd.isna(v) else str(v)).values
             col_order = list(out.columns)
             col_order.remove('1H-NMR_real')
-            idx = col_order.index('1H-NMR-v3') + 1
+            # 1H-NMR_real 插在 1H-NMR-v2.5 后 (v2.5 恒存在, 是最终归属基准列)
+            idx = col_order.index('1H-NMR-v2.5') + 1
             col_order.insert(idx, '1H-NMR_real')
             out = out[col_order]
     else:
         out = out.drop(columns=[c for c in ('1H-NMR_real', 'row_match') if c in out.columns])
-    # ---- 列序: ppm, Types, 1H-NMR-v1, [1H-NMR_real], 1H-NMR-v2, 1H-NMR-v3, δH_ppm, nH, review, judge ----
-    front = ['ppm', 'Types', '1H-NMR-v1', '1H-NMR_real', '1H-NMR-v2', '1H-NMR-v3',
+    # ---- 列序: ppm, Types, No., [No.参考, δc参考, δH参考], 1H-NMR-v1, 1H-NMR-v2, 1H-NMR-v2.5, [1H-NMR_real], [1H-NMR-v3], δH_ppm, nH, review, judge ----
+    front = ['ppm', 'Types', 'No.', 'No.参考', 'δc参考', 'δH参考',
+             '1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR_real', '1H-NMR-v3',
              'δH_ppm', 'nH']
     rest = [c for c in out.columns if c not in front]
     ordered = [c for c in front if c in out.columns]
@@ -1381,29 +1646,81 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
             ordered.append(c)
     ordered += [c for c in rest if c not in ordered]
     out = out[ordered]
-    # ---- 最终输出格式: 补全/续行 (CH2 第 2 行) 置空 ppm/Types, 仅保留 1H-NMR (参考 xlsx sheet1 续行格式) ----
-    if '_cont' in out.columns:
-        m_cont = out['_cont'].fillna(False).astype(bool)
-        out['ppm'] = out['ppm'].astype(object)
-        out['Types'] = out['Types'].astype(object)
-        out.loc[m_cont, ['ppm', 'Types']] = ''
-        out = out.drop(columns='_cont')
+    # ---- 输出前裁剪: assigned_1H / aligned_1D 为中间过程列, 不输出;
+    #      judge 为对比判分列, 无真实归属表 (无 truth) 时也不输出 ----
+    out = out.drop(columns=['assigned_1H', 'aligned_1D'], errors='ignore')
+    if not truth['1H-NMR'].notna().any():
+        out = out.drop(columns=['judge'], errors='ignore')
+    # ---- 参考列重排: 参考列在补 H 时按"补 H 配对序"写入, 但最终按 δH 降序排序后
+    #      行序可能变化 (如 No.15 补全行 1.22 排到未补行前, 而其参考 δH 1.47 < 2.14),
+    #      导致 δH参考 列在组内不是从大到小. 泛化修复: 组内按当前显示行序重新分配
+    #      降序参考行 (参考行已按 δH 降序), 保证 δH参考 列从大到小.
+    if 'δH参考' in out.columns and ref_path and os.path.isfile(ref_path):
+        ref_all = load_ref_h(ref_path)
+        ref_groups_all: dict = {}
+        for _, r in ref_all.iterrows():
+            ref_groups_all.setdefault(r['no_key'], []).append(r)
+        for k in ref_groups_all:
+            ref_groups_all[k].sort(key=lambda r: -(_ref_h_val(r['δH参考']) or -9e9))
+        has_ref = out['δH参考'].astype(str).str.strip().ne('') & \
+            out['δH参考'].astype(str).str.strip().ne('nan')
+        if has_ref.any():
+            out['_no_key2'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
+            for key, gi in out[has_ref].groupby('_no_key2', sort=False):
+                ref_rows = ref_groups_all.get(key, [])
+                # 组内行保持显示顺序 (已按 δH 降序), 依序分配降序参考行;
+                # 参考行不足的行 (组尾) 保留原值或空
+                for j, oi in enumerate(gi.index):
+                    if j >= len(ref_rows):
+                        break
+                    rr = ref_rows[j]
+                    out.at[oi, 'No.参考'] = rr['No.参考']
+                    out.at[oi, 'δc参考'] = rr['δc参考']
+                    out.at[oi, 'δH参考'] = rr['δH参考']
+            out = out.drop(columns='_no_key2')
+    # ---- 输出两个归属表 sheet: 补全版 (ppm/Types 完整) + 置空版 (组内非首行置空) ----
+    # 置空规则泛化: 最终排序后, 同 (ppm, Types) 组内除第一行外全部置空 ppm/Types
+    # (化学家续行格式: 碳标签只在组内首行). 不依赖 _cont 标记 — 补全行可能因 δH
+    # 降序排到组内首行, 此时首行保留标签、原行置空, 与行序自然一致.
+    out_blank = out.copy()
+    if '_cont' in out_blank.columns:
+        m_blank = pd.Series(False, index=out_blank.index)
+        for (_, _), gi in out_blank.groupby(['ppm', 'Types']).groups.items():
+            rows = list(gi)
+            m_blank.loc[rows[1:]] = True
+        out_blank['ppm'] = out_blank['ppm'].astype(object)
+        out_blank['Types'] = out_blank['Types'].astype(object)
+        out_blank.loc[m_blank, ['ppm', 'Types']] = ''
+        out_blank = out_blank.drop(columns='_cont')
+    out_full = out.drop(columns='_cont', errors='ignore')
     # ppm (碳) 列固定 2 位小数显示; 判定列文本格式 (防 '-' 开头误转公式)
-    text_cols = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3', '1H-NMR_real',
-                             'review', 'judge', 'C_match', 'row_match', 'assigned_1H',
-                             'all_assigned_H', 'aligned_1D', 'Types') if c in out.columns]
+    text_cols = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v3', '1H-NMR_real',
+                             'review', 'C_match', 'row_match', 'all_assigned_H', 'Types') if c in out.columns]
     # 双 sheet: 归属表 + 1H_NMR 积分表 (sheet 名沿用文件名前缀)
     # J 列落盘还原为 '(a, b)' 文本 (内存中是 list)
     sig_out = sig_df.copy()
+    # 新增 1H-NMR 列: 与归属表 1H-NMR 列同一格式规则 (fmt_1h_nmr):
+    # 'δ, mult (J...)'; J 值 >=3 个 (tdd/ddd 等) 逗号后直接写 m
+    if 'δH' in sig_out.columns and 'type' in sig_out.columns:
+        sig_out['1H-NMR'] = sig_out.apply(
+            lambda r: fmt_1h_nmr(f"{float(r['δH']):.2f}",
+                                 {'mult': r['type'],
+                                  'J': r['J'] if isinstance(r.get('J'), list) else []}),
+            axis=1)
     if 'J' in sig_out.columns:
         sig_out['J'] = sig_out['J'].map(
             lambda js: f"({', '.join(js)})" if isinstance(js, list) and js else
                        (str(js) if not isinstance(js, list) else ''))
+    # 1H_NMR sheet 列序固定: δH, type, J, 1H-NMR, δH_ppm, nH
+    sig_cols = [c for c in ('δH', 'type', 'J', '1H-NMR', 'δH_ppm', 'nH')
+                if c in sig_out.columns]
+    sig_out = sig_out[sig_cols]
     with pd.ExcelWriter(out_xlsx, engine='openpyxl') as xw:
-        out.to_excel(xw, sheet_name=f'{base}_归属表', index=False)
+        out_blank.to_excel(xw, sheet_name=f'{base}_归属表', index=False)
+        out_full.to_excel(xw, sheet_name=f'{base}_归属表补全', index=False)
         sig_out.to_excel(xw, sheet_name=f'{base}_1H_NMR', index=False)
-        ws = xw.book.worksheets[1]
-        from openpyxl.styles import Alignment
+        ws = xw.book.worksheets[2]
+        from openpyxl.styles import Alignment, Font, PatternFill
         for col_name in ('δH',):
             if col_name in sig_df.columns:
                 ci = list(sig_df.columns).index(col_name) + 1
@@ -1417,82 +1734,114 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str) -> p
                     for cell in row:
                         cell.number_format = '@'
                         cell.alignment = Alignment(horizontal='left')
-        # 归属表 sheet 的格式
-        ws0 = xw.book.worksheets[0]
-        if 'ppm' in out.columns:
-            ci = list(out.columns).index('ppm') + 1
-            for row in ws0.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                for cell in row:
-                    cell.number_format = '0.00'
-        for col_name in text_cols:
-            if col_name in out.columns:
-                ci = list(out.columns).index(col_name) + 1
-                for row in ws0.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                    for cell in row:
-                        cell.number_format = '@'
-                        cell.alignment = Alignment(horizontal='left')
-        # 红色标示: 三步结果列中, 每一步与上一步不同的行 (该三列单元格整行红字)
-        from openpyxl.styles import Font
+        # 两个归属表 sheet 的格式 (补全版 sheet0 + 置空版 sheet1)
         red = Font(color='FF0000')
-        col_v = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v3') if c in out.columns]
-        for idx_row in range(len(out)):
-            changed = False
-            for k in range(1, len(col_v)):
-                prev = out.iloc[idx_row][col_v[k - 1]]
-                curr = out.iloc[idx_row][col_v[k]]
-                ps = '' if pd.isna(prev) else str(prev).strip()
-                cs = '' if pd.isna(curr) else str(curr).strip()
-                if ps != cs:
-                    changed = True
-                    break
-            if changed:
-                for cname in col_v:
-                    ci = list(out.columns).index(cname) + 1
-                    ws0.cell(row=idx_row + 2, column=ci).font = red
-        # 第三 sheet: 第三步 COSY/HMBC 推断 (无 HSQC 交叉峰的信号; 全部已归属时跳过)
-        third_df = third_pass_cosy_hmbc(out, sig_df, h1d_signals, json_dir)
-        if not third_df.empty:
-            third_df.to_excel(xw, sheet_name=f'{base}_第三步_无HSQC信号', index=False)
-            ws2 = xw.book.worksheets[2]
-            if 'δH' in third_df.columns:
-                ci = list(third_df.columns).index('δH') + 1
-                for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+        col_v = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v3') if c in out.columns]
+        for si, df_v in ((0, out_full), (1, out_blank)):
+            wsi = xw.book.worksheets[si]
+            if 'ppm' in df_v.columns:
+                ci = list(df_v.columns).index('ppm') + 1
+                for row in wsi.iter_rows(min_row=2, min_col=ci, max_col=ci):
                     for cell in row:
                         cell.number_format = '0.00'
-            for col_name in ('δH_ppm', 'type', 'J', 'COSY邻位', 'HMBC碳', '推断结论'):
-                if col_name in third_df.columns:
-                    ci = list(third_df.columns).index(col_name) + 1
-                    for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+            for col_name in text_cols:
+                if col_name in df_v.columns:
+                    ci = list(df_v.columns).index(col_name) + 1
+                    for row in wsi.iter_rows(min_row=2, min_col=ci, max_col=ci):
                         for cell in row:
                             cell.number_format = '@'
                             cell.alignment = Alignment(horizontal='left')
-            print(f'[第三步] {len(third_df)} 个无 HSQC 交叉峰信号 → sheet {base}_第三步_无HSQC信号')
+            # 红色标示: 三步结果列中, 每一步与上一步不同的行 (该三列单元格整行红字)
+            for idx_row in range(len(df_v)):
+                changed = False
+                for k in range(1, len(col_v)):
+                    prev = df_v.iloc[idx_row][col_v[k - 1]]
+                    curr = df_v.iloc[idx_row][col_v[k]]
+                    ps = '' if pd.isna(prev) else str(prev).strip()
+                    cs = '' if pd.isna(curr) else str(curr).strip()
+                    if ps != cs:
+                        changed = True
+                        break
+                if changed:
+                    for cname in col_v:
+                        ci = list(df_v.columns).index(cname) + 1
+                        wsi.cell(row=idx_row + 2, column=ci).font = red
+        # 第三 sheet: 第三步 COSY/HMBC 推断 (仅 do_step3 开启时; 无 HSQC 交叉峰的信号; 全部已归属时跳过)
+        if do_step3:
+            third_df = third_pass_cosy_hmbc(out, sig_df, h1d_signals, json_dir)
+            if not third_df.empty:
+                third_df.to_excel(xw, sheet_name=f'{base}_第三步_无HSQC信号', index=False)
+                ws2 = xw.book.worksheets[3]
+                if 'δH' in third_df.columns:
+                    ci = list(third_df.columns).index('δH') + 1
+                    for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                        for cell in row:
+                            cell.number_format = '0.00'
+                for col_name in ('δH_ppm', 'type', 'J', 'COSY邻位', 'HMBC碳', '推断结论'):
+                    if col_name in third_df.columns:
+                        ci = list(third_df.columns).index(col_name) + 1
+                        for row in ws2.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                            for cell in row:
+                                cell.number_format = '@'
+                                cell.alignment = Alignment(horizontal='left')
+                print(f'[第三步] {len(third_df)} 个无 HSQC 交叉峰信号 → sheet {base}_第三步_无HSQC信号')
+        # 每个 sheet 视图固定首行表头 (上下滑动时表头不动); 隔行黄色背景便于阅读
+        for wsi in xw.book.worksheets:
+            wsi.freeze_panes = 'A2'
+            yellow = PatternFill(start_color='FFFF80', end_color='FFFF80',
+                                 fill_type='solid')
+            for r_i, row in enumerate(wsi.iter_rows(min_row=2), start=2):
+                if (r_i % 2) == 0:  # 数据区隔行 (第 2/4/6... 行) 填黄
+                    for cell in row:
+                        cell.fill = yellow
     print(f'[判分] {len(cmp_df)} 碳槽: OK={n_ok} 非OK={n_bad}')
     print(f'输出: {out_xlsx}')
     return cmp_df
 
 
 def main():
-    # 可选命令行参数覆盖默认配置: <化合物名|xlsx路径> [json_dir]
+    # 可选命令行参数: <化合物名|xlsx路径> [json_dir] [--step3] [--ref <参考xlsx>]
+    # 开关默认值取顶部配置 (_DEFAULT_DO_STEP3 / _DEFAULT_REF), 命令行可覆盖;
+    # --ref 未指定时默认用 <_DATA_DIR>/<化合物名>_H参考.xlsx (不存在则不启用参考补 H)
+    do_step3 = _DEFAULT_DO_STEP3 or '--step3' in sys.argv
+    sys.argv = [a for a in sys.argv if a != '--step3']
+    ref_path = _DEFAULT_REF()
+    if '--ref' in sys.argv:
+        ri = sys.argv.index('--ref')
+        if ri + 1 < len(sys.argv):
+            ref_path = sys.argv[ri + 1]
+            del sys.argv[ri:ri + 2]
+        else:
+            raise SystemExit('ERROR: --ref 需要参考 xlsx 路径参数')
     compound = _DEFAULT_COMPOUND
     if len(sys.argv) >= 2:
         compound = sys.argv[1]
     if os.path.isfile(compound) and compound.endswith('.xlsx'):
         xlsx_path = compound
         base = re.sub(r'数据归属\.xlsx$', '', os.path.basename(compound))
+        data_dir = os.path.dirname(xlsx_path)
     else:
         base = compound
-        xlsx_path = os.path.join(_DATA_DIR, f'{base}数据归属.xlsx')
-    h_report = os.path.join(_DATA_DIR, f'{base}氢谱积分.txt')
-    json_dir = sys.argv[2] if len(sys.argv) >= 3 else _export_mnova_json(base)
+        # 传入化合物名时 数据目录 / 参考表随化合物名联动
+        data_dir = rf'Y:\LXH数据处理\新化合物处理\程序解析\{base}解析'
+        xlsx_path = os.path.join(data_dir, f'{base}数据归属.xlsx')
+        if not ref_path:
+            ref_path = (lambda p: p if os.path.isfile(p) else '')(
+                os.path.join(data_dir, f'{base}_H参考.xlsx'))
+    h_report = os.path.join(data_dir, f'{base}氢谱积分.txt')
+    if len(sys.argv) >= 3:
+        json_dir = sys.argv[2]
+    else:
+        json_dir = _export_mnova_json(base, data_dir)
     out_dir = os.path.dirname(os.path.abspath(xlsx_path))
     # if not os.path.isfile(xlsx_path):
     #     raise SystemExit(f'ERROR: 归属表不存在: {xlsx_path}')
     if not os.path.isfile(h_report):
         raise SystemExit(f'ERROR: 氢谱积分.txt 不存在: {h_report}')
     print(f'[输入] xlsx={xlsx_path}\n[输入] 积分={h_report}\n[输入] JSON={json_dir}')
-    cmp_df = assign(xlsx_path, h_report, json_dir, out_dir)
-    print(cmp_df[['ppm', 'Types', 'assigned_H', 'truth_H', 'judge']].to_string(index=False))
+    cmp_df = assign(xlsx_path, h_report, json_dir, out_dir,
+                    do_step3=do_step3, ref_path=ref_path)
+    # print(cmp_df[['ppm', 'Types', 'assigned_H', 'truth_H', 'judge']].to_string(index=False))
 
 
 if __name__ == '__main__':
