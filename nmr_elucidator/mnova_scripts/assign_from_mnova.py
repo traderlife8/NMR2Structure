@@ -47,28 +47,41 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import statistics
+import subprocess
 import sys
+from collections import Counter
+from numpy.lib.stride_tricks import sliding_window_view
 
+import numpy as np
 import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
+from scipy import ndimage
+from scipy.optimize import curve_fit, linear_sum_assignment
 
 # ---- 默认输入配置 (直接运行即用; 换化合物时手工修改 _DEFAULT_COMPOUND 一行,
 #      其余路径/开关均随化合物名联动; 命令行参数可覆盖) ----
-_DEFAULT_COMPOUND = 'clxh123'   # 化合物名
+_DEFAULT_COMPOUND = 'clxh134'   # 化合物名
 _DATA_DIR = rf'Y:\LXH数据处理\新化合物处理\程序解析\{_DEFAULT_COMPOUND}解析'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
 # row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
 _ROW_MATCH_TOL = 0.015
 # mnova JSON 输出根 = _DATA_DIR/mnova_export (qs 从文档路径动态推导同一目录, 两端一致)
 _MNOVA_OUT_ROOT = os.path.join(_DATA_DIR, 'mnova_export')
-# 参考化合物 H 补归属: 参考 δH 与自身 1D 信号匹配容差 (类似化合物 δH 允许偏移)
+# 参考化合物 H 补归属: 参考 δH 与自身 1D 信号匹配容差 (类似化合物 δH 允许偏移);
+# 迭代复核重归属时的 HSQC 中心候选 δH 窗口同样用 δH ± _REF_H_TOL
 _REF_H_TOL = 0.3
+# 归属完整性迭代复核最大尝试次数 (δH_nH 与 nH 不一致时轮换重归属, 达上限留人工复核)
+_MAX_RETRY = 100
 # 可选开关默认值 (命令行 --step3 / --ref 可覆盖):
 # 第三步 COSY/HMBC 复核, 默认关闭
 _DEFAULT_DO_STEP3 = False
-# 参考化合物 H 归属表 (None = 不使用): 默认 <_DATA_DIR>/<化合物名>_H参考.xlsx,
-# 修改 _DEFAULT_COMPOUND 即自动切换到该化合物的参考表
-_DEFAULT_REF = lambda: (lambda p: p if os.path.isfile(p) else '')(
-    os.path.join(_DATA_DIR, f'{_DEFAULT_COMPOUND}_H参考.xlsx'))
+# 参考化合物 H 归属表 (空 = 不使用): 默认 <_DATA_DIR>/<化合物名>_H参考.xlsx,
+# 兼容有无下划线及 H 前缀 ('clxh126A_H参考' / 'clxh126AH参考' / 'clxh126A_参考' /
+# 'clxh126A参考' 均可); 修改 _DEFAULT_COMPOUND 即自动切换到该化合物的参考表
+_DEFAULT_REF = lambda: _find_data_file(
+    _DATA_DIR, _DEFAULT_COMPOUND, '_H参考', extra_variants=('H参考', '_参考', '参考'))
 
 
 def _deploy_qs(qs_source: str, qs_deployed: str) -> None:
@@ -92,6 +105,24 @@ def _deploy_qs(qs_source: str, qs_deployed: str) -> None:
         raise SystemExit(f'ERROR: 导出脚本部署失败 (需管理员权限): {e}')
 
 
+def _find_data_file(data_dir: str, compound: str, suffix: str, ext: str = '.xlsx',
+                    extra_variants: tuple = ()) -> str:
+    """在 data_dir 中查找化合物数据文件, 兼容化合物名与后缀之间有无下划线.
+
+    变体顺序: '<compound><suffix>' → '<compound>_<suffix>' (suffix 自带下划线时
+    两种自然覆盖 'clxh126A参考' 与 'clxh126A_参考'); extra_variants 追加其它变体
+    (如 H参考 与 参考: '<c>_H参考.xlsx' / '<c>H参考.xlsx' / '<c>_参考.xlsx' /
+    '<c>参考.xlsx'). 找不到返回 ''.
+    """
+    cands = [f'{compound}{suffix}{ext}', f'{compound}_{suffix}{ext}']
+    cands += [f'{compound}{v}{ext}' for v in extra_variants]
+    for fn in cands:
+        p = os.path.join(data_dir, fn)
+        if os.path.isfile(p):
+            return p
+    return ''
+
+
 def _export_mnova_json(compound: str, data_dir: str = '') -> str:
     """调用 MestReNova.exe 无界面导出 .mnova → JSON 目录 (<data_dir>/mnova_export/<compound>). 返回 JSON 目录.
 
@@ -112,10 +143,8 @@ def _export_mnova_json(compound: str, data_dir: str = '') -> str:
     _deploy_qs(qs_source, qs_deployed)
     # 每次导出全新, 避免旧数据混入
     out_dir = os.path.join(data_dir, 'mnova_export', compound)
-    import shutil
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir, ignore_errors=True)
-    import subprocess
     cmd = [_MNOVA_EXE, '--nogui', '-w', mnova_path, '--sf', 'mnovaBatchExportJson']
     print(f'[mnova] 无界面导出 JSON: {os.path.basename(mnova_path)} ...')
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -396,7 +425,6 @@ def _write_excel_formatted(df: pd.DataFrame, path: str,
     with pd.ExcelWriter(path, engine='openpyxl') as xw:
         df.to_excel(xw, index=False)
         ws = xw.book.worksheets[0]
-        from openpyxl.styles import Alignment
         for col_name in float2dp:
             if col_name in df.columns:
                 ci = df.columns.get_loc(col_name) + 1
@@ -478,21 +506,34 @@ def _norm_no_key(v) -> str:
 
 
 def load_ref_h(path: str) -> pd.DataFrame:
-    """读取参考化合物 H 归属表 (列 No. / δ c / δH; 兼容 '类型' 无此列).
+    """读取参考化合物 H 归属表 (必需列 δH; No./δc/Types 可选, 空缺自动补全).
 
+    列名兼容: No./No, δ c/δc/ppm, δH/1H-NMR, Types/类型.
     参考表存在两种多行写法, 均拆分/补全为每行一个 H:
     1. δH 单元格内换行 (\\n) → 拆成多行;
     2. No./δc 留空的续行 → 向下填充归并 (仅 δH 以数值开头才算续行, 排除 '3-Api' 文字行).
-    返回列: No. (原值) / no_key (归一键) / dC / dH (δH 字符串).
+    续行 / 单元格换行拆分出的行, 其 No./δc/Types 一并向下填充 (ppm/Types/No. 三列补全).
+    返回列: No.参考 / no_key / δc参考 / δH参考 / Types参考 (可空).
     """
     df = pd.read_excel(path, header=0)
     df.columns = [str(c).strip() for c in df.columns]
     c_no = next((c for c in df.columns if c in ('No.', 'No', 'no.', 'no')), None)
     c_c = next((c for c in df.columns if c in ('δ c', 'δc', 'ppm')), None)
     c_h = next((c for c in df.columns if c in ('δH', '1H-NMR')), None)
-    if c_no is None or c_c is None or c_h is None:
-        raise SystemExit(f'ERROR: 参考 xlsx 缺少 No./δ c/δH 列: {path}')
-    df = df.rename(columns={c_no: 'No.', c_c: 'dC', c_h: 'dH'}).copy()
+    c_t = next((c for c in df.columns if c in ('Types', '类型')), None)
+    if c_h is None:
+        raise SystemExit(f'ERROR: 参考 xlsx 缺少 δH (或 1H-NMR) 列: {path}')
+    ren = {c_h: 'dH'}
+    if c_no is not None:
+        ren[c_no] = 'No.'
+    if c_c is not None:
+        ren[c_c] = 'dC'
+    if c_t is not None:
+        ren[c_t] = 'dT'
+    df = df.rename(columns=ren).copy()
+    for c, default in (('No.', ''), ('dC', None), ('dT', '')):
+        if c not in df.columns:
+            df[c] = default
     # 脏数据清理: 数值与多重度/J 值中间的多余空格直接去掉 ('1. 76 m' → '1.76 m',
     # '2.29q(7. 2)' → '2.29q(7.2)'), 避免 δH 解析截断成 1.0 导致排序/匹配错乱
     df['dH'] = df['dH'].map(
@@ -501,14 +542,15 @@ def load_ref_h(path: str) -> pd.DataFrame:
                re.sub(r'([a-z]\()\s+', r'\1',      # 括号内开头空格: 'q( 7.2)' → 'q(7.2)'
                       re.sub(r'\s+(?=[\d.]+\))', '',  # 括号内结尾空格: '(7. 2 )' → '(7. 2)'→再由上一条处理
                              str(v).replace('\r\n', '\n').strip()))).strip())
-    # 续行归并: No./δc 留空且 δH 以化学位移数值开头 → 上一行的第 2 个 H
+    # 续行归并: No. 留空且 δH 以化学位移数值开头 → 上一行的第 2 个 H;
+    # ppm (dC) / Types (dT) / No. 三列向下填充补全 (clxh126A 参考表 δc 也有续行留空)
     _is_shift = df['dH'].str.match(r'^\d+\.\d+')
-    cont = df['No.'].isna() & df['dC'].isna() & df['dH'].ne('') & _is_shift
+    cont = df['No.'].isna() & df['dH'].ne('') & _is_shift
     df['_cont'] = cont
     if cont.any():
-        for c in ('No.', 'dC'):
+        for c in ('No.', 'dC', 'dT'):
             df.loc[cont, c] = df[c].ffill()[cont]
-    # 单元格内换行拆分: 每个子行一行, No./dC 仅首行保留
+    # 单元格内换行拆分: 每个子行一行, No./dC/dT 仅首行保留 (拆分行同样三列补全)
     rows = []
     for _, r in df.iterrows():
         parts = [p.strip() for p in str(r['dH']).split('\n') if p.strip()]
@@ -526,7 +568,8 @@ def load_ref_h(path: str) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out = out.dropna(subset=['dC']).reset_index(drop=True)
     out['no_key'] = out['No.'].map(_norm_no_key)
-    return out[['No.', 'no_key', 'dC', 'dH']].rename(columns={'No.': 'No.参考', 'dC': 'δc参考', 'dH': 'δH参考'})
+    out = out.rename(columns={'No.': 'No.参考', 'dC': 'δc参考', 'dH': 'δH参考', 'dT': 'Types参考'})
+    return out[['No.参考', 'no_key', 'δc参考', 'δH参考', 'Types参考']]
 
 
 def pick_docs(json_dir: str, dim: int, name_filter='', exclude=''):
@@ -591,7 +634,6 @@ def load_hsqc_matrix(json_dir: str):
     if doc.get('firstXppm') is None or doc.get('firstYppm') is None:
         return None
     try:
-        import numpy as np
         mat = np.array(m, dtype=float)
         c_ax = np.linspace(float(doc['firstXppm']), float(doc['lastXppm']), mat.shape[0])
         h_ax = np.linspace(float(doc['firstYppm']), float(doc['lastYppm']), mat.shape[1])
@@ -603,8 +645,6 @@ def load_hsqc_matrix(json_dir: str):
 
 def _cluster_blobs(mat, c_ax, h_ax):
     """连通域分割: 阈值以上像素聚成峰团. 返回 [{rows, cols, peak}] 列表 (按峰高降序)."""
-    import numpy as np
-    from scipy import ndimage
     noise = float(np.median(np.abs(mat - np.median(mat)))) * 1.4826  # MAD→σ
     thr = noise * REV_CLUSTER_SIG
     mask = mat > max(thr, mat.max() * 0.05)
@@ -622,8 +662,6 @@ def _cluster_blobs(mat, c_ax, h_ax):
 
 def _fit_gaussians(mat, c_ax, h_ax, blob, n_gauss):
     """在峰团窗口内拟合 n 个 2D 高斯 (共享 σ). 返回 (centers, resid_ratio) 或 None."""
-    import numpy as np
-    from scipy.optimize import curve_fit
     ys, xs = blob['rows'], blob['cols']
     pad_c = max(3, int(0.06 / max(abs(c_ax[1] - c_ax[0]), 1e-9)))
     pad_h = max(3, int(0.03 / max(abs(h_ax[1] - h_ax[0]), 1e-9)))
@@ -690,7 +728,6 @@ def split_blobs(mat, c_ax, h_ax, want_splits: dict):
     want_splits: {(round(c,1), round(h,1)): n_h} — 1D 信号 nH 约束 (提示拆分).
     返回 centers: [(c_ppm, h_ppm, amp)], 及 note 列表.
     """
-    import numpy as np
     blobs = _cluster_blobs(mat, c_ax, h_ax)
     centers, notes = [], []
     for b in blobs:
@@ -727,6 +764,34 @@ def split_blobs(mat, c_ax, h_ax, want_splits: dict):
     return centers, notes
 
 
+def check_h_counts(out: pd.DataFrame, sig_df: pd.DataFrame) -> pd.DataFrame:
+    """归属完整性检查 (与 数据处理程序/check_h_assignment.py 同规则).
+
+    统计归属表各行 δH_ppm 占用的 H 数: 同 (ppm, Types) 槽仅 1 行且 CH3 → 权重 3
+    (CH3 未拆行时一行代表 3H), 其余每行 1; 未归属行 (δH_ppm 空) 不计数.
+    返回 sig_df 副本附 δH_nH 列 (该信号在归属表中被占用的 H 数, 未出现为 0).
+    """
+    slot_rows: dict = {}
+    counts: Counter = Counter()
+    for _, r in out.iterrows():
+        s = '' if pd.isna(r.get('δH_ppm')) else str(r['δH_ppm']).strip()
+        if not s or s.lower() == 'nan':
+            continue
+        key = (round(float(r['ppm']), 2), str(r['Types']).strip())
+        slot_rows[key] = slot_rows.get(key, 0) + 1
+    for _, r in out.iterrows():
+        s = '' if pd.isna(r.get('δH_ppm')) else str(r['δH_ppm']).strip()
+        if not s or s.lower() == 'nan':
+            continue
+        typ = str(r['Types']).strip()
+        key = (round(float(r['ppm']), 2), typ)
+        w = 3 if (typ == 'CH3' and slot_rows.get(key, 0) == 1) else 1
+        counts[s] += w
+    sig_df = sig_df.copy()
+    sig_df['δH_nH'] = sig_df['δH_ppm'].map(lambda s: counts.get(str(s).strip(), 0))
+    return sig_df
+
+
 def fmt_1h_nmr(h_str, sig):
     """拼 xlsx 1H-NMR 格式: '4.31, t (8.8)'; 无 1D 信号时仅 δ.
     3 个及以上 J 值的复杂裂分 (如 ddt) 按惯例简写为 m."""
@@ -742,13 +807,16 @@ def fmt_1h_nmr(h_str, sig):
 
 
 def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
-                      h1d_signals, json_dir: str, sig_df=None) -> pd.DataFrame:
+                      h1d_signals, json_dir: str, sig_df=None,
+                      centers_out: list = None) -> pd.DataFrame:
     """第二阶段矩阵复核: 逐行验证初步归属, 融合峰拆分修正.
 
     返回带 'review' 列的 out (复核结论: OK / 偏移 / 复核修正 / 未命中).
     修正结果写入新列 '1H-NMR-v2.5' (以 1H-NMR-v2 为基准, 参考 H 补归属之后执行);
     回填仅使用拆分中心 (融合峰拆出的第 2 中心), 且要求本行 δC 与中心 δC 匹配、
     中心 δH 对齐到某 1D 信号 (有真实氢谱峰支撑), 避免激进改写.
+    centers_out: 传入 list 时, 拆分中心集合 [(c_ppm, h_ppm, amp)] 写入其中
+    (供归属完整性迭代复核轮换候选用).
     """
     loaded = load_hsqc_matrix(json_dir)
     if loaded is None:
@@ -829,6 +897,9 @@ def review_assignment(out: pd.DataFrame, truth: pd.DataFrame,
         else:
             rev[i] = f'未命中交叉峰 ({c_v:.2f})'
     out['review'] = rev
+    if centers_out is not None:
+        centers_out.clear()
+        centers_out.extend(centers)
     return out
 
 
@@ -864,7 +935,6 @@ def split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals):
     两遍处理: 第一遍所有团做单高斯并收集 σ_C 全局中位数;
     第二遍对 (1D nH>=2 提示) 且 (残差偏高 或 σ_C 显著宽于中位) 的团做双高斯拆分.
     """
-    import numpy as np
     blobs = _cluster_blobs(mat, c_ax, h_ax)
     infos = []
     for b in blobs:
@@ -917,7 +987,8 @@ def split_blobs_with_hints(mat, c_ax, h_ax, h1d_signals):
 # ---- 核心归属 ----
 
 def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
-                            h1d_signals, ref_path: str) -> pd.DataFrame:
+                            h1d_signals, ref_path: str,
+                            ref_groups_out: dict = None) -> pd.DataFrame:
     """参考已知化合物归属表, 补齐未知化合物 Types 有 H 但 1H-NMR-v2 为空的行.
 
     流程 (参考 1.sort_position.py 的 No. 排序规则对齐同位置):
@@ -978,7 +1049,6 @@ def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
         pairs.append((cand_idx, ref_rows))
     # ---- 偏差校准: 共同归属行的 C/H 整体偏差 (中位数), 叠加到信号匹配容差 ----
     # 共同行 = 参考列已配对 且 参考行 δH 为数值 且 目标行自身 v2 已归属 (有 δH)
-    import statistics
     d_cs, d_hs = [], []
     for oi in out.index:
         rv = _ref_h_val(out.at[oi, 'δH参考'])
@@ -1028,7 +1098,18 @@ def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
                                .sub(s_best['ppm']).abs().le(0.011)]
                 if not m_sig.empty:
                     out.at[oi, 'δH_ppm'] = str(m_sig.iloc[0]['δH_ppm'])
-    return out.drop(columns='_no_key')
+    return out.drop(columns='_no_key', errors='ignore')
+
+
+def _ref_groups_of(ref_path: str) -> dict:
+    """读取参考表并按 no_key 分组 (各组 δH 降序). 供迭代复核使用参考数据."""
+    ref = load_ref_h(ref_path)
+    groups: dict = {}
+    for _, r in ref.iterrows():
+        groups.setdefault(r['no_key'], []).append(r)
+    for k in groups:
+        groups[k].sort(key=lambda r: -(_ref_h_val(r['δH参考']) or -9e9))
+    return groups
 
 
 def _ref_h_val(s):
@@ -1086,63 +1167,59 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     assigned = [False] * len(active_slots)  # 匈牙利已处理的槽
     used_pairs: set = set()
 
-    try:
-        from scipy.optimize import linear_sum_assignment as _lsa
-        import numpy as _np
-        used_cluster = set()
-        for si, slot in enumerate(active_slots):
-            if si in used_cluster:
-                continue
-            # 簇: si 与其后 2.5 ppm 内的所有槽
-            members = [si]
-            for sj in range(si + 1, len(active_slots)):
-                if abs(active_slots[sj]['ppm'] - slot['ppm']) <= 2.5:
-                    members.append(sj)
-            # 簇内槽 >=3 且可用峰 >=3 才匈牙利
-            cpeaks = [(pi, p) for pi, p in enumerate(pairs)
-                      if any(abs(p[0] - active_slots[m]['ppm']) <= HSQC_C_TOL
-                             for m in members)]
-            if len(members) >= 3 and len(cpeaks) >= 3:
-                for m in members:
-                    used_cluster.add(m)
-                # 代价矩阵: 行=槽(展开 H 位), 列=峰
-                rows = []
-                slot_of_row = []
-                for m in members:
-                    for _k in range(active_slots[m]['n_h']):
-                        rows.append(m)
-                        slot_of_row.append(m)
-                n_rows, n_cols = len(rows), len(cpeaks)
-                cost = _np.full((n_rows, n_cols), 9.9)
-                for ri, m in enumerate(rows):
-                    sl = active_slots[m]
-                    for ci, (pi, p) in enumerate(cpeaks):
-                        dc = abs(p[0] - sl['ppm'])
-                        if dc > HSQC_C_TOL:
-                            continue
-                        dh = abs(_align_h(p[1]) - p[1])
-                        # CH3 加成
-                        adj = 0.0
-                        if sl['type'] == 'CH3':
-                            s_near = min(h1d_signals, key=lambda x: abs(x['ppm'] - p[1]),
-                                         default=None)
-                            if s_near and s_near['nH'] >= 3 \
-                                    and abs(s_near['ppm'] - p[1]) <= H_ALIGN_TOL:
-                                adj = -CH3_BONUS
-                        cost[ri, ci] = dc + 0.5 * dh + adj
-                ri_idx, ci_idx = _lsa(cost)
-                for ri, ci in zip(ri_idx, ci_idx):
-                    if cost[ri, ci] >= 9.9:
+    # ---- 全局一对一匹配: 密集簇匈牙利最优 (scipy 缺失时跳过, 由贪心兜底) ----
+    used_cluster = set()
+    for si, slot in enumerate(active_slots):
+        if si in used_cluster:
+            continue
+        # 簇: si 与其后 2.5 ppm 内的所有槽
+        members = [si]
+        for sj in range(si + 1, len(active_slots)):
+            if abs(active_slots[sj]['ppm'] - slot['ppm']) <= 2.5:
+                members.append(sj)
+        # 簇内槽 >=3 且可用峰 >=3 才匈牙利
+        cpeaks = [(pi, p) for pi, p in enumerate(pairs)
+                  if any(abs(p[0] - active_slots[m]['ppm']) <= HSQC_C_TOL
+                         for m in members)]
+        if len(members) >= 3 and len(cpeaks) >= 3:
+            for m in members:
+                used_cluster.add(m)
+            # 代价矩阵: 行=槽(展开 H 位), 列=峰
+            rows = []
+            slot_of_row = []
+            for m in members:
+                for _k in range(active_slots[m]['n_h']):
+                    rows.append(m)
+                    slot_of_row.append(m)
+            n_rows, n_cols = len(rows), len(cpeaks)
+            cost = np.full((n_rows, n_cols), 9.9)
+            for ri, m in enumerate(rows):
+                sl = active_slots[m]
+                for ci, (pi, p) in enumerate(cpeaks):
+                    dc = abs(p[0] - sl['ppm'])
+                    if dc > HSQC_C_TOL:
                         continue
-                    sl = active_slots[slot_of_row[ri]]
-                    h = cpeaks[ci][1][1]
-                    if any(abs(h - ph) < DUP_TOL for ph in sl['hs']):
-                        continue
-                    if len(sl['hs']) < sl['n_h']:
-                        sl['hs'].append(h)
-                        used_pairs.add(cpeaks[ci][0])
-    except ImportError:
-        pass
+                    dh = abs(_align_h(p[1]) - p[1])
+                    # CH3 加成
+                    adj = 0.0
+                    if sl['type'] == 'CH3':
+                        s_near = min(h1d_signals, key=lambda x: abs(x['ppm'] - p[1]),
+                                     default=None)
+                        if s_near and s_near['nH'] >= 3 \
+                                and abs(s_near['ppm'] - p[1]) <= H_ALIGN_TOL:
+                            adj = -CH3_BONUS
+                    cost[ri, ci] = dc + 0.5 * dh + adj
+            ri_idx, ci_idx = linear_sum_assignment(cost)
+            for ri, ci in zip(ri_idx, ci_idx):
+                if cost[ri, ci] >= 9.9:
+                    continue
+                sl = active_slots[slot_of_row[ri]]
+                h = cpeaks[ci][1][1]
+                if any(abs(h - ph) < DUP_TOL for ph in sl['hs']):
+                    continue
+                if len(sl['hs']) < sl['n_h']:
+                    sl['hs'].append(h)
+                    used_pairs.add(cpeaks[ci][0])
 
     # 贪心兜底 (非簇槽 / 匈牙利未覆盖的 H 位)
     edges = []
@@ -1349,12 +1426,35 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     # 先算 C/H 整体偏差并叠加匹配容差, 再用自身 1D 信号补齐
     # (按 No. 对齐参考表, 同时追加 No.参考/δc参考/δH参考 三个参考列)
     if ref_path and os.path.isfile(ref_path):
+        _ref_g = _ref_groups_of(ref_path)
         out = fill_missing_h_from_ref(out, sig_df, h1d_signals, ref_path)
-    elif ref_path:
-        print(f'[参考补H] WARN: 参考表不存在, 跳过: {ref_path}')
+        # 迭代复核用参考数据: 参考组 + C/H 整体偏差 (与补 H 同规则重算)
+        ref_groups_iter = _ref_g
+        _d_hs, _d_cs = [], []
+        out['_no_key_iter'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
+        for oi in out.index:
+            rv = _ref_h_val(out.at[oi, 'δH参考'])
+            pv = _ref_h_val(out.at[oi, '1H-NMR-v2'])
+            if rv is None or pv is None:
+                continue
+            _d_hs.append(pv - rv)
+            try:
+                _d_cs.append(float(out.at[oi, 'ppm']) - float(out.at[oi, 'δc参考']))
+            except (TypeError, ValueError):
+                pass
+        _d_h_med_iter = statistics.median(_d_hs) if _d_hs else 0.0
+        h_tol_eff = _REF_H_TOL + abs(_d_h_med_iter)
+    else:
+        ref_groups_iter = None
+        _d_h_med_iter = 0.0
+        h_tol_eff = _REF_H_TOL
+        if 'No.' in out.columns:
+            out['_no_key_iter'] = out['No.'].map(_norm_no_key)
     # 第二阶段: HSQC 矩阵复核 (在参考补 H 之后): 逐行验证 + 融合峰拆分修正,
     # 修正结果写新列 1H-NMR-v2.5; 未修正行 v2.5 = v2; δH_ppm/nH 随 v2.5 修正更新
-    out = review_assignment(out, df, h1d_signals, json_dir, sig_df=sig_df)
+    _centers_cache: list = []  # 拆分中心缓存 (供归属完整性迭代复核轮换候选)
+    out = review_assignment(out, df, h1d_signals, json_dir, sig_df=sig_df,
+                            centers_out=_centers_cache)
     if '1H-NMR-v2.5' not in out.columns:
         out['1H-NMR-v2.5'] = out['1H-NMR-v2']
     else:
@@ -1380,6 +1480,234 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                     out.at[i, 'δH_ppm'] = str(m_sig.iloc[0]['δH_ppm'])
     for i in out.index:
         _final_fill(i)
+    # ---- 归属完整性迭代复核 (内存中间 df, 输出 Excel 之前) ----
+    # 结合 2D HSQC 数据反复匹配归属表中的 C-H 对, 使 1H_NMR 的 δH_nH 与 nH
+    # 整体差异尽量小: 目标函数 = Σ(差异惩罚), 其中 nH==1 的行不允许差异 (权重极大),
+    # nH 越大允许的差异越大 (惩罚随 nH 增大而衰减 → 权重 1/nH).
+    # 不取消 H 容差限制意义上的盲匹配 — 候选 C-H 对仍须来自 2D HSQC 交叉峰中心
+    # (物理证据), H 端无 ppm 限制 (取消 _REF_H_TOL), 匹配自由度交给整体优化.
+    def _h_assign_state():
+        """当前归属状态: [(slot_key, δH_ppm_str,assigned δH list)] 及全局差异评估."""
+        sig_chk = check_h_counts(out, sig_df)
+        m_bad = sig_chk['δH_nH'] != sig_chk['nH']
+        # 差异惩罚: nH==1 行不允许差异 (权重 1000); 其余按 nH 越大容差越大 (权重 1/nH)
+        n_bad = int(m_bad.sum())
+        penalty = 0.0
+        for _, sr in sig_chk[m_bad].iterrows():
+            w = 1000.0 if int(sr['nH']) == 1 else 1.0 / max(int(sr['nH']), 1)
+            penalty += abs(int(sr['δH_nH']) - int(sr['nH'])) * w
+        return sig_chk, n_bad, penalty
+
+    def _rewrite_rows(m_rows, s1d):
+        """把归属表中 δH_ppm == m_rows 的行改归属到 1D 信号 s1d."""
+        h_new = f"{s1d['ppm']:.2f}"
+        dh_new = ''
+        if isinstance(sig_df, pd.DataFrame) and 'δH' in sig_df.columns:
+            m_sig = sig_df[pd.to_numeric(sig_df['δH'], errors='coerce')
+                           .sub(s1d['ppm']).abs().le(0.011)]
+            if not m_sig.empty:
+                dh_new = str(m_sig.iloc[0]['δH_ppm'])
+        for oi in out.index[m_rows]:
+            out.at[oi, 'assigned_1H'] = h_new
+            out.at[oi, '1H-NMR-v2.5'] = fmt_1h_nmr(h_new, s1d)
+            if s1d.get('nH') is not None:
+                out.at[oi, 'nH'] = int(s1d['nH'])
+            if dh_new:
+                out.at[oi, 'δH_ppm'] = dh_new
+
+    # 预计算: 每个 HSQC 中心 → 对齐的 1D 信号 (2D 物理证据 + 1D 支撑)
+    _center_to_sig = []
+    for cc, hh, amp in _centers_cache:
+        s1d = min(h1d_signals, key=lambda x: abs(x['ppm'] - hh), default=None)
+        _center_to_sig.append((cc, hh, s1d if s1d and abs(s1d['ppm'] - hh) <= H_ALIGN_TOL else None))
+
+    def _hsqc_h_profile(c_v: float):
+        """2D HSQC 在碳维 c_v 处的氢维截面 (h_axis, profile) 或 None.
+
+        截面 = 碳维 c_v ±2 像素的最大投影 (抗碳维抖动), 归一化到峰高 1.
+        """
+        if _hsqc_mat is None:
+            return None
+        ci = int(np.argmin(np.abs(_hsqc_c_ax - c_v)))
+        lo, hi = max(ci - 2, 0), min(ci + 3, _hsqc_mat.shape[0])
+        prof = _hsqc_mat[lo:hi, :].max(axis=0)
+        pk = prof.max()
+        if pk <= 0:
+            return None
+        return _hsqc_h_ax, prof / pk
+
+    def _hsqc_h_peaks(c_v: float, mult: str):
+        """按 1D 多重峰类型从 2D HSQC 截面提取 δH 候选值 (结合 review 与迭代复核).
+
+        规则 (化学家读谱方式):
+        - s (单峰) / t (三峰) / brs 等对称峰: 取截面峰顶 (局部极大) 的 H 数值;
+        - d (双峰) / q (四重峰) / dd/dt/dq 等两主峰型: 找两个主峰顶, 返回二者
+          **中间谷** 的 H 数值 (积分/二维中心落在双峰中线);
+        - 其余 (m 等): 返回截面最大点 H 数值.
+        返回候选 δH 列表 (降序按截面强度), 空截面返回 [].
+        """
+        prof = _hsqc_h_profile(c_v)
+        if prof is None:
+            return []
+        h_ax, p = prof
+        # 平滑后找局部极大 (峰顶) 与局部极小 (谷)
+        w = 3
+        if len(p) < w * 2 + 1:
+            return [float(h_ax[int(np.argmax(p))])]
+        ps = np.convolve(p, np.ones(w) / w, mode='same')
+        win = sliding_window_view(ps, 3)
+        imax = [(i + 1) for i in range(len(win)) if win[i][1] >= win[i][0]
+                and win[i][1] >= win[i][2] and win[i][1] > 0.15]
+        imin = [(i + 1) for i in range(len(win)) if win[i][1] <= win[i][0]
+                and win[i][1] <= win[i][2]]
+        imax = [i for i in imax if 0 < i < len(p) - 1]
+        mult_l = (mult or '').lower()
+        two_peak = any(k in mult_l for k in ('d', 'q', 'dd', 'dt', 'dq', 'td'))
+        if two_peak and len(imax) >= 2:
+            # 两个主峰 (强度最高) 之间的谷 → 双峰/四重峰中线 H 数值
+            i1, i2 = sorted(sorted(imax, key=lambda i: -p[i])[:2])
+            valleys = [i for i in imin if i1 < i < i2]
+            gi = min(valleys, key=lambda i: ps[i]) if valleys else (i1 + i2) // 2
+            return [float(h_ax[gi])]
+        if imax:
+            imax.sort(key=lambda i: -p[i])
+            return [float(h_ax[i]) for i in imax[:3]]
+        return [float(h_ax[int(np.argmax(p))])]
+
+    _hsqc_loaded = load_hsqc_matrix(json_dir)
+    if _hsqc_loaded is not None:
+        _hsqc_mat, _hsqc_c_ax, _hsqc_h_ax = _hsqc_loaded
+    else:
+        _hsqc_mat = None
+    _retry = 0
+    _best_penalty = None
+    while _retry < _MAX_RETRY:
+        sig_chk, n_bad, penalty = _h_assign_state()
+        if n_bad == 0:
+            break
+        if _best_penalty is None or penalty < _best_penalty:
+            _best_penalty = penalty
+        _retry += 1
+        # ---- 整体优化: 对每个 δH 缺 H (δH_nH < nH) 的信号, 找 HSQC 中心落在
+        # 其碳附近 (±REV_C_TOL) 的候选行 (优先 δH_nH > nH 的信号行, 即占用过多者),
+        # 按 2D C-H 对把该行改归属到缺 H 信号 → C-H 对整体重匹配 ----
+        # 参考化合物约束 (如有): 大部分 No. 两化合物归属一致, 因此参考列有值的行
+        # 优先参与 C-H 对交换 (其参考 δH + ΔH整体 指明该位置的真实 δH),
+        # 且参考 δH 指向的 1D 信号若未被占用, 可直接补到该行 (nH==1 行优先).
+        m_over = sig_chk[sig_chk['δH_nH'] > sig_chk['nH']]   # 占用过多 → 有行可移出
+        m_under = sig_chk[sig_chk['δH_nH'] < sig_chk['nH']]  # 缺 H → 接收
+        if not m_under.empty:
+            # 轮换偏移: 同一状态多次尝试时换不同候选, 避免死循环
+            _shift = _retry - 1
+            progressed = False
+            # ---- 途径 A (参考化合物驱动): 参考列有值 + 该行归属 H 与
+            # 参考 δH + ΔH整体 偏离超过 _REF_H_TOL → 按 2D 截面/参考 δH 重归属.
+            # 参考化合物大部分 No. 归属一致 → 参考列是可靠的先验证据.
+            if ref_groups_iter is not None:
+                for oi in out.index:
+                    if progressed:
+                        break
+                    rk = out.at[oi, '_no_key_iter']
+                    if rk not in ref_groups_iter:
+                        continue
+                    ref_h = _ref_h_val(out.at[oi, 'δH参考'])
+                    if ref_h is None:
+                        continue
+                    pv = _ref_h_val(out.at[oi, 'assigned_1H'])
+                    if pv is not None and abs(pv - (ref_h + _d_h_med_iter)) <= _REF_H_TOL:
+                        continue  # 已与参考一致
+                    # 该位置参考 δH 指向的 1D 信号 (未占用或本行已占用)
+                    target_h = ref_h + _d_h_med_iter
+                    s_ref = min(h1d_signals, key=lambda x: abs(x['ppm'] - target_h),
+                                default=None)
+                    if s_ref is None or abs(s_ref['ppm'] - target_h) > h_tol_eff:
+                        continue
+                    cur = str(out.at[oi, 'assigned_1H'])
+                    if cur == f"{s_ref['ppm']:.2f}":
+                        continue
+                    # 2D 证据: 该行碳附近存在对齐到 s_ref 的中心 (nH==1 必须匹配正确)
+                    c_v = float(out.at[oi, 'ppm'])
+                    ok2d = any(t[2] is not None and t[2]['ppm'] == s_ref['ppm']
+                               and abs(t[0] - c_v) <= REV_C_TOL
+                               for t in _center_to_sig)
+                    if int(out.at[oi, 'nH'] if not pd.isna(out.at[oi, 'nH']) else 0) == 1 \
+                            and not ok2d:
+                        continue  # nH==1 行必须 2D 支撑
+                    m_one = pd.Series(False, index=out.index)
+                    m_one[oi] = True
+                    _rewrite_rows(m_one, s_ref)
+                    progressed = True
+            # ---- 途径 B (2D C-H 对整体重匹配): 缺 H 信号从占用过多信号移入行 ----
+            for _, urow in m_under.iterrows():
+                dh_u = float(urow['δH'])
+                dh_u_str = str(urow['δH_ppm']).strip()
+                # 缺 H 信号的碳位置: 归属表中已引用该信号的行 (或其参考 δc)
+                m_ref = out[out['δH_ppm'].astype(str).str.strip() == dh_u_str]
+                c_u = float(m_ref['ppm'].iloc[0]) if not m_ref.empty else None
+                # 候选 1D 信号 (δH ± 无限制 — 取消 H 容差): 与缺 H 信号 δH 最近的
+                # 若干个, 依次尝试把"占用过多"信号的行转归属过来 (必须经 2D 中心)
+                # 缺 H 信号的 1D 多重峰类型 → 2D 截面提取的 δH 真值候选:
+                # s/t → 峰顶; d/q → 双峰中间谷; 匹配值允许落在 δH_ppm 区间内
+                # 任意位置 (不必等于区间中点), nH==1 的 C-H 对必须匹配正确
+                u_type = ''
+                if isinstance(sig_df, pd.DataFrame) and 'type' in sig_df.columns:
+                    m_t = sig_df[sig_df['δH_ppm'].astype(str).str.strip() == dh_u_str]
+                    u_type = str(m_t.iloc[0]['type']) if not m_t.empty else ''
+                h_true_cands = _hsqc_h_peaks(c_u if c_u is not None else dh_u, u_type)
+                # 缺 H 信号自身碳维处无截面 (碳归属错位) 时用其 2D 中心 δH 兜底
+                if not h_true_cands and cands_u:
+                    h_true_cands = [float(cands_u[_shift % len(cands_u)][1])]
+                for _, orow in m_over.iterrows():
+                    dh_o_str = str(orow['δH_ppm']).strip()
+                    m_o_rows = out['δH_ppm'].astype(str).str.strip() == dh_o_str
+                    if not m_o_rows.any():
+                        continue
+                    c_o = float(out[m_o_rows]['ppm'].iloc[0])
+                    # 2D HSQC 证据: 占用过多信号与缺 H 信号的碳之间必须存在交叉峰
+                    # 中心网络 (本碳中心各自的 s1d 互为邻近), 用中心轮换建立映射
+                    cands_o = [t for t in _center_to_sig
+                               if t[2] is not None and abs(t[0] - c_o) <= REV_C_TOL]
+                    cands_u = [t for t in _center_to_sig
+                               if t[2] is not None and c_u is not None
+                               and abs(t[0] - c_u) <= REV_C_TOL]
+                    if not cands_o or not cands_u:
+                        continue
+                    # 从占用过多信号中取一行 (轮换), 改归属到缺 H 信号 δH 附近
+                    # 的 1D 信号 (2D 中心对齐支撑, 无 H ppm 限制)
+                    oi = list(out.index[m_o_rows])[_shift % len(out.index[m_o_rows])]
+                    # 目标 1D 信号: 优先 2D 截面 δH 真值候选对齐的信号 (J 类型规则),
+                    # 无则退回缺 H 信号 δH 对齐的 2D 中心对应信号
+                    sig_u = None
+                    for ht in h_true_cands:
+                        s_c = min(h1d_signals, key=lambda x: abs(x['ppm'] - ht),
+                                  default=None)
+                        if s_c and abs(s_c['ppm'] - ht) <= H_ALIGN_TOL:
+                            sig_u = s_c
+                            break
+                    if sig_u is None and cands_u:
+                        sig_u = cands_u[_shift % len(cands_u)][2]
+                    if sig_u is None:
+                        continue
+                    if abs(sig_u['ppm'] - dh_u) > _REF_H_TOL + 1.0:
+                        continue  # 防御: 目标信号应接近缺 H 信号的 δH (宽裕度)
+                    # 单行改归属: 构造与 out 同索引的布尔掩码
+                    m_one = pd.Series(False, index=out.index)
+                    m_one[oi] = True
+                    _rewrite_rows(m_one, sig_u)
+                    progressed = True
+                    break  # 每轮只移动一行, 下轮重新评估
+                if progressed:
+                    break
+            if not progressed:
+                break  # 无可改进的移动 → 收敛退出
+    out = out.drop(columns='_no_key_iter', errors='ignore')
+    sig_chk, n_bad_final, _ = _h_assign_state()
+    if _retry:
+        print(f'[检查] 归属完整性迭代复核: 尝试 {_retry} 次, '
+              f'最终不匹配 {n_bad_final}/{len(sig_chk)} 条'
+              + (' (无 2D 支撑的移动, 剩余行待人工复核)'
+                 if n_bad_final and _retry < _MAX_RETRY else
+                 (' (达上限, 剩余行待人工复核)' if n_bad_final else '')))
     # 第三步 (COSY/HMBC 全表复核) 不改写 H — v3 = v2.5; 复核证据在第三 sheet
     # 开关 do_step3 默认关闭: 不执行第三步, 最终归属以 1H-NMR-v2.5 为准;
     # 原依赖 v3 的列 (row_match / 1H-NMR_real 对齐基准等) 改用基准列.
@@ -1651,33 +1979,27 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     out = out.drop(columns=['assigned_1H', 'aligned_1D'], errors='ignore')
     if not truth['1H-NMR'].notna().any():
         out = out.drop(columns=['judge'], errors='ignore')
-    # ---- 参考列重排: 参考列在补 H 时按"补 H 配对序"写入, 但最终按 δH 降序排序后
+    # ---- 参考列重排与补全: 参考列在补 H 时按"补 H 配对序"写入, 但最终按 δH 降序排序后
     #      行序可能变化 (如 No.15 补全行 1.22 排到未补行前, 而其参考 δH 1.47 < 2.14),
     #      导致 δH参考 列在组内不是从大到小. 泛化修复: 组内按当前显示行序重新分配
     #      降序参考行 (参考行已按 δH 降序), 保证 δH参考 列从大到小.
+    #      补全要求: 有参考化合物时, 参考组存在的 No. 其组内所有行 (含 CH2 第二行)
+    #      参考三列都必须有值 — 参考行不足时复用该组最后一个参考行 (同位置 CH2
+    #      第二 H 的 No./δc 相同, δH参考 也沿用同位置数据).
     if 'δH参考' in out.columns and ref_path and os.path.isfile(ref_path):
-        ref_all = load_ref_h(ref_path)
-        ref_groups_all: dict = {}
-        for _, r in ref_all.iterrows():
-            ref_groups_all.setdefault(r['no_key'], []).append(r)
-        for k in ref_groups_all:
-            ref_groups_all[k].sort(key=lambda r: -(_ref_h_val(r['δH参考']) or -9e9))
-        has_ref = out['δH参考'].astype(str).str.strip().ne('') & \
-            out['δH参考'].astype(str).str.strip().ne('nan')
-        if has_ref.any():
-            out['_no_key2'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
-            for key, gi in out[has_ref].groupby('_no_key2', sort=False):
-                ref_rows = ref_groups_all.get(key, [])
-                # 组内行保持显示顺序 (已按 δH 降序), 依序分配降序参考行;
-                # 参考行不足的行 (组尾) 保留原值或空
-                for j, oi in enumerate(gi.index):
-                    if j >= len(ref_rows):
-                        break
-                    rr = ref_rows[j]
-                    out.at[oi, 'No.参考'] = rr['No.参考']
-                    out.at[oi, 'δc参考'] = rr['δc参考']
-                    out.at[oi, 'δH参考'] = rr['δH参考']
-            out = out.drop(columns='_no_key2')
+        ref_groups_all = _ref_groups_of(ref_path)
+        out['_no_key2'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
+        for key, gi in out.groupby('_no_key2', sort=False):
+            ref_rows = ref_groups_all.get(key, [])
+            if not ref_rows:
+                continue  # 参考表无该 No. → 留空 (该位置参考未提供)
+            # 组内全部行按显示顺序分配降序参考行; 参考行不足时复用最后一个参考行
+            for j, oi in enumerate(gi.index):
+                rr = ref_rows[min(j, len(ref_rows) - 1)]
+                out.at[oi, 'No.参考'] = rr['No.参考']
+                out.at[oi, 'δc参考'] = rr['δc参考']
+                out.at[oi, 'δH参考'] = rr['δH参考']
+        out = out.drop(columns='_no_key2')
     # ---- 输出两个归属表 sheet: 补全版 (ppm/Types 完整) + 置空版 (组内非首行置空) ----
     # 置空规则泛化: 最终排序后, 同 (ppm, Types) 组内除第一行外全部置空 ppm/Types
     # (化学家续行格式: 碳标签只在组内首行). 不依赖 _cont 标记 — 补全行可能因 δH
@@ -1715,12 +2037,35 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     sig_cols = [c for c in ('δH', 'type', 'J', '1H-NMR', 'δH_ppm', 'nH')
                 if c in sig_out.columns]
     sig_out = sig_out[sig_cols]
+    # ---- 检查复核 (输出 Excel 之前): 归属完整性检查 ----
+    # 统计归属表各行 δH_ppm 占用 H 数 (同 (ppm, Types) 槽仅 1 行且 CH3 → 权重 3,
+    # 其余每行 1), 汇总到 1H_NMR 表的 δH_nH 列, 与 nH 向量化比较,
+    # 不相等行整行标红 (与 数据处理程序/check_h_assignment.py 同规则)
+    _slot_rows: dict = {}
+    _counts = Counter()
+    for _, _r in out.iterrows():
+        _s = '' if pd.isna(_r.get('δH_ppm')) else str(_r['δH_ppm']).strip()
+        if _s and _s.lower() != 'nan':
+            _k = (round(float(_r['ppm']), 2), str(_r['Types']).strip())
+            _slot_rows[_k] = _slot_rows.get(_k, 0) + 1
+    for _, _r in out.iterrows():
+        _s = '' if pd.isna(_r.get('δH_ppm')) else str(_r['δH_ppm']).strip()
+        if _s and _s.lower() != 'nan':
+            _typ = str(_r['Types']).strip()
+            _k = (round(float(_r['ppm']), 2), _typ)
+            _w = 3 if (_typ == 'CH3' and _slot_rows.get(_k, 0) == 1) else 1
+            _counts[_s] += _w
+    sig_out['δH_nH'] = sig_out['δH_ppm'].map(lambda s: _counts.get(str(s).strip(), 0))
+    m_bad = sig_out['δH_nH'] != sig_out['nH']
+    n_bad_h = int(m_bad.sum())
+    print(f'[检查] 归属完整性: 信号 {len(sig_out)} 条, 完整 {len(sig_out) - n_bad_h} 条, '
+          f'不匹配 {n_bad_h} 条 (1H_NMR sheet 标红)')
     with pd.ExcelWriter(out_xlsx, engine='openpyxl') as xw:
         out_blank.to_excel(xw, sheet_name=f'{base}_归属表', index=False)
         out_full.to_excel(xw, sheet_name=f'{base}_归属表补全', index=False)
         sig_out.to_excel(xw, sheet_name=f'{base}_1H_NMR', index=False)
         ws = xw.book.worksheets[2]
-        from openpyxl.styles import Alignment, Font, PatternFill
+        red = Font(color='FF0000')
         for col_name in ('δH',):
             if col_name in sig_df.columns:
                 ci = list(sig_df.columns).index(col_name) + 1
@@ -1734,8 +2079,13 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                     for cell in row:
                         cell.number_format = '@'
                         cell.alignment = Alignment(horizontal='left')
+        # 1H_NMR sheet: δH_nH != nH 的行整行红字
+        if n_bad_h:
+            for r_i in range(len(sig_out)):
+                if bool(m_bad.iloc[r_i]):
+                    for c_i in range(1, len(sig_out.columns) + 1):
+                        ws.cell(row=r_i + 2, column=c_i).font = red
         # 两个归属表 sheet 的格式 (补全版 sheet0 + 置空版 sheet1)
-        red = Font(color='FF0000')
         col_v = [c for c in ('1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v3') if c in out.columns]
         for si, df_v in ((0, out_full), (1, out_blank)):
             wsi = xw.book.worksheets[si]
@@ -1822,13 +2172,17 @@ def main():
         data_dir = os.path.dirname(xlsx_path)
     else:
         base = compound
-        # 传入化合物名时 数据目录 / 参考表随化合物名联动
+        # 传入化合物名时 数据目录 / 参考表随化合物名联动 (文件名兼容有无下划线)
         data_dir = rf'Y:\LXH数据处理\新化合物处理\程序解析\{base}解析'
-        xlsx_path = os.path.join(data_dir, f'{base}数据归属.xlsx')
+        xlsx_path = _find_data_file(data_dir, base, '数据归属')
+        if not xlsx_path:
+            xlsx_path = os.path.join(data_dir, f'{base}数据归属.xlsx')
         if not ref_path:
-            ref_path = (lambda p: p if os.path.isfile(p) else '')(
-                os.path.join(data_dir, f'{base}_H参考.xlsx'))
-    h_report = os.path.join(data_dir, f'{base}氢谱积分.txt')
+            ref_path = _find_data_file(
+                data_dir, base, '_H参考', extra_variants=('H参考', '_参考', '参考'))
+    h_report = _find_data_file(data_dir, base, '氢谱积分', ext='.txt')
+    if not h_report:
+        h_report = os.path.join(data_dir, f'{base}氢谱积分.txt')
     if len(sys.argv) >= 3:
         json_dir = sys.argv[2]
     else:
