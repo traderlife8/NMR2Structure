@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """仅对第一个 sheet 的行排序：不带′的单独数字按数字升序（OCH3 特殊值排在该组最后），
 带′的先按′数量升序、数量相同再按最后一个数字升序；
-排序后删除最后一个数字之前的所有字符串（OCH3 特殊值保留原样），′ 统一为半角 '。
+排序后删除最后一个数字之前的所有字符串（OCH3 特殊值保留原样），撇号统一归一
+（单引号字符 → 半角 ' ; 双引号字符 → 两个半角 '）。
 其它 sheet 内容原样不动，输出到 原文件名_已排序.xlsx。"""
 import os
 import pandas as pd
@@ -10,6 +11,16 @@ from openpyxl import load_workbook
 SRC = r'Y:\LXH数据处理\新化合物处理\程序解析\clxh122解析\clxh122_归属表.xlsx'
 
 OUT = os.path.splitext(SRC)[0] + '_已排序.xlsx'
+
+
+def _norm_prime(v) -> str:
+    """撇号归一: 全角/半角撇号统一 — 单引号字符 (′ U+2032 / ' U+FF07 / ') → 一个
+    半角 ' ; 双引号字符 (″ U+2033 / " U+FF02 / ") → 两个半角 '."""
+    s = str(v)
+    s = (s.replace('\u2033', "''").replace('\uff02', "''").replace('\"', "''")
+          .replace('\u2032', "'").replace('\uff07', "'"))
+    return s
+
 
 wb = load_workbook(SRC)
 ws = wb.worksheets[0]                       # 只处理第一个 sheet
@@ -24,10 +35,8 @@ if pos_col is None:
 # 表格尾部有大量全空行（所有列均为空），先剔除再排序
 df = df.dropna(how='all').reset_index(drop=True)
 
-# 统一转为半角撇号（覆盖全角′、全角'等变体）
-s = (df[pos_col].astype(str).str.strip()
-       .str.replace('\u2032', "'", regex=False)
-       .str.replace('\uff07', "'", regex=False))
+# 撇号归一 (单引号→' ; 双引号→'' ; 覆盖全角′″、全角'等变体)
+s = df[pos_col].map(_norm_prime).astype(str).str.strip()
 
 # 提取末尾数字和′数量（全程向量化，无 for 循环）
 is_special = s.str.contains('OCH3', case=False)
