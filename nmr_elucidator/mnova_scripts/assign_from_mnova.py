@@ -38,9 +38,13 @@
  10. [--step3] 第三步 COSY/HMBC 全表复核 (默认关闭): 不改写 H (v3 = 基准列),
      复核证据独立输出到第三 sheet (COSY 邻位一致性 / HMBC 碳列表 / 无 HSQC 信号推断)
  11. 输出: <base>_归属表.xlsx (置空版 + 补全版 + 1H_NMR 积分表, + 糖基/苷元拆分 sheet:
-     No./Pos. 列撇号归一后带 ' 的行 = 糖基, 不带 ' = 苷元); 判分列 (judge 仅在有
-     1H-NMR truth 时输出), 每步结果变化的行红字标示, 1H_NMR 中 δH_nH != nH 行红字,
-     冻结首行表头 + 隔行浅黄背景
+     No./Pos. 列撇号归一后带 ' 的行 = 糖基, 不带 ' = 苷元); 归属表/糖基/苷元 sheet
+     开头列序按默认输入配置 _FRONT_COL_ORDER (默认 ppm, ppm参考, Δppm(C), Type,
+     Type参考, No.参考, No., [构型参考, 构型], δH参考; 带'参考'列仅有参考时输出,
+     '构型'列仅当输入文件有该列时原样带入; 落盘改名为 Type/Type参考/ppm参考),
+     其后接各版本列, 只输出到 nH 列, 最末再重复输出一列 ppm; 非数字列居左;
+     CH2 组内第二行 ppm/Types 置空; 每步结果变化的行红字标示, 1H_NMR 中
+     δH_nH != nH 行红字, 冻结首行表头 + 隔行浅黄背景 + 缩放 150%
 基准列 (_ver): 有参考 = v2.6, 无参考 = v2.5; xlsx 1H-NMR 有真实值时 v2.7 = 最终
 基准; --step3 时 v3 = 基准列并作为 _ver
 
@@ -77,7 +81,7 @@ from scipy.optimize import curve_fit, linear_sum_assignment
 
 # ---- 默认输入配置 (直接运行即用; 换化合物时手工修改 _DEFAULT_COMPOUND 一行,
 #      其余路径/开关均随化合物名联动; 命令行参数可覆盖) ----
-_DEFAULT_COMPOUND = 'clxh138A'   # 化合物名
+_DEFAULT_COMPOUND = 'clxh134'   # 化合物名
 _DATA_DIR = rf'Y:\LXH数据处理\新化合物处理\程序解析\{_DEFAULT_COMPOUND}解析'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
 # row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
@@ -100,6 +104,18 @@ _DEFAULT_DO_STEP3 = False
 # 'clxh126A参考' 均可); 修改 _DEFAULT_COMPOUND 即自动切换到该化合物的参考表
 _DEFAULT_REF = lambda: _find_data_file(
     _DATA_DIR, _DEFAULT_COMPOUND, '_H参考', extra_variants=('H参考', '_参考', '参考'))
+# 输出前几列顺序 (归属表/糖基/苷元 sheet 共用, 1H_NMR sheet 不受影响):
+# 手工改本 tuple 即改输出列序 — 只影响落盘输出, 不影响程序中间计算过程.
+# 列名用输出名: Type (=数据归属 Types 列) / ppm参考 (=参考 δc) / Type参考 /
+# No.参考 / 构型参考 / Δppm(C) / ppm / δH参考(1H-NMR参考).
+# 带 '参考' 的列仅在有参考化合物 (且该数据非空) 时输出;
+# '构型' 列仅当输入数据归属 xlsx 有该列时原样带入输出; 列不存在则该位置自动跳过.
+# 最末一列由程序自动再重复输出一次 ppm (与开头 ppm 列完全相同) 方便对照.
+_FRONT_COL_ORDER = ('ppm', 'ppm参考', 'Δppm(C)', 'Type', 'Type参考', 'No.参考', 'No.',
+                    '构型参考', '构型', 'δH参考')
+# 输出列名映射 (中间计算沿用内部列名, 落盘时改名):
+#   Types → Type, Types参考 → Type参考, δc参考 → ppm参考
+_OUT_RENAME = {'Types': 'Type', 'Types参考': 'Type参考', 'δc参考': 'ppm参考'}
 
 
 def _deploy_qs(qs_source: str, qs_deployed: str) -> None:
@@ -627,14 +643,14 @@ def _norm_no_key(v) -> str:
 
 
 def load_ref_h(path: str) -> pd.DataFrame:
-    """读取参考化合物 H 归属表 (必需列 δH; No./δc/Types 可选, 空缺自动补全).
+    """读取参考化合物 H 归属表 (必需列 δH; No./δc/Types/构型 可选, 空缺自动补全).
 
-    列名兼容: No./No, δ c/δc/ppm, δH/1H-NMR, Types/类型.
+    列名兼容: No./No, δ c/δc/ppm, δH/1H-NMR, Types/类型, 构型.
     参考表存在两种多行写法, 均拆分/补全为每行一个 H:
     1. δH 单元格内换行 (\\n) → 拆成多行;
     2. No./δc 留空的续行 → 向下填充归并 (仅 δH 以数值开头才算续行, 排除 '3-Api' 文字行).
-    续行 / 单元格换行拆分出的行, 其 No./δc/Types 一并向下填充 (ppm/Types/No. 三列补全).
-    返回列: No.参考 / no_key / δc参考 / δH参考 / Types参考 (可空).
+    续行 / 单元格换行拆分出的行, 其 No./δc/Types/构型 一并向下填充 (ppm/Types/No. 补全).
+    返回列: No.参考 / no_key / δc参考 / δH参考 / Types参考 (+ 构型参考, 仅参考表有构型列时).
     """
     df = pd.read_excel(path, header=0)
     df.columns = [str(c).strip() for c in df.columns]
@@ -643,6 +659,8 @@ def load_ref_h(path: str) -> pd.DataFrame:
     c_c = next((c for c in df.columns if c in ('δ c', 'δc', 'ppm')), None)
     c_h = next((c for c in df.columns if c in ('δH', '1H-NMR')), None)
     c_t = next((c for c in df.columns if c in ('Types', '类型')), None)
+    # 构型列: 参考表存在则原样带入 (α/β 等), 不存在则不输出
+    c_g = next((c for c in df.columns if str(c).strip() == '构型'), None)
     if c_h is None:
         raise SystemExit(f'ERROR: 参考 xlsx 缺少 δH (或 1H-NMR) 列: {path}')
     ren = {c_h: 'dH'}
@@ -652,6 +670,8 @@ def load_ref_h(path: str) -> pd.DataFrame:
         ren[c_c] = 'dC'
     if c_t is not None:
         ren[c_t] = 'dT'
+    if c_g is not None:
+        ren[c_g] = 'dG'
     df = df.rename(columns=ren).copy()
     for c, default in (('No.', ''), ('dC', None), ('dT', '')):
         if c not in df.columns:
@@ -671,7 +691,8 @@ def load_ref_h(path: str) -> pd.DataFrame:
     cont = df['dC'].isna() & df['dH'].ne('') & _is_shift
     df['_cont'] = cont
     if cont.any():
-        for c in ('dC', 'dT'):
+        # dC / dT 一定补全; dG (构型) 仅在参考表有该列时补全
+        for c in [x for x in ('dC', 'dT', 'dG') if x in df.columns]:
             df.loc[cont, c] = df[c].ffill()[cont]
         # No. 空的续行沿用上一行 (普通续行写法); 有值的保留 (6′a/6′b 写法)
         m_no_empty = cont & df['No.'].isna()
@@ -695,8 +716,12 @@ def load_ref_h(path: str) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     out = out.dropna(subset=['dC']).reset_index(drop=True)
     out['no_key'] = out['No.'].map(_norm_no_key)
-    out = out.rename(columns={'No.': 'No.参考', 'dC': 'δc参考', 'dH': 'δH参考', 'dT': 'Types参考'})
-    return out[['No.参考', 'no_key', 'δc参考', 'δH参考', 'Types参考']]
+    out = out.rename(columns={'No.': 'No.参考', 'dC': 'δc参考', 'dH': 'δH参考',
+                              'dT': 'Types参考', 'dG': '构型参考'})
+    cols = ['No.参考', 'no_key', 'δc参考', 'δH参考', 'Types参考']
+    if '构型参考' in out.columns:
+        cols.append('构型参考')  # 参考表有构型列才输出
+    return out[cols]
 
 
 def pick_docs(json_dir: str, dim: int, name_filter='', exclude=''):
@@ -1136,6 +1161,17 @@ def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
     for col in ('No.参考', 'δc参考', 'δH参考'):
         out[col] = ''
         out[col] = out[col].astype(object)
+    # Types参考 / 构型参考: 参考表对应数据非空时才输出该列 (无则不输出)
+    def _has_val(df_v, c):
+        if c not in df_v.columns:
+            return False
+        return df_v[c].astype(str).str.strip().replace('nan', '').ne('').any()
+    _xcols = []
+    for c_x in ('Types参考', '构型参考'):
+        if _has_val(ref, c_x):
+            out[c_x] = ''
+            out[c_x] = out[c_x].astype(object)
+            _xcols.append(c_x)
     out['_no_key'] = out['No.'].map(
         lambda v: _norm_prime(str(v)).strip()) if 'No.' in out.columns else ''
     # 糖基/苷元分区: 归一化原始 No. 中含 ' 即糖基 (6'a / 3-O-Glc-1' 等, 任何撇号)
@@ -1239,6 +1275,8 @@ def fill_missing_h_from_ref(out: pd.DataFrame, sig_df: pd.DataFrame,
                 out.at[oi, 'No.参考'] = rr['No.参考']
                 out.at[oi, 'δc参考'] = rr['δc参考']
                 out.at[oi, 'δH参考'] = rr['δH参考']
+                for c_x in _xcols:
+                    out.at[oi, c_x] = rr[c_x] if c_x in ref.columns else ''
                 try:
                     out.at[oi, 'Δppm(C)'] = round(
                         float(out.at[oi, 'ppm']) - float(rr['δc参考']), 2)
@@ -2289,8 +2327,11 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
             out = out[col_order]
     else:
         out = out.drop(columns=[c for c in ('1H-NMR_real', 'row_match') if c in out.columns])
-    # ---- 列序: ppm, Types, No., [No.参考, δc参考, δH参考], 1H-NMR-v1, 1H-NMR-v2, 1H-NMR-v2.5, [1H-NMR_real], [1H-NMR-v3], δH_ppm, nH, review, judge ----
-    front = ['ppm', 'Types', 'No.', 'No.参考', 'δc参考', 'Δppm(C)', 'δH参考',
+    # ---- 中间 df 列序 (内部用): 归属基础列 + 版本列, 输出时裁到 nH;
+    #      落盘的列名/列序由 _finalize_cols 按 _FRONT_COL_ORDER 决定
+    #      (只影响输出, 不影响此后的中间计算)
+    front = ['ppm', 'Types', 'No.', 'No.参考', 'Types参考', '构型参考', '构型',
+             'δc参考', 'Δppm(C)', 'δH参考',
              '1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v2.6', '1H-NMR-v2.7',
              '1H-NMR_real', '1H-NMR-v3', 'δH_ppm', 'nH']
     rest = [c for c in out.columns if c not in front]
@@ -2318,6 +2359,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     #      盖成糖基异头碳参考), 因此未匹配到参考的行保持 C 对应结果 (空).
     if 'δH参考' in out.columns and ref_path and os.path.isfile(ref_path):
         ref_groups_all = _ref_groups_of(ref_path)
+        # Types参考 / 构型参考 (存在时) 随参考行一起重排/补全, 保持与 No./δc/δH 一致
+        _xcols2 = [c for c in ('Types参考', '构型参考') if c in out.columns]
         out['_no_key2'] = out['No.'].map(_norm_no_key) if 'No.' in out.columns else ''
         out['_has_ref2'] = out['δc参考'].astype(str).str.strip().ne('') & \
             out['δc参考'].astype(str).str.strip().ne('nan')
@@ -2336,6 +2379,9 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                 out.at[oi, 'No.参考'] = rr['No.参考']
                 out.at[oi, 'δc参考'] = rr['δc参考']
                 out.at[oi, 'δH参考'] = rr['δH参考']
+                for c_x in _xcols2:
+                    if c_x in rr.index:
+                        out.at[oi, c_x] = rr[c_x]
         # CH2 第二行参考补全: 同 (no_key, ppm, Types) 组内首行有参考而次行无 →
         # 复用首行参考 (同位置第二 H, No./δc/δH参考 相同)
         for (key, _p, _t), gi in out.groupby(['_no_key2', 'ppm', 'Types'], sort=False):
@@ -2347,6 +2393,8 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                         out.at[oi, 'No.参考'] = out.at[rows[0], 'No.参考']
                         out.at[oi, 'δc参考'] = out.at[rows[0], 'δc参考']
                         out.at[oi, 'δH参考'] = out.at[rows[0], 'δH参考']
+                        for c_x in _xcols2:
+                            out.at[oi, c_x] = out.at[rows[0], c_x]
         out = out.drop(columns=['_no_key2', '_has_ref2'])
     # ---- 输出两个归属表 sheet: 补全版 (ppm/Types 完整) + 置空版 (组内非首行置空) ----
     # 置空规则泛化: 最终排序后, 同 (ppm, Types) 组内除第一行外全部置空 ppm/Types
@@ -2360,21 +2408,63 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
     _pos = _pos_col(out)
     # No./Pos. 列保留原始字符串 (含全角′″), 不做归一替换;
     # 归一 (_norm_prime) 仅在识别糖基 (_norm_no_key) 时使用.
-    out_blank = out.copy()
-    if '_cont' in out_blank.columns:
-        m_blank = pd.Series(False, index=out_blank.index)
-        for (_, _), gi in out_blank.groupby(['ppm', 'Types']).groups.items():
-            rows = list(gi)
-            m_blank.loc[rows[1:]] = True
-        out_blank['ppm'] = out_blank['ppm'].astype(object)
-        out_blank['Types'] = out_blank['Types'].astype(object)
-        out_blank.loc[m_blank, ['ppm', 'Types']] = ''
-        out_blank = out_blank.drop(columns='_cont')
-    out_full = out.drop(columns='_cont', errors='ignore')
-    # ppm (碳) 列固定 2 位小数显示; 判定列文本格式 (防 '-' 开头误转公式)
-    text_cols = [c for c in ('No.', 'Pos.', '1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5',
-                             '1H-NMR-v2.6', '1H-NMR-v2.7', '1H-NMR-v3', '1H-NMR_real',
-                             'review', 'C_match', 'row_match', 'all_assigned_H', 'Types') if c in out.columns]
+
+    def _blank_dup_carbon(df_v):
+        """CH2 组 (同 ppm, Types) 内除首行外, ppm/Types 两列置空 (化学家续行格式).
+
+        归属表/糖基/苷元 sheet 共用. 仅对 CH2 生效 — CH/CH3 即使有相同两行
+        也不置空第二行 (其两行是不同的碳或独立记录). 不依赖 _cont 标记 —
+        组内行序即显示行序; 同时丢弃 _cont 中间列.
+        """
+        if df_v is None:
+            return None
+        d = df_v.copy().drop(columns='_cont', errors='ignore')
+        if 'ppm' not in d.columns or 'Types' not in d.columns:
+            return d
+        m_blank = pd.Series(False, index=d.index)
+        for (_, _t), gi in d.groupby(['ppm', 'Types'], sort=False).groups.items():
+            if str(_t).strip() != 'CH2':
+                continue
+            m_blank.loc[list(gi)[1:]] = True
+        if m_blank.any():
+            d['ppm'] = d['ppm'].astype(object)
+            d['Types'] = d['Types'].astype(object)
+            d.loc[m_blank, ['ppm', 'Types']] = ''
+        return d
+
+    def _cut_to_nh(df_v):
+        """归属表/糖基/苷元 sheet 只输出到 nH 列 (其后的 review/judge/C_match/
+        row_match 等中间列不输出)."""
+        if df_v is None or 'nH' not in df_v.columns:
+            return df_v
+        cols = list(df_v.columns)
+        return df_v[cols[:cols.index('nH') + 1]]
+
+    def _finalize_cols(df_v):
+        """落盘列名/列序: 改名 (_OUT_RENAME) → 按 _FRONT_COL_ORDER 重排开头列 →
+        末尾再重复输出一列 ppm (与开头 ppm 列完全相同, 方便对照).
+
+        配置中不存在于本次数据的列自动跳过; 未列出的列按原相对顺序接在后面.
+        只作用于输出 df, 不影响中间计算.
+        """
+        if df_v is None:
+            return None
+        d = df_v.rename(columns=_OUT_RENAME)
+        cols = [c for c in _FRONT_COL_ORDER if c in d.columns]
+        cols += [c for c in d.columns if c not in cols]
+        d = d[cols]
+        if 'ppm' in d.columns:
+            # 末尾重复 ppm 列 (同名同值; pandas 允许重复列名, to_excel 两列表头都写 ppm)
+            d = pd.concat([d, d[['ppm']]], axis=1)
+        return d
+
+    out_blank = _finalize_cols(_cut_to_nh(_blank_dup_carbon(out)))
+    out_full = _finalize_cols(_cut_to_nh(out.drop(columns='_cont', errors='ignore')))
+    # ppm (碳) 列固定 2 位小数显示; 非数字列文本格式 + 居左 (防 '-' 开头误转公式)
+    text_cols = ('No.', 'No.参考', 'Pos.', 'Type', 'Type参考', '构型', '构型参考',
+                 '1H-NMR-v1', '1H-NMR-v2', '1H-NMR-v2.5', '1H-NMR-v2.6',
+                 '1H-NMR-v2.7', '1H-NMR-v3', '1H-NMR_real',
+                 'review', 'C_match', 'row_match', 'all_assigned_H')
     # 双 sheet: 归属表 + 1H_NMR 积分表 (sheet 名沿用文件名前缀)
     # J 列落盘还原为 '(a, b)' 文本 (内存中是 list)
     sig_out = sig_df.copy()
@@ -2429,10 +2519,26 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
         # CH2 构型后缀、3-O-Glc-1' 等连接位写法, 任何含撇号的均属糖基)
         _has_prime = out[_pos].map(
             lambda v: not pd.isna(v) and "'" in _norm_prime(v))
-        gly_df = out[_has_prime].copy()
-        agly_df = out[~_has_prime].copy()
+        gly_df = _finalize_cols(_cut_to_nh(_blank_dup_carbon(out[_has_prime])))
+        agly_df = _finalize_cols(_cut_to_nh(_blank_dup_carbon(out[~_has_prime])))
     else:
         gly_df = agly_df = None
+    def _fmt_assign_sheet(wse, df_v):
+        """归属表类 sheet 格式: ppm / ppm参考 / Δppm(C) 按 0.00 显示 (同名重复列
+        全部处理); 非数字列 (Type/No./版本列/构型/…) 文本格式并居左."""
+        for col_name in ('ppm', 'ppm参考', 'Δppm(C)'):
+            for ci in [i + 1 for i, c in enumerate(df_v.columns) if c == col_name]:
+                for row in wse.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '0.00'
+        for col_name in text_cols:
+            if col_name in df_v.columns:
+                ci = list(df_v.columns).index(col_name) + 1
+                for row in wse.iter_rows(min_row=2, min_col=ci, max_col=ci):
+                    for cell in row:
+                        cell.number_format = '@'
+                        cell.alignment = Alignment(horizontal='left')
+
     with pd.ExcelWriter(out_xlsx, engine='openpyxl') as xw:
         out_blank.to_excel(xw, sheet_name=f'{base}_归属表', index=False)
         out_full.to_excel(xw, sheet_name=f'{base}_归属表补全', index=False)
@@ -2449,19 +2555,7 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
         for si_extra, df_e in ((3, gly_df), (4, agly_df)):
             if df_e is None:
                 continue
-            wse = xw.book.worksheets[si_extra]
-            if 'ppm' in df_e.columns:
-                ci = list(df_e.columns).index('ppm') + 1
-                for row in wse.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                    for cell in row:
-                        cell.number_format = '0.00'
-            for col_name in text_cols:
-                if col_name in df_e.columns:
-                    ci = list(df_e.columns).index(col_name) + 1
-                    for row in wse.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                        for cell in row:
-                            cell.number_format = '@'
-                            cell.alignment = Alignment(horizontal='left')
+            _fmt_assign_sheet(xw.book.worksheets[si_extra], df_e)
         for col_name in ('δH',):
             if col_name in sig_df.columns:
                 ci = list(sig_df.columns).index(col_name) + 1
@@ -2486,18 +2580,7 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                              '1H-NMR-v2.7', '1H-NMR-v3') if c in out.columns]
         for si, df_v in ((0, out_full), (1, out_blank)):
             wsi = xw.book.worksheets[si]
-            if 'ppm' in df_v.columns:
-                ci = list(df_v.columns).index('ppm') + 1
-                for row in wsi.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                    for cell in row:
-                        cell.number_format = '0.00'
-            for col_name in text_cols:
-                if col_name in df_v.columns:
-                    ci = list(df_v.columns).index(col_name) + 1
-                    for row in wsi.iter_rows(min_row=2, min_col=ci, max_col=ci):
-                        for cell in row:
-                            cell.number_format = '@'
-                            cell.alignment = Alignment(horizontal='left')
+            _fmt_assign_sheet(wsi, df_v)
             # 红色标示: 三步结果列中, 每一步与上一步不同的行 (该三列单元格整行红字)
             for idx_row in range(len(df_v)):
                 changed = False
@@ -2532,9 +2615,11 @@ def assign(xlsx_path: str, h_report_path: str, json_dir: str, out_dir: str,
                                 cell.number_format = '@'
                                 cell.alignment = Alignment(horizontal='left')
                 print(f'[第三步] {len(third_df)} 个无 HSQC 交叉峰信号 → sheet {base}_第三步_无HSQC信号')
-        # 每个 sheet 视图固定首行表头 (上下滑动时表头不动); 隔行黄色背景便于阅读
+        # 每个 sheet 视图固定首行表头 (上下滑动时表头不动); 隔行黄色背景便于阅读;
+        # 默认显示缩放 150%
         for wsi in xw.book.worksheets:
             wsi.freeze_panes = 'A2'
+            wsi.sheet_view.zoomScale = 150
             yellow = PatternFill(start_color='FFFF80', end_color='FFFF80',
                                  fill_type='solid')
             for r_i, row in enumerate(wsi.iter_rows(min_row=2), start=2):
