@@ -81,7 +81,7 @@ from scipy.optimize import curve_fit, linear_sum_assignment
 
 # ---- 默认输入配置 (直接运行即用; 换化合物时手工修改 _DEFAULT_COMPOUND 一行,
 #      其余路径/开关均随化合物名联动; 命令行参数可覆盖) ----
-_DEFAULT_COMPOUND = 'clxh134'   # 化合物名
+_DEFAULT_COMPOUND = 'clxh83'   # 化合物名
 _DATA_DIR = rf'Y:\LXH数据处理\新化合物处理\程序解析\{_DEFAULT_COMPOUND}解析'
 _MNOVA_EXE = r'D:\Program Files\Mestrelab Research S.L\MestReNova\MestReNova.exe'
 # row_match 差异容差 (ppm): |δH_程序 - δH_xlsx| <= 此值时判 '一致 (ΔδH=...)', 保留差异值
@@ -656,9 +656,15 @@ def load_ref_h(path: str) -> pd.DataFrame:
     df.columns = [str(c).strip() for c in df.columns]
     c_no = next((c for c in df.columns
                  if str(c).strip().rstrip('.').lower() in ('no', 'pos')), None)
-    c_c = next((c for c in df.columns if c in ('δ c', 'δc', 'ppm')), None)
-    c_h = next((c for c in df.columns if c in ('δH', '1H-NMR')), None)
-    c_t = next((c for c in df.columns if c in ('Types', '类型')), None)
+    c_c = next((c for c in df.columns
+                if re.match(r'^δ\s*c$', str(c).strip(), re.IGNORECASE)
+                or str(c).strip().lower() == 'ppm'), None)
+    # δH 列: 表头含 δH (或 1H-NMR) 即可, 例如 'δH, mult. (J)'
+    c_h = next((c for c in df.columns
+                if 'δH' in str(c).strip() or '1H-NMR' in str(c).strip()), None)
+    # Types 列: 兼容 'Types'/'type'/'类型' (忽略大小写)
+    c_t = next((c for c in df.columns
+                if str(c).strip().lower() in ('types', 'type', '类型')), None)
     # 构型列: 参考表存在则原样带入 (α/β 等), 不存在则不输出
     c_g = next((c for c in df.columns if str(c).strip() == '构型'), None)
     if c_h is None:
