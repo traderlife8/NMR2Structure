@@ -100,6 +100,53 @@ def extract_num(s):
     return float(m.group(1)) if m else None
 
 
+def has_two_ppm(h):
+    """H 文本是否含两个化学位移 (用 ';' 分隔, 或同一段写 '1.2, 1.4 (m)').
+    同段写法要求第二个数值紧跟第一个且后面不是 J 值列表 (如 'd, 7.8' 不算).
+    '1.46, m; 2H' 这类 '; 2H' 是氢数标记 (等同 '(2H, m)'), 不是第二个位移."""
+    parts = [p.strip() for p in h.split(';') if p.strip()]
+    if not parts:
+        return False
+    if len(parts) == 1:
+        return re.match(r'^\s*\d+(?:\.\d+)?\s*(?:[(\u03b1\u03b2)][^,]*?)?\s*[,;]\s*'
+                        r'\d+(?:\.\d+)?\s*(?:[(\u03b1\u03b2]|$)', h) is not None
+    return (len(parts) == 2
+            and all(extract_num(p) is not None for p in parts)
+            and not re.fullmatch(r'\dH', parts[1]))                    # '; 2H' 不拆
+
+
+def split_ab(h):
+    """把 CH2 双氢文本拆成 (α 段, β 段).
+    - 标注了 α/β (如 '2.69(β), m; 2.44(α) (d, ...)') 时按标注: α 段在前,
+      另一段即 β; 只标注了一边的, 另一边为另一段.
+    - 未标注时按化学位移大小: 大值为 α, 小值为 β.
+    - 两个位移写在同一段 '1.2, 1.4 (m)' 时按位置拆开, 数值后的多重峰归后一个."""
+    parts = [p.strip() for p in h.split(';') if p.strip()]
+    if len(parts) != 2:
+        m2 = re.match(r'^\s*(\d+(?:\.\d+)?\s*(?:[(\u03b1\u03b2)]*)?)\s*[,;]\s*'
+                      r'(\d+(?:\.\d+)?)\s*(.*)$', h.strip())
+        if not m2:
+            return None
+        # 原写法把多重峰放在第一个数值之后 ('1.4 (m), 1.2'), 归给哪个不明确:
+        # 两个数值都没带多重峰时按末尾片段补上, 否则只保留数值
+        rest = m2.group(3).strip()
+        p1, p2 = m2.group(1).strip(), m2.group(2).strip()
+        if rest and not re.search(r'[a-zA-Z]', p1 + p2):
+            p2 = f'{p2}{rest if rest.startswith("(") else " " + rest}'
+        parts = [p1, p2]
+    tags = []
+    for p in parts:
+        t = re.search(r'[\u03b1\u03b2]', p)
+        tags.append(t.group(0) if t else None)
+    if '\u03b1' in tags:
+        a_i = tags.index('\u03b1')
+    elif '\u03b2' in tags:
+        a_i = 1 - tags.index('\u03b2')
+    else:
+        a_i = 0 if (extract_num(parts[0]) or 0) >= (extract_num(parts[1]) or 0) else 1
+    return parts[a_i], parts[1 - a_i]
+
+
 def num_key(s):
     """排序键: 无化学位移数值的片段排到最后, 不与 float 混比."""
     v = extract_num(s)
@@ -113,11 +160,12 @@ def fmt_h(s):
     → '4.85, d (7.8)' / '4.97, d (7.2)' / '1.87' / '1.46, (2H, m)'.
     所有 'J = ' 字样去除, J 值直接并入括号; 仅 2H 标记保留 (写成 '(2H, mult)'),
     其余氢数标记 (1H/3H 等) 全部去除; 逗号后统一一个空格."""
-    s = s.strip().rstrip(';').strip()
-    # 全角符号转半角: （）→(), ，→, 空格类归一
     s = (s.replace('\uff08', '(').replace('\uff09', ')')
           .replace('\uff0c', ',').replace('\uff1b', ';')
           .replace('\u3000', ' '))
+    # 化学位移后的括号可能只含 α/β 标记 (如 '2.69(β), m'), 去掉该括号但保留标记
+    s = re.sub(r'^(\d+(?:\.\d+)?)\s*\(\s*([\u03b1\u03b2])\s*\)',
+               r'\1\2', s.strip().rstrip(';').strip())
     # 去掉 ' Hz'; 氢数标记仅保留 2H, 其余 (1H/3H 等) 去除
     s = re.sub(r'\s*Hz\b', '', s)
     s = re.sub(r',\s*(?!2H\b)\dH\b', '', s)
@@ -128,20 +176,37 @@ def fmt_h(s):
     ppm, rest = m.group(1), m.group(2).strip()
     if not rest:
         return ppm
+    # 原数据的多余标记: 化学位移后、多重峰字母前单独的 α/β 或孤立 'H'
+    # ('1.42, α, m' → '1.42, m'; '2, H' → '2')
+    rest = re.sub(r'^[\s,\u03b1\u03b2]*[\u03b1\u03b2][\s,]*', '', rest)
+    rest = re.sub(r'^[\s,]*H(?=[\s,]|$)[\s,]*', '', rest)
+    if not rest:
+        return ppm
+    # '(2H, m)' 与 'm; 2H' 含义相同: 分号统一成逗号, 两种写法都归一为 '(2H, m)'
+    rest = rest.replace(';', ',')
     rest = rest.strip('()')                     # 去掉整体包裹的括号
     # 去掉所有 'J = ' 字样 (J 值留下)
     rest = re.sub(r'\bJ\s*=\s*', '', rest)
-    # 多重峰字母后接数值列表时把数值并入括号: 'd, 7.8' → 'd (7.8)'; 'd (7.2)' 保持
-    m2 = re.match(r'^([a-zA-Z]+)\s*,\s*\(?([\d.,\s]+?)\)?$', rest)
+    # 多重峰字母后接数值列表时把数值并入括号: 'd, 7.8' → 'd (7.8)';
+    # 'α (d, 7.8)' 也统一成 'α, d (7.8)'
+    m2 = (re.match(r'^([a-zA-Z\u03b1\u03b2]+)\s*,\s*\(?([\d.,\s]+?)\)?$', rest)
+          or re.match(r'^([\u03b1\u03b2])\s*\(\s*([a-zA-Z]+)\s*,\s*([\d.,\s]+?)\s*\)$', rest))
     if m2:
-        rest = f'{m2.group(1)} ({", ".join(j.strip() for j in m2.group(2).split(",") if j.strip())})'
+        g = m2.groups()
+        mult, nums = (g[0], g[2]) if len(g) == 3 else (g[0], g[1])
+        vals = ", ".join(j.strip() for j in nums.split(",") if j.strip())
+        rest = f'{mult} ({vals})' if len(g) == 2 else f'{g[0]}, {mult} ({vals})'
     # 逗号后统一一个空格; 保证括号配对
     rest = re.sub(r'\s*,\s*', ', ', rest).strip(' ,')
     if rest.count('(') > rest.count(')'):
         rest += ')'
-    # 含 2H 标记的行整体包裹: '2H, m' / 'd, 6.6, 2H' → '(2H, m)' / '(d, 6.6, 2H)'
-    if re.search(r'(?<![\d.])2H\b', rest) and not rest.startswith('('):
-        rest = f'({rest})'
+    # 含 2H 标记的行统一写成 '(2H, mult)': 2H 提到括号最前
+    # ('m; 2H' / 'd, 6.6, 2H' → '(2H, m)' / '(2H, d, 6.6)')
+    if (re.search(r'(?<![\d.])2H\b', rest)
+            and not re.fullmatch(r'[\u03b1\u03b2]', rest.split(' (')[0])):
+        rest = rest.replace('2H', '', 1).strip(' ,')
+        rest = re.sub(r'\s*,\s*', ', ', rest).strip(' ,')
+        rest = f'(2H, {rest})' if rest else '(2H)'
     return f'{ppm}, {rest}'
 
 
@@ -186,18 +251,16 @@ def block_rows(df, c0, c1):
         ppm = round(float(r.iloc[ppm_i]), 1)
         h = '' if pd.isna(r.iloc[h_i]) else str(r.iloc[h_i]).strip()
 
-        if typ != 't' and h:
-            # 非 CH2 (如 CH3): 所有 nH 氢数标记 (含 2H) 一并去除
-            h = re.sub(r',?\s*\dH\b', '', h)
-        if typ == 't' and ';' in h and '2H' not in h:
-            # CH2 双氢拆分: 大值第一行 (α, 保留 δC/type), 小值第二行 (β, 置空)
-            parts = sorted((p.strip() for p in h.split(';') if p.strip()),
-                           key=num_key)
-            if len(parts) != 2:
-                raise ValueError(f'CH2 拆分段数异常 ({len(parts)}): {h!r} (Pos.={pos})')
-            rows.append({'No.': pos + 'α', 'δH': fmt_h(parts[0]),
+        # 注意: 预处理阶段不能先删 nH 标记, 否则 '2.69(β), m; 2.44(α) (d, J=8.2 Hz, 1H)'
+        # 会丢掉末尾 ')', 影响下面按 ';' 拆分成 α/β 两行. 统一交给 fmt_h 处理, 且每个
+        # 半行单独调用 fmt_h (各自去掉 nH 标记).
+        if typ == 't' and has_two_ppm(h):
+            # CH2 双氢拆分: α 段放第一行 (保留 δC/type), β 段放第二行 (δC/type 置空).
+            # 标注了 α/β 则按标注, 未标注则大值作 α、小值作 β (见 split_ab).
+            a_part, b_part = split_ab(h)
+            rows.append({'No.': pos + 'α', 'δH': fmt_h(a_part),
                          'δC': ppm, 'type': typ})
-            rows.append({'No.': pos + 'β', 'δH': fmt_h(parts[1]),
+            rows.append({'No.': pos + 'β', 'δH': fmt_h(b_part),
                          'δC': None, 'type': None})
         else:
             rows.append({'No.': pos, 'δH': fmt_h(h), 'δC': ppm, 'type': typ})
@@ -252,7 +315,7 @@ def main():
         ws = wb_out.create_sheet(f'{name}归属表')
         ws.append(HDR)
         for r in rows:
-            ws.append([r['No.'], r['δH'], r['δC'], r['type']])
+            ws.append([r['No.'], no_rich(r['δH']), r['δC'], r['type']])
         # 格式与示例归属表一致: 字体/对齐/列宽/行高/δC 数字格式
         for row in ws.iter_rows():
             for c in row:
