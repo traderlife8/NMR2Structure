@@ -34,7 +34,7 @@ IF_I = InlineFont(rFont='Times New Roman', sz=16, i=True, family=1)
 IF_S = InlineFont(rFont='Times New Roman', sz=16, family=1, vertAlign='subscript')
 IF_N = InlineFont(rFont='Times New Roman', sz=16, family=1)
 
-SRC = r'Y:\LXH数据处理\新化合物处理\数据格式处理\数据格式处理.xlsx'
+SRC = r'Y:\LXH数据处理\新化合物处理\数据格式处理\数据格式修改.xlsx'
 DST = os.path.splitext(SRC)[0] + '_合并归属表.xlsx'
 
 TYPE_MAP = {'C': 's', 'CH': 'd', 'CH2': 't', 'CH3': 'q', 'OCH3': 'q'}
@@ -68,10 +68,11 @@ def norm_no(v) -> str:
 
 def no_sort_key(no: str):
     """排序键: (′数量, 末尾数字, α=0/β=1), 参考 1.sort_position.py 排序规则.
-    糖基连接位字符串取最后一个数字及其后的 ′ 参与排序."""
+    糖基连接位字符串取最后一个数字及其后的 ′ 参与排序.
+    无法解析的 No. (如 '16′-COOH') 返回 None, 由调用方统一排到最后."""
     m = re.search(r"(\d+)((?:\u2032)*)(?:[\u03b1\u03b2])?$", no)
     if m is None:
-        raise ValueError(f'No. 无法排序: {no!r}')
+        return None
     lastnum, primes = m.group(1), m.group(2)
     suffix = 1 if no.endswith('\u03b2') else 0
     return (len(primes), int(lastnum), suffix)
@@ -97,6 +98,12 @@ def extract_num(s):
     """从 1H 文本开头提取化学位移数值, 无数值返回 None."""
     m = re.match(r'^\s*(\d+(?:\.\d+)?)', s)
     return float(m.group(1)) if m else None
+
+
+def num_key(s):
+    """排序键: 无化学位移数值的片段排到最后, 不与 float 混比."""
+    v = extract_num(s)
+    return (v is None, -(v if v is not None else 0.0))
 
 
 def fmt_h(s):
@@ -185,7 +192,7 @@ def block_rows(df, c0, c1):
         if typ == 't' and ';' in h and '2H' not in h:
             # CH2 双氢拆分: 大值第一行 (α, 保留 δC/type), 小值第二行 (β, 置空)
             parts = sorted((p.strip() for p in h.split(';') if p.strip()),
-                           key=extract_num, reverse=True)
+                           key=num_key)
             if len(parts) != 2:
                 raise ValueError(f'CH2 拆分段数异常 ({len(parts)}): {h!r} (Pos.={pos})')
             rows.append({'No.': pos + 'α', 'δH': fmt_h(parts[0]),
@@ -208,6 +215,7 @@ def main():
 
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
+    log = []                              # 无法排序的 No. 说明, 另存到源文件同目录
     for name, df in dfs.items():
         # 块边界: 第 1 行标题含 '糖基数据' / '排除糖基后数据' 的列起点
         titles = df.iloc[0].fillna('').astype(str)
@@ -223,7 +231,23 @@ def main():
         # No. 归一并排序 (糖基块与苷元块整体一起排, 参考 1.sort_position.py 规则)
         for r in rows:
             r['No.'] = no_rich(norm_no(r['No.']))
-        rows.sort(key=lambda r: no_sort_key(str(r['No.'])))
+        # 无法排序的 No. 排到最后 (Python 排序稳定, 保持原有先后顺序)
+        for r in rows:
+            r['_plain'] = str(r['No.'])   # CellRichText 的 str() 即纯文本
+
+        def sort_key(r):
+            k = no_sort_key(r['_plain'])
+            return (1, (0, 0, 0)) if k is None else (0, k)
+        bad = [r for r in rows if no_sort_key(r['_plain']) is None]
+        rows.sort(key=sort_key)
+        if bad:
+            msg = (f'{name}: "No." 无法排序的 {len(bad)} 行已排到最后: '
+                   + '; '.join(r['_plain'] for r in bad))
+            log.append(msg)
+            print(msg)
+            for r in bad:
+                print(f'  - {r["_plain"]}  δH={r["δH"]}  δC={r["δC"]}  '
+                      f'type={r["type"]}')
 
         ws = wb_out.create_sheet(f'{name}归属表')
         ws.append(HDR)
@@ -244,6 +268,15 @@ def main():
 
     wb_out.save(DST)
     print(f'OK: {DST}')
+    # 无法排序的 No. 说明: 同时输出到终端并另存 txt (与源文件同目录)
+    LOG = os.path.splitext(SRC)[0] + '_无法排序No说明.txt'
+    with open(LOG, 'w', encoding='utf-8') as f:
+        if log:
+            f.write('以下 No. 无法按位置编号排序, 已排到各自归属表的最后一行:\n')
+            f.write('\n'.join(log) + '\n')
+        else:
+            f.write('所有 No. 均可排序, 无需特殊处理.\n')
+    print(f'说明文件: {LOG}')
 
 
 if __name__ == '__main__':
